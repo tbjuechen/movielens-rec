@@ -194,7 +194,12 @@ class TwoTowerRecall(BaseRecall):
 
         device = next(self.model.parameters()).device
         u_id_tensor = torch.LongTensor([uid_int]).to(device)
-        u_genres_tensor = torch.LongTensor([feat['user_top_genres_idx']]).to(device)
+        
+        # 修复：对题材列表进行 Padding 到长度 3
+        genres = feat['user_top_genres_idx']
+        padded_genres = genres + [0] * (3 - len(genres))
+        u_genres_tensor = torch.LongTensor([padded_genres]).to(device)
+        
         u_num_tensor = torch.FloatTensor([[feat['user_avg_rating_norm'], feat['user_rating_count_norm']]]).to(device)
 
         self.model.eval()
@@ -217,8 +222,14 @@ class TwoTowerRecall(BaseRecall):
         self.user_map, self.movie_map, self.user_features_dict = data['user_map'], data['movie_map'], data['user_features_dict']
         self.inv_movie_map = {v: k for k, v in self.movie_map.items()}
         self.faiss_index = faiss.read_index(f"{path}/item_index.faiss")
-        state_dict = torch.load(f"{path}/model.pth", map_location="cpu")
-        self.model = TwoTowerModel(state_dict['user_tower.user_embed.weight'].shape[0], state_dict['item_tower.item_embed.weight'].shape[0], 20, data['meta']['embed_dim'], data['meta']['temp'])
+        
+        # 自动识别设备
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+        
+        state_dict = torch.load(f"{path}/model.pth", map_location=device)
+        num_users = state_dict['user_tower.user_embed.weight'].shape[0]
+        num_items = state_dict['item_tower.item_embed.weight'].shape[0]
+        self.model = TwoTowerModel(num_users, num_items, 20, data['meta']['embed_dim'], data['meta']['temp']).to(device)
         self.model.load_state_dict(state_dict)
         self.model.eval()
-        logger.info(f"Model loaded from {path}")
+        logger.info(f"Model loaded from {path} on {device}")
