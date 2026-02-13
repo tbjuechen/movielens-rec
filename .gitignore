@@ -1,1 +1,6 @@
-data/
+data/ml-32m/
+data/processed/
+*.parquet
+__pycache__/
+.venv/
+.DS_Store
