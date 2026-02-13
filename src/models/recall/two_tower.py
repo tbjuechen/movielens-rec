@@ -120,11 +120,14 @@ def collate_fn(batch):
         return torch.tensor([x[key] for x in batch], dtype=dtype)
 
     user_ids = get_tensor("user_id", torch.long)
-    user_genres = torch.tensor(np.stack([x["user_genres"] for x in batch]), dtype=torch.long)
+    # 修复：对用户题材也使用 pad_sequence，防止长度不一导致 stack 失败
+    user_genres_list = [torch.tensor(x["user_genres"]) for x in batch]
+    user_genres = torch.nn.utils.rnn.pad_sequence(user_genres_list, batch_first=True, padding_value=0)
     user_num = get_tensor("user_numeric", torch.float)
     
     item_ids = get_tensor("item_id", torch.long)
-    item_genres = torch.nn.utils.rnn.pad_sequence([torch.tensor(x["item_genres"]) for x in batch], batch_first=True, padding_value=0)
+    item_genres_list = [torch.tensor(x["item_genres"]) for x in batch]
+    item_genres = torch.nn.utils.rnn.pad_sequence(item_genres_list, batch_first=True, padding_value=0)
     item_num = get_tensor("item_numeric", torch.float)
     
     return (user_ids, user_genres, user_num), (item_ids, item_genres, item_num)
