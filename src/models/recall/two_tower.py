@@ -9,6 +9,7 @@ from typing import List, Tuple, Dict
 from pathlib import Path
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 from src.models.recall.base import BaseRecall
 
 # --- PyTorch 模型定义 ---
@@ -108,7 +109,8 @@ class TwoTowerRecall(BaseRecall):
         self.model.train()
         for epoch in range(epochs):
             total_loss = 0
-            for user_ids, item_ids in loader:
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
+            for user_ids, item_ids in pbar:
                 user_ids, item_ids = user_ids.to(device), item_ids.to(device)
                 
                 user_vec, item_vec = self.model(user_ids, item_ids)
@@ -123,9 +125,12 @@ class TwoTowerRecall(BaseRecall):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                total_loss += loss.item()
+                
+                current_loss = loss.item()
+                total_loss += current_loss
+                pbar.set_postfix({"loss": f"{current_loss:.4f}"})
             
-            logger.info(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(loader):.4f}")
+            logger.info(f"Epoch {epoch+1}/{epochs} finished. Avg Loss: {total_loss/len(loader):.4f}")
 
         # 训练完成后构建 Faiss 索引
         self._build_faiss_index(num_items, device)
