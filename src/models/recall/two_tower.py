@@ -10,6 +10,7 @@ from pathlib import Path
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import sys
 from src.models.recall.base import BaseRecall
 
 # --- PyTorch 模型定义 ---
@@ -111,7 +112,7 @@ class TwoTowerRecall(BaseRecall):
         self.model.train()
         for epoch in range(epochs):
             total_loss = 0
-            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", mininterval=1.0)
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", file=sys.stdout, mininterval=0.5)
             for user_ids, item_ids in pbar:
                 user_ids, item_ids = user_ids.to(device), item_ids.to(device)
                 
