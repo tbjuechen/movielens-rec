@@ -32,27 +32,25 @@ def test_itemcf():
     
     # 4. 显示该用户的观影历史
     history_ids = model.user_history.get(test_user_id, [])
-    print("
-" + "="*60)
+    print("\n" + "="*60)
     print(f"【用户历史】User ID: {test_user_id} | 观影数量: {len(history_ids)}")
-    print("-"*60)
+    print("-" * 60)
     for mid in history_ids[:10]:
         print(f"- {movie_dict.get(mid, 'Unknown')}")
-    if len(history_ids) > 10: print("  ...")
+    if len(history_ids) > 10:
+        print("  ...")
 
     # 5. 执行召回
     results = model.recall(user_id=test_user_id, top_n=10)
 
     # 6. 打印推荐结果
-    print("
-" + "="*60)
+    print("\n" + "="*60)
     print(f"【ItemCF 个性化推荐结果】Top 10")
-    print("="*60)
+    print("=" * 60)
     for i, (mid, score) in enumerate(results):
         title = movie_dict.get(mid, 'Unknown')
         print(f"{i+1}. [ID: {mid:6}] Score: {score:8.3f} | Title: {title}")
-    print("="*60 + "
-")
+    print("=" * 60 + "\n")
 
 if __name__ == "__main__":
     test_itemcf()
