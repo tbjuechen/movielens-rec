@@ -11,39 +11,45 @@
 conda create -y -n movielens-rec python=3.10
 conda activate movielens-rec
 # 安装全量依赖
-conda install -y -c pytorch -c conda-forge pandas pyarrow loguru jupyter matplotlib seaborn scikit-learn pytorch faiss-cpu tqdm scipy python-dotenv beautifulsoup4 requests
+conda install -y -c pytorch -c conda-forge pandas pyarrow loguru jupyter matplotlib seaborn scikit-learn pytorch faiss-cpu tqdm scipy python-dotenv beautifulsoup4 requests openai
 # 注册 Jupyter 内核
 python -m ipykernel install --user --name movielens-rec --display-name "Python 3.10 (movielens-rec)"
 ```
 
+### 外部数据配置 (TMDb / OpenAI)
+在项目根目录下创建 `.env` 文件并填入：
+```text
+TMDB_API_KEY=xxx
+OPENAI_API_KEY=xxx
+OPENAI_BASE_URL=xxx
+EMBEDDING_MODEL=BAAI/bge-m3
+```
+
 ## 2. 数据工程流水线
 
-### 2.1 基础预处理
-将 32M CSV 转换为高效的 Parquet 格式，并完成时间切分 (80/10/10) 与 ID 重映射。
+### 2.1 基础预处理 (MovieLens)
 ```bash
 PYTHONPATH=. python scripts/run_preprocessing.py
 PYTHONPATH=. python scripts/prepare_two_tower_data.py
 ```
 
-### 2.2 外部元数据采集 (TMDb)
-通过 TMDb API 补全电影的剧情、关键词、导演、主演等深度特征。
-1. **配置 Key**：在 `.env` 中填入 `TMDB_API_KEY=xxx`。
-2. **高效抓取**：使用 50 线程并发抓取全量 JSON。
-   ```bash
-   PYTHONPATH=. python scripts/data_collector/run_batch_crawl.py
-   ```
-3. **星型建模**：将散乱的 JSON 整合为结构化的电影、人员、关系表。
-   ```bash
-   PYTHONPATH=. python scripts/data_collector/process_tmdb_json.py
-   ```
+### 2.2 深度特征采集 (TMDb & Embedding)
+```bash
+# 1. 50 线程并发采集 TMDb 元数据 JSON
+PYTHONPATH=. python scripts/data_collector/run_batch_crawl.py
+
+# 2. 星型建模整合为 Parquet 关联表
+PYTHONPATH=. python scripts/data_collector/process_tmdb_json.py
+
+# 3. 语义向量化 (获取 1024 维剧情简介向量)
+PYTHONPATH=. python scripts/data_collector/generate_text_embeddings.py
+```
 
 ## 3. 召回层 (Recall)
 
 支持多路并发召回，核心指标 **HitRate@50** 已达到 **0.35**。
 
 ### 3.1 训练召回模型
-所有召回模型通过统一的驱动脚本训练：
-
 ```bash
 # 1. 训练热门召回 (Popularity)
 PYTHONPATH=. python scripts/train_recall.py --model popularity --input data/processed/two_tower/train.parquet
@@ -52,26 +58,24 @@ PYTHONPATH=. python scripts/train_recall.py --model popularity --input data/proc
 PYTHONPATH=. python scripts/train_recall.py --model itemcf --input data/processed/two_tower/train.parquet
 
 # 3. 训练多模态双塔模型 (Two-Tower V2)
-# 建议配置：M4 芯片下 batch_size 越大，负采样效果越好
 PYTHONPATH=. python scripts/train_recall.py --model two_tower --epochs 5 --batch_size 8192
 ```
 
 ### 3.2 一键对比评估
-在测试集上对比三路召回的真实命中率：
 ```bash
 PYTHONPATH=. python scripts/evaluate_recall.py
 ```
 
 ## 4. 排序层 (Ranking) - 开发中
-利用采集到的 TMDb 深度特征，通过特征交叉与 CTR 预估实现精细化排序。
+利用采集到的文本向量与业务特征，实现精细化特征交叉与打分。
 
 ---
 
 ## 项目架构与规范
 
-- **星型模型**：外部元数据按 `Movies`, `Persons`, `Cast`, `Crew` 四张表存储，确保数据无冗余。
-- **原子提交**：严格遵循一个提交解决一个问题的原则。
-- **MPS 优化**：针对 Apple 芯片手动实现 pooling 算子，绕过 PyTorch 兼容性限制。
+- **星型模型**：外部元数据按 `Movies`, `Persons`, `Cast`, `Crew` 四张表存储。
+- **分层处理**：语义向量采集采用 API Batch (64) 与 Checkpoint Chunk (500) 的分层策略。
+- **MPS 优化**：针对 Apple 芯片手动实现 pooling 算子。
 
 ## 许可证 (License)
 

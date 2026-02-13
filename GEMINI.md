@@ -24,17 +24,17 @@
 - [x] **双塔 V2**: **0.35 HitRate** (Completed).
 
 ### Phase 3: 精排模型 (Ranking)
-- [/] **Ranking EDA**: 分析外部特征与 Label 的相关性 (Completed).
-- [ ] **语义增强**: 调用 API 获取剧情简介的语义向量 (Planned).
-- [ ] **特征工程**: 构建用户画像、物品画像及历史行为序列 (Planned).
+- [x] **Ranking EDA**: 分析外部特征与 Label 的相关性 (Completed).
+- [x] **语义增强**: 50 线程元数据抓取 + BGE-M3 语义向量化 (Completed).
+- [/] **特征工程**: 构建用户画像、物品画像及历史行为序列 (In Progress).
 - [ ] **样本构造**: 实现精排正负样本采样。
-- [ ] **模型实现**: XGBoost / DeepFM。
+- [ ] **模型实现**: XGBoost / DeepFM.
 
 ## 排序阶段待办清单 (Ranking Phase To-Do List)
 
 ### 3.1 语义向量化 (Phase 3.1)
-- [ ] **实现 `api_embedder.py`**: 支持批量获取 Embedding，内置 **Matryoshka 降维** (1536 -> 256)。
-- [ ] **实现断点续传**: 自动保存已获取的向量，防止网络中断。
+- [x] **实现 `api_embedder.py`**: 支持多线程并发，适配厂商 Batch 限制 (Completed).
+- [x] **获取全量 Embedding**: BGE-M3 1024 维向量全量落地 (Completed).
 
 ### 3.2 特征底座建设 (Phase 3.2)
 - [ ] **构建 `User_Profile`**: 整合用户平均分、题材偏好、活跃度等。
