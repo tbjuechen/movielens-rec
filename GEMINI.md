@@ -26,6 +26,36 @@ The contents of this directory are intended to be used as follows:
 3. **Model Training**: Implementing collaborative filtering, content-based filtering, or hybrid recommendation models.
 4. **Evaluation**: Using the ratings data to test the accuracy and relevance of generated recommendations.
 
+## Implementation Roadmap
+
+### Phase 1: Data Engineering & Feature Engineering
+- [x] **Data Formatting**: Convert raw CSVs to Parquet for performance (Completed).
+- [ ] **EDA (Exploratory Data Analysis)**: Analyze user activity, movie popularity, and rating distributions.
+- [ ] **Feature Processing**:
+    - User: Historical interactions, average ratings, activity patterns.
+    - Movie: Genres, release year, popularity metrics.
+    - Context: Temporal features from timestamps.
+
+### Phase 2: Multi-channel Recall (召回)
+- **Goal**: Filter ~87,000 movies down to 500-1000 candidates.
+- [ ] **Popularity-based**: Global and genre-specific hot movies.
+- [ ] **Collaborative Filtering**: ItemCF, UserCF.
+- [ ] **Embedding-based**: Vector search using Item2Vec or Two-Tower models.
+
+### Phase 3: Ranking (精排)
+- **Goal**: Predict specific scores or CTR for candidates.
+- [ ] **Dataset Construction**: Generate positive/negative samples and train/test splits.
+- [ ] **Model Implementation**: XGBoost/LightGBM or Deep Models (e.g., DeepFM, Wide&Deep).
+- [ ] **Evaluation**: Metric calculation (NDCG, MRR, Precision@K).
+
+### Phase 4: Reranking & Strategy (重排)
+- **Goal**: Optimize final presentation.
+- [ ] **Diversity & MMR**: Ensure variety in recommendations.
+- [ ] **Business Logic**: Filtering watched movies, blacklists.
+
+### Phase 5: Inference Pipeline
+- [ ] **End-to-End Flow**: Integrate all modules into `src/inference/pipeline.py`.
+
 ## Development Conventions
 - **Atomic Commits**: Each commit must be atomic, implementing a single feature or fulfilling a single purpose. Avoid bundling multiple unrelated changes into one commit.
 - **Logging**: Use `loguru` for all project-wide logging instead of the standard library `logging` or `print` statements.
