@@ -63,6 +63,7 @@ def evaluate_all():
             for uid_int in tqdm(sample_users, desc=f"Evaluating {name}"):
                 uid_raw = inv_user_map[uid_int]
                 raw_rec = model.recall(uid_raw, top_n=top_k)
+                # 必须确保召回的 ID 在我们的电影映射表（训练集）中
                 preds.append([movie_map[mid] for mid, _ in raw_rec if mid in movie_map])
                 
         elif name == "Two-Tower":
