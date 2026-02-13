@@ -88,7 +88,14 @@ class TwoTowerRecall(BaseRecall):
         epochs = kwargs.get('epochs', 5)
         batch_size = kwargs.get('batch_size', 1024)
         lr = kwargs.get('lr', 0.001)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 支持 CUDA (NVIDIA), MPS (Apple Silicon), CPU
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
 
         logger.info(f"Training Two-Tower on {device} (Users: {num_users}, Items: {num_items})")
         
