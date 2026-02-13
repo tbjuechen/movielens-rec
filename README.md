@@ -41,6 +41,9 @@ PYTHONPATH=. conda run -n movielens-rec python scripts/run_preprocessing.py
 ```bash
 # 训练热门召回模型
 PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model popularity
+
+# 训练 ItemCF 召回模型
+PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model itemcf
 ```
 
 ## 5. 测试与演示
