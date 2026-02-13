@@ -3,16 +3,16 @@ from openai import OpenAI
 from loguru import logger
 from typing import List
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 class APIEmbedder:
     """
     语义嵌入引擎：利用 API 获取高质量文本向量。
-    支持 OpenAI, BGE-M3 等兼容接口。
+    支持多线程并发以利用高 RPM 限额。
     """
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_BASE_URL")
-        # 允许从环境变量读取模型名称，默认为 OpenAI 的模型
         self.model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
         
         if not self.api_key:
@@ -21,31 +21,33 @@ class APIEmbedder:
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         logger.info(f"APIEmbedder initialized with model: {self.model}")
 
-    def get_embeddings(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
+    def _fetch_single_batch(self, batch_texts: List[str]) -> List[List[float]]:
+        """单个 Batch 的抓取逻辑，用于线程池"""
+        try:
+            response = self.client.embeddings.create(
+                input=batch_texts,
+                model=self.model
+            )
+            return [data.embedding for data in response.data]
+        except Exception as e:
+            logger.error(f"Batch fetch error: {e}")
+            time.sleep(2) # 遇到错误稍作休息
+            return self._fetch_single_batch(batch_texts) # 简单重试
+
+    def get_embeddings(self, texts: List[str], batch_size: int = 64, max_workers: int = 10) -> List[List[float]]:
         """
-        批量获取嵌入向量。适配厂商限制 (通常为 64)。
+        利用线程池并发获取嵌入向量。
         """
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
         all_embeddings = []
-        for i in range(0, len(texts), batch_size):
-            batch_texts = [str(t) for t in texts[i:i + batch_size]]
+        
+        logger.info(f"Starting parallel embedding fetch with {max_workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 使用 map 保证返回顺序与输入顺序一致
+            results = list(executor.map(self._fetch_single_batch, batches))
             
-            try:
-                # 记录请求时间
-                start_time = time.time()
-                response = self.client.embeddings.create(
-                    input=batch_texts,
-                    model=self.model
-                )
-                duration = time.time() - start_time
-                logger.debug(f"Fetched {len(batch_texts)} embeddings in {duration:.2f}s")
-                
-                batch_embeddings = [data.embedding for data in response.data]
-                all_embeddings.extend(batch_embeddings)
-                
-            except Exception as e:
-                logger.error(f"Embedding API error at batch {i}: {e}")
-                # 简单指数退避
-                time.sleep(5)
-                return self.get_embeddings(texts[i:], batch_size) # 递归重试剩余部分
+        for batch_res in results:
+            all_embeddings.extend(batch_res)
                 
         return all_embeddings
