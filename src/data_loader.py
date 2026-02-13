@@ -1,9 +1,6 @@
 import pandas as pd
 from pathlib import Path
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 def convert_csv_to_parquet(csv_path: str, parquet_path: str) -> None:
     """
