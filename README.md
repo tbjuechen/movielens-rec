@@ -37,9 +37,10 @@ PYTHONPATH=. conda run -n movielens-rec python scripts/run_preprocessing.py
 ### 热门召回 (Popularity Recall)
 统计全局最热门的电影榜单。
 
-**训练/统计脚本（即将推出）**:
+**执行训练/统计脚本**:
 ```bash
-# PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model popularity
+# 训练热门召回模型
+PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model popularity
 ```
 
 ---
