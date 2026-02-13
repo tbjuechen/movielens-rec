@@ -19,7 +19,7 @@ def test_two_tower():
     movie_dict = dict(zip(df_movies['movieId'], df_movies['title']))
 
     # 2. 加载模型
-    model_path = "saved_models/two_tower_model"
+    model_path = "saved_models/two_tower_v2"
     if not Path(model_path).exists():
         logger.error(f"Model directory not found at {model_path}!")
         return

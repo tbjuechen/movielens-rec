@@ -38,7 +38,7 @@ def evaluate_all():
     models_to_eval = [
         ("Popularity", "saved_models/popularity_recall.pkl"),
         ("ItemCF", "saved_models/itemcf_recall.pkl"),
-        ("Two-Tower", "saved_models/two_tower_model")
+        ("Two-Tower", "saved_models/two_tower_v2")
     ]
 
     results_summary = []
