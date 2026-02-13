@@ -1,6 +1,7 @@
 data/ml-32m/
 data/processed/
 data/raw/
+data/processed/tmdb/*.csv
 saved_models/
 *.parquet
 __pycache__/

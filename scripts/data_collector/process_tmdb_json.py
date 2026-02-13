@@ -98,17 +98,24 @@ def process_tmdb_jsons_normalized():
 
     # 2. 转换并保存四张表
     if movies_list:
-        # 保存电影主表
-        pd.DataFrame(movies_list).to_parquet(output_dir / "tmdb_movies.parquet", index=False)
-        # 保存人员维度表
-        pd.DataFrame(list(persons_dict.values())).to_parquet(output_dir / "tmdb_persons.parquet", index=False)
-        # 保存演员关系表
-        pd.DataFrame(cast_links).to_parquet(output_dir / "tmdb_movie_cast.parquet", index=False)
-        # 保存团队关系表
-        pd.DataFrame(crew_links).to_parquet(output_dir / "tmdb_movie_crew.parquet", index=False)
+        logger.info("正在保存 Parquet 和 CSV 文件...")
+        
+        # 定义保存逻辑
+        def save_table(df_list, table_name):
+            df = pd.DataFrame(df_list)
+            # 保存 Parquet (生产用)
+            df.to_parquet(output_dir / f"{table_name}.parquet", index=False)
+            # 保存 CSV (分享用)
+            df.to_csv(output_dir / f"{table_name}.csv", index=False)
+            return len(df)
 
-        logger.success(f"数据建模处理完成！Parquet 文件已保存至 {output_dir}")
-        logger.info(f"统计：电影 {len(movies_list)} 部, 人员 {len(persons_dict)} 名, 演员关系 {len(cast_links)} 条")
+        n_movies = save_table(movies_list, "tmdb_movies")
+        n_persons = save_table(list(persons_dict.values()), "tmdb_persons")
+        n_cast = save_table(cast_links, "tmdb_movie_cast")
+        n_crew = save_table(crew_links, "tmdb_movie_crew")
+
+        logger.success(f"数据建模处理完成！文件已保存至 {output_dir}")
+        logger.info(f"统计：电影 {n_movies} 部, 人员 {n_persons} 名, 演员关系 {n_cast} 条, 团队关系 {n_crew} 条")
     else:
         logger.warning("未处理任何有效数据。")
 
