@@ -6,16 +6,20 @@ import time
 
 class APIEmbedder:
     """
-    语义嵌入引擎：利用 OpenAI API 获取高质量文本向量。
+    语义嵌入引擎：利用 API 获取高质量文本向量。
+    支持 OpenAI, BGE-M3 等兼容接口。
     """
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_BASE_URL")
+        # 允许从环境变量读取模型名称，默认为 OpenAI 的模型
+        self.model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        
         if not self.api_key:
-            logger.error("OPENAI_API_KEY not found in environment!")
+            logger.error("API Key not found in environment!")
         
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        self.model = "text-embedding-3-small"
+        logger.info(f"APIEmbedder initialized with model: {self.model}")
 
     def get_embeddings(self, texts: List[str], batch_size: int = 500) -> List[List[float]]:
         """
