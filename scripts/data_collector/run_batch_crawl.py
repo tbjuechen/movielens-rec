@@ -36,8 +36,8 @@ def crawl_task(tmdb_id, client, cache_dir):
         return "failed"
 
 def run_batch_crawl():
-    # 线程数设置 (TMDb 允许较高的并发)
-    MAX_WORKERS = 15 
+    # 大幅提升线程数 (M4 性能强劲，可以处理更高的网络并发)
+    MAX_WORKERS = 50 
     
     # 1. 加载待抓取列表
     links_path = Path("data/processed/links.parquet")

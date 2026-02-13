@@ -36,7 +36,7 @@ class TMDBClient:
             # 处理频率限制 (Rate Limiting)
             if response.status_code == 429:
                 logger.warning("触发频率限制，休眠后重试...")
-                time.sleep(2)
+                time.sleep(1)
                 return self.get_full_movie_info(tmdb_id)
             
             if response.status_code == 404:
