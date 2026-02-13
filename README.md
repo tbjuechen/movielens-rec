@@ -53,6 +53,9 @@ PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model i
 ```bash
 # 测试热门召回效果
 PYTHONPATH=. conda run -n movielens-rec python examples/test_recall_popularity.py
+
+# 测试 ItemCF 个性化召回效果
+PYTHONPATH=. conda run -n movielens-rec python examples/test_recall_itemcf.py
 ```
 
 ---
