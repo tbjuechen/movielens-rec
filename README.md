@@ -50,6 +50,9 @@ PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model p
 
 # 训练 ItemCF 召回模型
 PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model itemcf
+
+# 训练双塔召回模型
+PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model two_tower --epochs 5
 ```
 
 ## 5. 测试与演示

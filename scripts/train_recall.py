@@ -3,37 +3,56 @@ from loguru import logger
 import pandas as pd
 from src.models.recall.popularity import PopularityRecall
 from src.models.recall.itemcf import ItemCFRecall
+from src.models.recall.two_tower import TwoTowerRecall
 from pathlib import Path
 
 def train_recall():
     parser = argparse.ArgumentParser(description="训练/预计算召回模型")
-    parser.add_argument("--model", type=str, required=True, choices=["popularity", "itemcf"], help="选择召回模型")
-    parser.add_argument("--input", type=str, default="data/processed/ratings.parquet", help="评分数据路径")
+    parser.add_argument("--model", type=str, required=True, choices=["popularity", "itemcf", "two_tower"], help="选择召回模型")
+    parser.add_argument("--input", type=str, help="数据路径 (若不指定则根据模型选择默认路径)")
     parser.add_argument("--output_dir", type=str, default="saved_models", help="模型保存目录")
+    
+    # 双塔模型超参数
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--embed_dim", type=int, default=64)
     
     args = parser.parse_args()
     
-    # 1. 加载数据
-    logger.info(f"Loading training data from {args.input}...")
-    if not Path(args.input).exists():
-        logger.error(f"Input file not found: {args.input}")
-        return
+    # 1. 确定默认输入路径
+    if args.input:
+        input_path = args.input
+    else:
+        if args.model == "two_tower":
+            input_path = "data/processed/two_tower/train.parquet"
+        else:
+            input_path = "data/processed/ratings.parquet"
 
-    df_train = pd.read_parquet(args.input)
+    # 2. 加载数据
+    logger.info(f"Loading training data from {input_path}...")
+    if not Path(input_path).exists():
+        logger.error(f"Input file not found: {input_path}")
+        return
+    df_train = pd.read_parquet(input_path)
     
-    # 2. 实例化模型
+    # 3. 实例化模型并确定保存路径
     if args.model == "popularity":
         model = PopularityRecall()
         save_path = Path(args.output_dir) / "popularity_recall.pkl"
+        model.train(df_train)
+        model.save(str(save_path))
     elif args.model == "itemcf":
         model = ItemCFRecall()
         save_path = Path(args.output_dir) / "itemcf_recall.pkl"
+        model.train(df_train)
+        model.save(str(save_path))
+    elif args.model == "two_tower":
+        model = TwoTowerRecall(embed_dim=args.embed_dim)
+        save_path = Path(args.output_dir) / "two_tower_model"
+        model.train(df_train, epochs=args.epochs, batch_size=args.batch_size)
+        model.save(str(save_path))
     else:
         raise ValueError(f"Unsupported model: {args.model}")
-    
-    # 3. 训练并保存
-    model.train(df_train)
-    model.save(str(save_path))
     
     logger.success(f"Model {args.model} trained and saved to {save_path}")
 
