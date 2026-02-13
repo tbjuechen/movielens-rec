@@ -74,8 +74,11 @@ def evaluate_all():
             model.load(path)
             preds = []
             for uid_int in tqdm(sample_users, desc=f"Evaluating {name}"):
-                rec_internal = model.recall(uid_int, top_n=top_k)
-                preds.append([mid_int for mid_int, _ in rec_internal])
+                # 修复：双塔召回接口需要原始 ID
+                uid_raw = inv_user_map[uid_int]
+                raw_rec = model.recall(uid_raw, top_n=top_k)
+                # 召回结果是原始 ID，映射回内部 ID 以便 HitRate 计算
+                preds.append([movie_map[mid] for mid, _ in raw_rec if mid in movie_map])
 
         hr = calculate_hit_rate(preds, gt_list)
         results_summary.append((name, hr))
