@@ -28,6 +28,7 @@ The contents of this directory are intended to be used as follows:
 
 ## Development Conventions
 - **Atomic Commits**: Each commit must be atomic, implementing a single feature or fulfilling a single purpose. Avoid bundling multiple unrelated changes into one commit.
+- **Logging**: Use `loguru` for all project-wide logging instead of the standard library `logging` or `print` statements.
 
 ## Development Status
 This project is currently in the **initial data setup phase**. No source code or scripts have been implemented yet. Future additions may include Python scripts (using libraries like `pandas`, `scikit-learn`, or `PyTorch`), notebooks, or specialized recommendation engine frameworks.
