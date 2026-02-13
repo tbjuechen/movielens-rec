@@ -17,19 +17,24 @@ class APIEmbedder:
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model = "text-embedding-3-small"
 
-    def get_embeddings(self, texts: List[str], batch_size: int = 100) -> List[List[float]]:
+    def get_embeddings(self, texts: List[str], batch_size: int = 500) -> List[List[float]]:
         """
-        批量获取嵌入向量。
+        批量获取嵌入向量。由于 API 限制较高 (RPM 2000, TPM 100W)，增加 batch_size 以加速。
         """
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
-            batch_texts = [t[:8000] for t in texts[i:i + batch_size]] # 防止单文本超长
+            batch_texts = [str(t)[:8000] for t in texts[i:i + batch_size]]
             
             try:
+                # 记录请求时间
+                start_time = time.time()
                 response = self.client.embeddings.create(
                     input=batch_texts,
                     model=self.model
                 )
+                duration = time.time() - start_time
+                logger.debug(f"Fetched {len(batch_texts)} embeddings in {duration:.2f}s")
+                
                 batch_embeddings = [data.embedding for data in response.data]
                 all_embeddings.extend(batch_embeddings)
                 
