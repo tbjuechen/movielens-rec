@@ -43,6 +43,15 @@ PYTHONPATH=. conda run -n movielens-rec python scripts/run_preprocessing.py
 PYTHONPATH=. conda run -n movielens-rec python scripts/train_recall.py --model popularity
 ```
 
+## 5. 测试与演示
+
+可以使用 `examples/` 目录下的脚本快速验证模型效果：
+
+```bash
+# 测试热门召回效果
+PYTHONPATH=. conda run -n movielens-rec python examples/test_recall_popularity.py
+```
+
 ---
 
 ## 开发规范
