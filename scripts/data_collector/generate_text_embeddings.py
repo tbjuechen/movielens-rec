@@ -55,7 +55,10 @@ def run_embedding_task():
             
             # 追加并保存
             df_existing = pd.concat([df_existing, df_chunk_res], ignore_index=True)
+            # 保存为 Parquet (生产用)
             df_existing.to_parquet(output_path, index=False)
+            # 保存为 CSV (分享与查看用)
+            df_existing.to_csv(output_path.with_suffix('.csv'), index=False)
             
             pbar.update(len(chunk))
             pbar.set_postfix({"total": len(df_existing)})
