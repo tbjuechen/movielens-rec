@@ -27,7 +27,7 @@ class APIEmbedder:
         """
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
-            batch_texts = [str(t)[:8000] for t in texts[i:i + batch_size]]
+            batch_texts = [str(t) for t in texts[i:i + batch_size]]
             
             try:
                 # 记录请求时间
