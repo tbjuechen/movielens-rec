@@ -1,6 +1,7 @@
 import argparse
 from loguru import logger
 import pandas as pd
+import pickle
 from src.models.recall.popularity import PopularityRecall
 from src.models.recall.itemcf import ItemCFRecall
 from src.models.recall.two_tower import TwoTowerRecall
