@@ -35,13 +35,16 @@ def train_recall():
         return
     df_train = pd.read_parquet(input_path)
     
-    # 双塔 V2 特有：加载特征查询表
+    # 双塔 V2 特有：加载特征查询表和映射表
     user_features, item_features = None, None
+    user_map, movie_map = {}, {}
     if args.model == "two_tower":
         feat_dir = Path("data/processed/two_tower")
-        logger.info("Loading feature tables for Two-Tower V2...")
+        logger.info("Loading feature tables and mappings for Two-Tower V2...")
         user_features = pd.read_parquet(feat_dir / "user_features.parquet")
         item_features = pd.read_parquet(feat_dir / "item_features.parquet")
+        with open(feat_dir / "user_map.pkl", "rb") as f: user_map = pickle.load(f)
+        with open(feat_dir / "movie_map.pkl", "rb") as f: movie_map = pickle.load(f)
 
     # 3. 实例化模型并确定保存路径
     if args.model == "popularity":
@@ -56,13 +59,15 @@ def train_recall():
         model.save(str(save_path))
     elif args.model == "two_tower":
         model = TwoTowerRecall(embed_dim=args.embed_dim)
-        save_path = Path(args.output_dir) / "two_tower_model_v2"
+        save_path = Path(args.output_dir) / "two_tower_v2"
         model.train(
             df_train, 
             epochs=args.epochs, 
             batch_size=args.batch_size,
             user_features=user_features,
-            item_features=item_features
+            item_features=item_features,
+            user_map=user_map,
+            movie_map=movie_map
         )
         model.save(str(save_path))
     else:
