@@ -195,12 +195,18 @@ class TwoTowerRecall(BaseRecall):
         device = next(self.model.parameters()).device
         u_id_tensor = torch.LongTensor([uid_int]).to(device)
         
-        # 修复：对题材列表进行 Padding 到长度 3
+        # 确保 genres 是列表类型并进行 Padding
         genres = feat['user_top_genres_idx']
-        padded_genres = genres + [0] * (3 - len(genres))
-        u_genres_tensor = torch.LongTensor([padded_genres]).to(device)
+        if isinstance(genres, np.ndarray):
+            genres = genres.tolist()
+        padded_genres = (genres + [0] * 3)[:3]
         
-        u_num_tensor = torch.FloatTensor([[feat['user_avg_rating_norm'], feat['user_rating_count_norm']]]).to(device)
+        # 使用 numpy 中转以提升性能并消除警告
+        u_genres_tensor = torch.as_tensor(np.array([padded_genres]), dtype=torch.long).to(device)
+        
+        # 数值特征同样处理
+        num_feats = np.array([[feat['user_avg_rating_norm'], feat['user_rating_count_norm']]], dtype=np.float32)
+        u_num_tensor = torch.as_tensor(num_feats).to(device)
 
         self.model.eval()
         with torch.no_grad():
