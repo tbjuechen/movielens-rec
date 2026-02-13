@@ -41,12 +41,24 @@ PYTHONPATH=. python scripts/prepare_two_tower_data.py
 
 支持多路并发召回，核心指标 **HitRate@50** 已达到 **0.35**。
 
-- **热门召回 (Popularity)**：带“已看过滤”的全局基准路。
-- **协同过滤 (ItemCF)**：基于 `scipy` 稀疏矩阵的个性化关联路。
-- **多模态双塔 (Two-Tower V2)**：融合 ID、题材和统计特征的深度学习核心路。
+### 3.1 训练召回模型
+所有召回模型通过统一的驱动脚本训练：
 
 ```bash
-# 一键评估召回率
+# 1. 训练热门召回 (Popularity)
+PYTHONPATH=. python scripts/train_recall.py --model popularity --input data/processed/two_tower/train.parquet
+
+# 2. 训练物品协同过滤 (ItemCF)
+PYTHONPATH=. python scripts/train_recall.py --model itemcf --input data/processed/two_tower/train.parquet
+
+# 3. 训练多模态双塔模型 (Two-Tower V2)
+# 建议配置：M4 芯片下 batch_size 越大，负采样效果越好
+PYTHONPATH=. python scripts/train_recall.py --model two_tower --epochs 5 --batch_size 8192
+```
+
+### 3.2 一键对比评估
+在测试集上对比三路召回的真实命中率：
+```bash
 PYTHONPATH=. python scripts/evaluate_recall.py
 ```
 
