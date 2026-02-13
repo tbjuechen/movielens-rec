@@ -80,6 +80,7 @@ isoduration=20.11.0=pyhd8ed1ab_1
 jansson=2.14=h80987f9_1
 jedi=0.19.2=pyhd8ed1ab_1
 jinja2=3.1.6=pyhcf101f3_1
+joblib=1.5.3=pyhd8ed1ab_0
 jpeg=9e=h1a8c8d9_3
 json5=0.13.0=pyhd8ed1ab_0
 jsonpointer=3.0.0=pyhcf101f3_3
@@ -133,6 +134,7 @@ libpng=1.6.55=h132b30e_0
 libprotobuf=6.33.0=h6acce77_1
 libre2-11=2025.11.05=hd4f4e8d_0
 libsodium=1.0.20=h99b78c6_0
+libsqlite=3.51.2=h1b79a29_0
 libssh2=1.11.1=h3e2b118_0
 libthrift=0.22.0=hbe873a3_0
 libtiff=4.7.1=h367c460_0
@@ -190,7 +192,7 @@ pyobjc-core=12.1=py310h73c2a22_0
 pyobjc-framework-cocoa=12.1=py310h73c2a22_0
 pyparsing=3.3.2=pyhcf101f3_0
 pysocks=1.7.1=pyha55dd90_7
-python=3.10.19=hf701271_0
+python=3.10.15=hdce6c4c_2_cpython
 python-dateutil=2.9.0post0=py310hca03da5_2
 python-fastjsonschema=2.21.2=pyhe01879c_0
 python-json-logger=2.0.7=pyhd8ed1ab_0
@@ -208,6 +210,7 @@ rfc3339-validator=0.1.4=pyhd8ed1ab_1
 rfc3986-validator=0.1.1=pyh9f0ad1d_0
 rfc3987-syntax=1.1.0=pyhe01879c_1
 rpds-py=0.28.0=py310h931abed_0
+scikit-learn=1.7.2=py310h660f142_0
 scipy=1.15.3=py310h132fc3c_1
 seaborn=0.13.2=hd8ed1ab_3
 seaborn-base=0.13.2=pyhd8ed1ab_3
@@ -222,6 +225,7 @@ stack_data=0.6.3=pyhd8ed1ab_1
 statsmodels=0.14.6=py310haa24f5a_0
 svt-av1=4.0.0=h0cb729a_0
 terminado=0.18.1=pyhc90fa1f_1
+threadpoolctl=3.6.0=pyhecae5ae_0
 tinycss2=1.4.0=pyhd8ed1ab_0
 tk=8.6.15=hcd8a7d5_0
 tomli=2.4.0=pyhcf101f3_0
