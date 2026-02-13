@@ -187,6 +187,25 @@ class TwoTowerRecall(BaseRecall):
         logger.info(f"Two-Tower model saved to {path}")
 
     def load(self, path: str) -> None:
-        # 实际加载需要根据训练时的 num_users/num_items 重新实例化模型
-        # 这里为了演示先略过具体恢复逻辑，后续在 Pipeline 中完善
-        logger.warning("Load logic needs exact num_users/num_items from metadata.")
+        """从磁盘恢复模型、索引和元数据"""
+        # 1. 加载元数据
+        with open(f"{path}/meta.pkl", "rb") as f:
+            meta = pickle.load(f)
+        self.embed_dim = meta['embed_dim']
+        self.temperature = meta['temp']
+
+        # 2. 恢复 Faiss 索引
+        self.faiss_index = faiss.read_index(f"{path}/item_index.faiss")
+        
+        # 3. 恢复 PyTorch 模型
+        # 注意：为了恢复模型，我们需要知道训练时的 num_users 和 num_items
+        # 这里从 Faiss 索引和权重文件中推断
+        state_dict = torch.load(f"{path}/model.pth", map_location="cpu")
+        num_users = state_dict['user_tower.user_embed.weight'].shape[0]
+        num_items = state_dict['item_tower.item_embed.weight'].shape[0]
+        
+        self.model = TwoTowerModel(num_users, num_items, self.embed_dim, self.temperature)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        
+        logger.info(f"Two-Tower model loaded from {path} (Users: {num_users}, Items: {num_items})")
