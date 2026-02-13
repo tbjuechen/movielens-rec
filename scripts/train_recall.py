@@ -35,6 +35,14 @@ def train_recall():
         return
     df_train = pd.read_parquet(input_path)
     
+    # 双塔 V2 特有：加载特征查询表
+    user_features, item_features = None, None
+    if args.model == "two_tower":
+        feat_dir = Path("data/processed/two_tower")
+        logger.info("Loading feature tables for Two-Tower V2...")
+        user_features = pd.read_parquet(feat_dir / "user_features.parquet")
+        item_features = pd.read_parquet(feat_dir / "item_features.parquet")
+
     # 3. 实例化模型并确定保存路径
     if args.model == "popularity":
         model = PopularityRecall()
@@ -48,8 +56,14 @@ def train_recall():
         model.save(str(save_path))
     elif args.model == "two_tower":
         model = TwoTowerRecall(embed_dim=args.embed_dim)
-        save_path = Path(args.output_dir) / "two_tower_model"
-        model.train(df_train, epochs=args.epochs, batch_size=args.batch_size)
+        save_path = Path(args.output_dir) / "two_tower_model_v2"
+        model.train(
+            df_train, 
+            epochs=args.epochs, 
+            batch_size=args.batch_size,
+            user_features=user_features,
+            item_features=item_features
+        )
         model.save(str(save_path))
     else:
         raise ValueError(f"Unsupported model: {args.model}")
