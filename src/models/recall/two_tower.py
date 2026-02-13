@@ -57,18 +57,60 @@ class TwoTowerModel(nn.Module):
         item_vector = self.item_tower(item_ids)
         return user_vector, item_vector
 
-# --- 数据集类 ---
+# --- 数据集类 V2 ---
 
 class MovieLensDataset(Dataset):
-    def __init__(self, df: pd.DataFrame):
-        self.users = torch.LongTensor(df['userId'].values)
-        self.items = torch.LongTensor(df['movieId'].values)
+    def __init__(self, df_interactions: pd.DataFrame, user_features: pd.DataFrame, item_features: pd.DataFrame):
+        """
+        df_interactions: 包含 userId, movieId, rating
+        user_features: 包含 userId_int, user_avg_rating_norm, user_rating_count_norm, user_top_genres_idx
+        item_features: 包含 movieId_int, genres_idx, release_year_norm, item_avg_rating_norm, item_rating_count_norm
+        """
+        self.users = df_interactions['userId'].values
+        self.items = df_interactions['movieId'].values
+        
+        # 将特征表转换为字典，加速查询
+        logger.info("Building feature lookup dictionaries...")
+        self.user_feat_dict = user_features.set_index('userId_int').to_dict('index')
+        self.item_feat_dict = item_features.set_index('movieId_int').to_dict('index')
 
     def __len__(self):
         return len(self.users)
 
     def __getitem__(self, idx):
-        return self.users[idx], self.items[idx]
+        uid = self.users[idx]
+        mid = self.items[idx]
+        
+        u_feat = self.user_feat_dict[uid]
+        i_feat = self.item_feat_dict[mid]
+        
+        return {
+            "user_id": uid,
+            "user_numeric": np.array([u_feat['user_avg_rating_norm'], u_feat['user_rating_count_norm']], dtype=np.float32),
+            "user_genres": np.array(u_feat['user_top_genres_idx'], dtype=np.int64),
+            "item_id": mid,
+            "item_numeric": np.array([i_feat['release_year_norm'], i_feat['item_avg_rating_norm'], i_feat['item_rating_count_norm']], dtype=np.float32),
+            "item_genres": np.array(i_feat['genres_idx'], dtype=np.int64)
+        }
+
+def collate_fn(batch):
+    """
+    自定义 Collate 函数，处理变长题材列表（进行零填充）。
+    """
+    res = {}
+    for key in ["user_id", "item_id"]:
+        res[key] = torch.LongTensor([x[key] for x in batch])
+    
+    for key in ["user_numeric", "item_numeric"]:
+        res[key] = torch.FloatTensor(np.stack([x[key] for x in batch]))
+        
+    # 处理题材 Padding (user_genres 是固定长度 3，item_genres 是变长)
+    res["user_genres"] = torch.LongTensor(np.stack([x["user_genres"] for x in batch]))
+    
+    item_genres_list = [torch.LongTensor(x["item_genres"]) for x in batch]
+    res["item_genres"] = torch.nn.utils.rnn.pad_sequence(item_genres_list, batch_first=True, padding_value=0)
+    
+    return res
 
 # --- 召回封装类 ---
 
