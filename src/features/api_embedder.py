@@ -22,8 +22,10 @@ class APIEmbedder:
         logger.info(f"APIEmbedder initialized with model: {self.model}")
 
     def _fetch_single_batch(self, batch_texts: List[str]) -> List[List[float]]:
-        """单个 Batch 的抓取逻辑，用于线程池"""
+        """单个 Batch 的抓取逻辑，包含频率缓冲"""
         try:
+            # 增加一个基础间隔，防止请求过于密集
+            time.sleep(0.2) 
             response = self.client.embeddings.create(
                 input=batch_texts,
                 model=self.model
@@ -31,17 +33,17 @@ class APIEmbedder:
             return [data.embedding for data in response.data]
         except Exception as e:
             logger.error(f"Batch fetch error: {e}")
-            time.sleep(2) # 遇到错误稍作休息
-            return self._fetch_single_batch(batch_texts) # 简单重试
+            time.sleep(5) # 遇到错误多休息一会儿
+            return self._fetch_single_batch(batch_texts)
 
-    def get_embeddings(self, texts: List[str], batch_size: int = 64, max_workers: int = 10) -> List[List[float]]:
+    def get_embeddings(self, texts: List[str], batch_size: int = 64, max_workers: int = 3) -> List[List[float]]:
         """
-        利用线程池并发获取嵌入向量。
+        利用线程池并发获取嵌入向量。并发数已降低，并增加了间隔以防止速率过快。
         """
         batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
         all_embeddings = []
         
-        logger.info(f"Starting parallel embedding fetch with {max_workers} workers...")
+        logger.info(f"Starting controlled parallel fetch with {max_workers} workers...")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 使用 map 保证返回顺序与输入顺序一致
