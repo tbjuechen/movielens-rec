@@ -26,5 +26,8 @@ The contents of this directory are intended to be used as follows:
 3. **Model Training**: Implementing collaborative filtering, content-based filtering, or hybrid recommendation models.
 4. **Evaluation**: Using the ratings data to test the accuracy and relevance of generated recommendations.
 
+## Development Conventions
+- **Atomic Commits**: Each commit must be atomic, implementing a single feature or fulfilling a single purpose. Avoid bundling multiple unrelated changes into one commit.
+
 ## Development Status
 This project is currently in the **initial data setup phase**. No source code or scripts have been implemented yet. Future additions may include Python scripts (using libraries like `pandas`, `scikit-learn`, or `PyTorch`), notebooks, or specialized recommendation engine frameworks.
