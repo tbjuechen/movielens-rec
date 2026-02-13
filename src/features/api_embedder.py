@@ -21,9 +21,9 @@ class APIEmbedder:
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         logger.info(f"APIEmbedder initialized with model: {self.model}")
 
-    def get_embeddings(self, texts: List[str], batch_size: int = 500) -> List[List[float]]:
+    def get_embeddings(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
         """
-        批量获取嵌入向量。由于 API 限制较高 (RPM 2000, TPM 100W)，增加 batch_size 以加速。
+        批量获取嵌入向量。适配厂商限制 (通常为 64)。
         """
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
