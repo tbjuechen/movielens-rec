@@ -30,15 +30,15 @@ The contents of this directory are intended to be used as follows:
 
 ### Phase 1: Data Engineering & Feature Engineering
 - [x] **Data Formatting**: Convert raw CSVs to Parquet for performance (Completed).
-- [ ] **EDA (Exploratory Data Analysis)**: Analyze user activity, movie popularity, and rating distributions.
-- [ ] **Feature Processing**:
-    - User: Historical interactions, average ratings, activity patterns.
-    - Movie: Genres, release year, popularity metrics.
-    - Context: Temporal features from timestamps.
+- [x] **EDA (Exploratory Data Analysis)**: Analyze user activity, movie popularity, and rating distributions (Completed).
+- [x] **Feature Processing**:
+    - Movie: Year extraction and genre splitting implemented (Completed).
+    - User/Context: (Planned).
 
 ### Phase 2: Multi-channel Recall (召回)
 - **Goal**: Filter ~87,000 movies down to 500-1000 candidates.
-- [ ] **Popularity-based**: Global and genre-specific hot movies.
+- [x] **Base Infrastructure**: Abstract base class `BaseRecall` implemented (Completed).
+- [/] **Popularity-based**: Model implemented, pending training script (In Progress).
 - [ ] **Collaborative Filtering**: ItemCF, UserCF.
 - [ ] **Embedding-based**: Vector search using Item2Vec or Two-Tower models.
 
@@ -59,6 +59,7 @@ The contents of this directory are intended to be used as follows:
 ## Development Conventions
 - **Atomic Commits**: Each commit must be atomic, implementing a single feature or fulfilling a single purpose. Avoid bundling multiple unrelated changes into one commit.
 - **Logging**: Use `loguru` for all project-wide logging instead of the standard library `logging` or `print` statements.
+- **Documentation**: Proactively update `README.md` and `GEMINI.md` with relevant CLI commands and progress whenever a new script or core feature is implemented.
 
 ## Development Status
-This project is currently in the **initial data setup phase**. No source code or scripts have been implemented yet. Future additions may include Python scripts (using libraries like `pandas`, `scikit-learn`, or `PyTorch`), notebooks, or specialized recommendation engine frameworks.
+This project is currently in the **active development phase**. Core data infrastructure, EDA, and the initial recall module are being established.
