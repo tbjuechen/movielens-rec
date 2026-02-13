@@ -72,3 +72,7 @@ PYTHONPATH=. python scripts/evaluate_recall.py
 - **星型模型**：外部元数据按 `Movies`, `Persons`, `Cast`, `Crew` 四张表存储，确保数据无冗余。
 - **原子提交**：严格遵循一个提交解决一个问题的原则。
 - **MPS 优化**：针对 Apple 芯片手动实现 pooling 算子，绕过 PyTorch 兼容性限制。
+
+## 许可证 (License)
+
+本项目采用 [MIT License](LICENSE) 开源协议。
