@@ -106,10 +106,12 @@ class TwoTowerRecall(BaseRecall):
         dataset = MovieLensDataset(df_train)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+        logger.info("Data loading and tensor conversion finished. Starting training loop...")
+        
         self.model.train()
         for epoch in range(epochs):
             total_loss = 0
-            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", mininterval=1.0)
             for user_ids, item_ids in pbar:
                 user_ids, item_ids = user_ids.to(device), item_ids.to(device)
                 
