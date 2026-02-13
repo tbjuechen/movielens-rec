@@ -34,6 +34,12 @@ PYTHONPATH=. conda run -n movielens-rec python scripts/run_preprocessing.py
 
 ## 4. 召回模块 (Recall)
 
+### 数据准备 (双塔模型专用)
+双塔模型需要进行 ID 连续化编码及时间切分：
+```bash
+PYTHONPATH=. conda run -n movielens-rec python scripts/prepare_two_tower_data.py
+```
+
 ### 热门召回 (Popularity Recall)
 统计全局最热门的电影榜单。
 
