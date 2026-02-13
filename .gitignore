@@ -1,5 +1,6 @@
 data/ml-32m/
 data/processed/
+data/raw/
 saved_models/
 *.parquet
 __pycache__/
