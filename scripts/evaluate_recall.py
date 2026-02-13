@@ -52,9 +52,12 @@ def evaluate_all():
         if name == "Popularity":
             model = PopularityRecall()
             model.load(path)
-            raw_top_mids = [mid for mid, _ in model.recall(0, top_n=top_k)]
-            internal_top_mids = [movie_map[mid] for mid in raw_top_mids if mid in movie_map]
-            preds = [internal_top_mids for _ in sample_users]
+            preds = []
+            for uid_int in tqdm(sample_users, desc=f"Evaluating {name}"):
+                uid_raw = inv_user_map[uid_int]
+                # 现在热门召回也会根据 userId 过滤已看
+                raw_rec = model.recall(uid_raw, top_n=top_k)
+                preds.append([movie_map[mid] for mid, _ in raw_rec if mid in movie_map])
             
         elif name == "ItemCF":
             model = ItemCFRecall()
