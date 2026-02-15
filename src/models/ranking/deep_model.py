@@ -12,7 +12,7 @@ class MMoELayer(nn.Module):
         self.num_experts = num_experts
         self.num_tasks = num_tasks
         
-        # 1. Experts: 一组专家网络
+        # 1. Experts
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(input_dim, expert_hidden_units[0]),
@@ -21,7 +21,7 @@ class MMoELayer(nn.Module):
             ) for _ in range(num_experts)
         ])
         
-        # 2. Gates: 每个任务都有一个门控网络
+        # 2. Gates
         self.gates = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(input_dim, num_experts),
@@ -30,19 +30,17 @@ class MMoELayer(nn.Module):
         ])
 
     def forward(self, x):
-        # x: (B, input_dim)
-        # expert_outputs: (num_experts, B, expert_dim)
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0) # (num_experts, B, expert_dim)
         
         final_outputs = []
         for i in range(self.num_tasks):
-            # gate_weights: (B, num_experts)
-            gate_weights = self.gates[i](x)
-            # 加权求和: (B, expert_dim)
-            task_out = torch.sum(gate_weights.transpose(0, 1).unsqueeze(-1) * expert_outputs, dim=0)
+            gate_weights = self.gates[i](x) # (B, num_experts)
+            # Transpose weights to (num_experts, B, 1) for broadcasting
+            weights = gate_weights.t().unsqueeze(-1)
+            task_out = torch.sum(weights * expert_outputs, dim=0) # (B, expert_dim)
             final_outputs.append(task_out)
             
-        return final_outputs # List of (B, expert_dim)
+        return final_outputs
 
 class UnifiedDeepRanker(nn.Module):
     def __init__(self, 
@@ -54,7 +52,7 @@ class UnifiedDeepRanker(nn.Module):
         self.feature_map = feature_map
         self.tasks = tasks
         
-        # 1. Embedding Layers (扩容至 128)
+        # 1. Embedding Layers
         self.embeddings = nn.ModuleDict()
         for feat, size in feature_map['sparse'].items():
             self.embeddings[feat] = nn.Embedding(size + 1, embedding_dim, padding_idx=0)
@@ -62,15 +60,15 @@ class UnifiedDeepRanker(nn.Module):
         # 2. Sequence Layer (DIN)
         self.din_attention = AttentionSequencePooling(embedding_dim)
         
-        # 3. 维度计算
+        # 3. Dimension Calculation
         self.total_input_dim = (len(feature_map['sparse']) * embedding_dim) + \
                                embedding_dim + \
                                feature_map['dense']
         
-        # 4. DCN Layer (高阶交叉)
+        # 4. DCN Layer
         self.cross_net = CrossNetV2(self.total_input_dim, num_layers=3)
         
-        # 5. MMoE Layer (专家系统)
+        # 5. MMoE Layer
         self.mmoe = MMoELayer(
             input_dim=self.total_input_dim,
             num_experts=num_experts,
@@ -80,28 +78,37 @@ class UnifiedDeepRanker(nn.Module):
         
         # 6. Task Heads
         self.heads = nn.ModuleDict()
-        for i, task in enumerate(tasks):
-            # 每个任务基于 MMoE 吐出的 expert 融合向量进行最终预测
+        for task in tasks:
             self.heads[task] = nn.Linear(128, 1)
 
     def forward(self, inputs):
-        # A. Embeddings
-        sparse_embs = [self.embeddings[feat](inputs[feat]) for feat in self.feature_map['sparse']]
+        """
+        核心修复：自动处理 Listwise (3D) 和 Pointwise (2D) 输入。
+        """
+        # 1. 识别并展平维度 (B, K, ...) -> (B*K, ...)
+        is_listwise = inputs['movieId'].dim() == 2
+        if is_listwise:
+            B, K = inputs['movieId'].shape
+            flat_inputs = {
+                'movieId': inputs['movieId'].reshape(-1),
+                'seq_history': inputs['seq_history'].reshape(B*K, -1),
+                'dense_feats': inputs['dense_feats'].reshape(B*K, -1)
+            }
+        else:
+            flat_inputs = inputs
+            B, K = inputs['movieId'].size(0), 1
+
+        # A. Embeddings (B*K, E)
+        sparse_embs = [self.embeddings[feat](flat_inputs[feat]) for feat in self.feature_map['sparse']]
         
-        # B. DIN
-        target_item_emb = self.embeddings['movieId'](inputs['movieId']).unsqueeze(1)
-        history_seq_emb = self.embeddings['movieId'](inputs['seq_history'])
-        seq_mask = (inputs['seq_history'] > 0).float()
+        # B. DIN (B*K, E)
+        target_item_emb = self.embeddings['movieId'](flat_inputs['movieId']).unsqueeze(1) # (B*K, 1, E)
+        history_seq_emb = self.embeddings['movieId'](flat_inputs['seq_history']) # (B*K, T, E)
+        seq_mask = (flat_inputs['seq_history'] > 0).float()
         interest_emb = self.din_attention(target_item_emb, history_seq_emb, seq_mask)
         
-        # C. Concatenate
-        all_features = torch.cat(sparse_embs + [interest_emb, inputs['dense_feats']], dim=-1)
-        # Reshape if input was 3D (Listwise batching)
-        if all_features.dim() == 3:
-            B, K, D = all_features.shape
-            all_features = all_features.view(B*K, D)
-        else:
-            B, K = all_features.size(0), 1
+        # C. Concatenate (B*K, D_total)
+        all_features = torch.cat(sparse_embs + [interest_emb, flat_inputs['dense_feats']], dim=-1)
         
         # D. DCN Cross
         cross_out = self.cross_net(all_features)
@@ -113,7 +120,7 @@ class UnifiedDeepRanker(nn.Module):
         outputs = {}
         for i, task in enumerate(self.tasks):
             logits = self.heads[task](task_specific_features[i]).squeeze(-1)
-            # 如果是 Listwise 训练，我们在训练脚本里处理 reshape
+            # 如果是 Listwise，在这里不进行 reshape，由训练脚本根据需要 reshape
             outputs[task] = logits
             
         return outputs
