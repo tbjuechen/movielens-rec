@@ -21,7 +21,7 @@ class RankingFeatureEngine:
         self.user_high_score_directors: Dict[int, Set[int]] = {}
         self.user_high_score_actors: Dict[int, Set[int]] = {}
 
-    def initialize(self):
+    def initialize(self, ref_ratings: pd.DataFrame = None):
         """加载画像表并预计算交叉索引"""
         logger.info("正在初始化精排特征引擎...")
         
@@ -35,8 +35,10 @@ class RankingFeatureEngine:
         self.item_profile = pd.read_parquet(item_p_path)
         
         # 构建『用户-主创』匹配索引
-        logger.info("正在计算『用户-主创』高分匹配索引 (Label > 4.0)...")
-        ratings = pd.read_parquet(self.data_dir / "ratings.parquet")
+        logger.info("正在计算『用户-主创』高分匹配索引...")
+        # ⚠️ 核心改进：只基于传入的参考数据（训练集）构建偏好索引，防止标签泄露
+        ratings = ref_ratings if ref_ratings is not None else pd.read_parquet(self.data_dir / "ratings.parquet")
+        
         tmdb_crew = pd.read_parquet(self.tmdb_dir / "tmdb_movie_crew.parquet")
         tmdb_cast = pd.read_parquet(self.tmdb_dir / "tmdb_movie_cast.parquet")
         

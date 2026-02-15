@@ -27,12 +27,9 @@ def train_ranker_v2():
     test_df = samples_df.iloc[split_idx:].copy()
 
     # 3. 初始化特征引擎 (仅基于训练集数据构建索引，防止泄露)
-    # 注意：我们需要微调引擎，让它只看 train_df 里的打分情况
     engine = RankingFeatureEngine(data_dir=str(data_dir))
-    engine.initialize() 
-    
-    # ⚠️ 修正：由于当前的 initialize 内部读取的是全量 ratings，
-    # 我们在这里手动覆盖其画像数据，确保只使用训练集信息 (此处暂简处理逻辑)
+    # ⚠️ 修正：传入训练集打分记录，让引擎只基于训练集构建“最爱主创”索引
+    engine.initialize(train_df) 
     
     logger.info("提取训练集特征...")
     train_matrix = engine.build_feature_matrix(train_df)
