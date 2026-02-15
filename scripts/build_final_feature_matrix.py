@@ -3,48 +3,59 @@ import numpy as np
 from pathlib import Path
 from loguru import logger
 from src.features.ranking_feature_engine import RankingFeatureEngine
+import gc
 
-def build_final_store():
+def build_final_feature_store():
+    """
+    全量特征预计算：
+    逐个分片读取 samples，计算交叉特征，并持久化。
+    """
     data_dir = Path("data/processed")
-    ranking_dir = data_dir / "ranking"
-    input_path = ranking_dir / "ranking_samples_v2_hard.parquet"
-    output_path = ranking_dir / "final_ranking_feature_matrix.parquet"
+    input_dir = data_dir / "ranking/samples"
+    output_dir = data_dir / "ranking/features"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not input_path.exists():
-        logger.error("V2 样本集不存在，请先运行 scripts/prepare_ranking_dataset_v2.py")
-        return
-
-    logger.info("正在加载 2000w+ 样本数据进行特征预计算...")
-    samples_df = pd.read_parquet(input_path)
+    # 1. 准备参考数据（用于去泄露）
+    # 为保证严谨，我们加载原始 ratings，取前 80% 作为历史参考
+    ratings = pd.read_parquet(data_dir / "ratings.parquet")
+    ratings = ratings.sort_values('timestamp')
+    history_ratings = ratings.head(int(len(ratings) * 0.8))
     
-    # 执行三段式隔离
-    n = len(samples_df)
-    # 此处假设 60% 依然是历史参考线
-    history_ratings = samples_df.iloc[:int(n*0.6)]
-    history_ratings = history_ratings[history_ratings['label'] == 1][['userId', 'movieId', 'timestamp']]
-
-    # 初始化引擎
+    # 2. 初始化特征引擎
     engine = RankingFeatureEngine(data_dir=str(data_dir))
     engine.initialize(history_ratings)
     
-    # 核心：计算全量特征
-    # 针对大规模数据，我们分块处理以防止内存溢出
-    logger.info("开始分块提取特征并持久化...")
-    chunk_size = 500000
-    all_chunks = []
+    del ratings, history_ratings
+    gc.collect()
+
+    # 3. 逐个分片计算并存盘
+    shard_files = sorted(list(input_dir.glob("samples_shard_*.parquet")))
     
-    for i in range(0, len(samples_df), chunk_size):
-        chunk = samples_df.iloc[i:i+chunk_size]
-        logger.info(f"Processing chunk {i//chunk_size + 1}...")
-        feature_chunk = engine.build_feature_matrix(chunk)
-        all_chunks.append(feature_chunk)
+    for shard_file in shard_files:
+        logger.info(f"正在计算特征: {shard_file.name}...")
+        df_shard = pd.read_parquet(shard_file)
         
-    final_df = pd.concat(all_chunks, ignore_index=True)
-    
-    # 保存大宽表
-    logger.info(f"保存大宽表至 {output_path}...")
-    final_df.to_parquet(output_path, index=False)
-    logger.success("特征工程持久化完成！")
+        # 核心：批量生成特征矩阵
+        feature_df = engine.build_feature_matrix(df_shard)
+        
+        # 仅保留模型需要的列，舍弃中间辅助列以节省空间
+        cols_to_keep = [
+            'userId', 'movieId', 'label', 'timestamp', 'seq_history',
+            'user_avg_rating', 'user_rating_std', 'user_rating_count_log',
+            'year', 'runtime', 'budget_log', 'revenue_log', 'vote_average', 'vote_count',
+            'is_director_match', 'actor_match_count', 'rating_diff', 'semantic_sim', 'genre_match_score'
+        ]
+        feature_df = feature_df[cols_to_keep]
+        
+        output_path = output_dir / shard_file.name.replace("samples", "features")
+        feature_df.to_parquet(output_path, index=False)
+        
+        logger.success(f"特征分片已存至 {output_path}")
+        
+        del df_shard, feature_df
+        gc.collect()
+
+    logger.success("全量特征工程持久化完成！")
 
 if __name__ == "__main__":
-    build_final_store()
+    build_final_feature_store()
