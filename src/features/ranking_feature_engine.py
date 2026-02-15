@@ -85,5 +85,41 @@ class RankingFeatureEngine:
         # 2.3 评分差值
         df['rating_diff'] = df['vote_average'] - df['user_avg_rating']
         
+        # 2.4 语义相似度 (余弦相似度)
+        # 逻辑：将用户最近看过的 Last-5 电影的 Embedding 取均值，作为用户的瞬时兴趣向量
+        # 然后计算该向量与当前电影 Embedding 的余弦相似度
+        logger.info("计算语义相似度特征...")
+        
+        # 建立 movieId -> embedding 的快速查找字典
+        movie_emb_dict = dict(zip(self.item_profile['movieId'], self.item_profile['embedding']))
+        
+        def compute_semantic_sim(row):
+            seq = row.get('seq_history', [])
+            target_mid = row['movieId']
+            
+            if not isinstance(seq, (list, np.ndarray)) or len(seq) == 0:
+                return 0.0
+            
+            target_emb = movie_emb_dict.get(target_mid)
+            if target_emb is None or np.sum(np.abs(target_emb)) == 0:
+                return 0.0
+                
+            # 计算历史序列的均值向量
+            history_embs = [movie_emb_dict.get(mid) for mid in seq if movie_emb_dict.get(mid) is not None]
+            if not history_embs:
+                return 0.0
+            
+            mean_history_emb = np.mean(history_embs, axis=0)
+            
+            # 余弦相似度
+            norm_target = np.linalg.norm(target_emb)
+            norm_history = np.linalg.norm(mean_history_emb)
+            if norm_target == 0 or norm_history == 0:
+                return 0.0
+            
+            return np.dot(target_emb, mean_history_emb) / (norm_target * norm_history)
+
+        df['semantic_sim'] = df.apply(compute_semantic_sim, axis=1)
+        
         logger.success("特征矩阵构建完成。")
         return df
