@@ -16,7 +16,7 @@ def train_click_only():
     data_dir = Path("data/processed")
     ranking_dir = data_dir / "ranking"
     
-    # 1. 准备数据 (三段式隔离)
+    # 1. 准备数据
     samples_df = pd.read_parquet(ranking_dir / "ranking_samples_prototype.parquet")
     samples_df = samples_df.sort_values('timestamp').reset_index(drop=True)
     
@@ -28,6 +28,7 @@ def train_click_only():
     engine = RankingFeatureEngine(data_dir=str(data_dir))
     engine.initialize(history_ratings)
     
+    logger.info("提取特征矩阵...")
     train_df = engine.build_feature_matrix(samples_df.iloc[history_end:train_end])
     val_df = engine.build_feature_matrix(samples_df.iloc[train_end:])
     item_profile = pd.read_parquet(ranking_dir / "item_profile_ranking.parquet")
@@ -38,17 +39,14 @@ def train_click_only():
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
     
-    # 3. 初始化模型 (单任务版)
+    # 3. 初始化模型
     feature_map = {
         'sparse': {'movieId': train_ds.vocab_size},
-        'dense': 4
+        'dense': len(train_ds.dense_cols)
     }
-    model = UnifiedDeepRanker(
-        feature_map, 
-        embedding_dim=128
-    ).to(device)
+    model = UnifiedDeepRanker(feature_map, embedding_dim=128).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
     # 4. 训练
@@ -59,25 +57,22 @@ def train_click_only():
         with tqdm(train_loader, desc=f"Epoch {epoch+1}") as pbar:
             for batch in pbar:
                 B, K = batch['movieId'].shape
-                inputs = {k: v.to(device) for k, v in batch.items() if k not in ['click_label', 'rating_label']}
+                inputs = {k: v.to(device) for k, v in batch.items() if k != 'click_label'}
                 
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 
-                # Reshape logits to (B, K) for Listwise CrossEntropy
                 logits = outputs['click'].view(B, K)
                 loss = criterion(logits, batch['click_label'].to(device))
                 
                 if torch.isnan(loss):
-                    logger.warning("发现 NaN Loss，重置模型梯度并跳过。")
-                    optimizer.zero_grad()
+                    logger.warning("NaN detected, skipping...")
                     continue
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
-                # 统计 Top-1 Accuracy
                 preds = torch.argmax(logits, dim=1)
                 correct_top1 += (preds == 0).sum().item()
                 total_loss += loss.item()
