@@ -63,6 +63,7 @@ def train_click_only():
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 
+                # 把分值拉回 (B, K)
                 logits = outputs['click'].view(B, K)
                 loss = criterion(logits, batch['click_label'].to(device))
                 
@@ -73,12 +74,19 @@ def train_click_only():
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
-                # 修复统计逻辑：累加样本总数
+                # 统计 Top-1 Accuracy
                 preds = torch.argmax(logits, dim=1)
                 correct_top1 += (preds == 0).sum().item()
                 total_loss += loss.item()
                 total_samples += B
-                pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{correct_top1/total_samples:.4f}"})
+                
+                # 诊断：计算 Logits 的标准差，观察是否有数值差异
+                logit_std = torch.std(logits).item()
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}", 
+                    'acc': f"{correct_top1/total_samples:.4f}",
+                    'l_std': f"{logit_std:.3f}"
+                })
 
         logger.success(f"Epoch {epoch+1} 训练结束。")
 

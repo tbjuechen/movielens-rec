@@ -5,8 +5,7 @@ from .layers import CrossNetV2, AttentionSequencePooling
 
 class UnifiedDeepRanker(nn.Module):
     """
-    精简版精排模型：DIN + DCN-V2 + DNN (Single Task: Click)
-    优化了数值稳定性与收敛动力学。
+    增强版精排模型：优化了初始化与激活函数，引入温度系数打破数值平衡。
     """
     def __init__(self, 
                  feature_map: dict, 
@@ -19,8 +18,7 @@ class UnifiedDeepRanker(nn.Module):
         self.embeddings = nn.ModuleDict()
         for feat, size in feature_map['sparse'].items():
             self.embeddings[feat] = nn.Embedding(size + 1, embedding_dim, padding_idx=0)
-            # 初始化：Xavier Normal
-            nn.init.xavier_normal_(self.embeddings[feat].weight)
+            nn.init.normal_(self.embeddings[feat].weight, std=0.01)
             
         # 2. Sequence Layer (DIN)
         self.din_attention = AttentionSequencePooling(embedding_dim)
@@ -30,31 +28,33 @@ class UnifiedDeepRanker(nn.Module):
                                embedding_dim + \
                                feature_map['dense']
         
-        # 4. DCN Layer (高阶交叉)
+        # 4. DCN Layer
         self.cross_net = CrossNetV2(self.total_input_dim, num_layers=2)
         
-        # 5. Stability Layers (仅保留入口处 Norm)
-        self.input_norm = nn.LayerNorm(self.total_input_dim)
+        # 5. Stability Layer (仅入口 BatchNorm，比 LayerNorm 更能保持方差)
+        self.input_bn = nn.BatchNorm1d(self.total_input_dim)
         
         # 6. Deep MLP Tower
         input_dim = self.total_input_dim
         curr_units = [input_dim] + hidden_units
         layers = []
         for i in range(len(curr_units) - 1):
-            layers.append(nn.Linear(curr_units[i], curr_units[i+1]))
+            fc = nn.Linear(curr_units[i], curr_units[i+1])
+            # 使用 Kaiming 初始化
+            nn.init.kaiming_normal_(fc.weight, mode='fan_out', nonlinearity='leaky_relu')
+            layers.append(fc)
             layers.append(nn.BatchNorm1d(curr_units[i+1]))
-            layers.append(nn.ReLU())
+            layers.append(nn.LeakyReLU(0.1)) # 替换 ReLU 为 LeakyReLU
             layers.append(nn.Dropout(0.1))
         
         self.mlp_tower = nn.Sequential(*layers)
         
         # 7. Final Output Head
         self.click_head = nn.Linear(hidden_units[-1], 1)
-        # 初始化：稍微大一点的方差，打破 symmetry
-        nn.init.normal_(self.click_head.weight, std=0.01)
+        nn.init.xavier_normal_(self.click_head.weight)
 
     def forward(self, inputs):
-        # 1. 展平 Listwise 维度 (B, K, ...) -> (B*K, ...)
+        # 1. 展平
         is_listwise = inputs['movieId'].dim() == 2
         if is_listwise:
             B, K = inputs['movieId'].shape
@@ -76,9 +76,9 @@ class UnifiedDeepRanker(nn.Module):
         seq_mask = (flat_inputs['seq_history'] > 0).float()
         interest_emb = self.din_attention(target_item_emb, history_seq_emb, seq_mask)
         
-        # C. Concatenate & Norm
+        # C. Concatenate & BN
         all_features = torch.cat(sparse_embs + [interest_emb, flat_inputs['dense_feats']], dim=-1)
-        all_features = self.input_norm(all_features) # 限压阀：放在入口
+        all_features = self.input_bn(all_features)
         
         # D. DCN
         cross_out = self.cross_net(all_features)
@@ -86,7 +86,8 @@ class UnifiedDeepRanker(nn.Module):
         # E. MLP Tower
         deep_out = self.mlp_tower(cross_out)
         
-        # F. Output Logits
+        # F. Output Logits (温度系数设置为 5.0，放大差异)
         logits = self.click_head(deep_out).squeeze(-1)
+        logits = logits * 5.0 
         
         return {'click': logits}
