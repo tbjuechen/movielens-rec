@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 from tqdm import tqdm
 
-def generate_profiles():
+def generate_profiles(ref_ratings=None):
     data_dir = Path("data/processed")
     tmdb_dir = data_dir / "tmdb"
     recall_data_dir = data_dir / "two_tower"
@@ -15,8 +15,9 @@ def generate_profiles():
     logger.info("开始生成精排特征底座 (Feature Profiles)...")
 
     # --- 1. 加载所有组件 ---
-    logger.info("正在加载 MovieLens 和 TMDb 数据表...")
-    ratings = pd.read_parquet(data_dir / "ratings.parquet")
+    logger.info("正在加载数据表...")
+    # ⚠️ 修正：如果传入了 ref_ratings (训练集)，则基于它计算统计特征
+    ratings = ref_ratings if ref_ratings is not None else pd.read_parquet(data_dir / "ratings.parquet")
     movies = pd.read_parquet(data_dir / "movies.parquet")
     
     tmdb_movies = pd.read_parquet(tmdb_dir / "tmdb_movies.parquet")
