@@ -30,18 +30,20 @@ def prepare_ranking_dataset():
         lambda x: [x.iloc[max(0, i-5):i].tolist() for i in range(len(x))]
     )
 
-    # 3. 负采样 (1:1 简单随机采样)
-    logger.info("执行随机负采样...")
+    # 3. 负采样 (1:4 随机采样)
+    logger.info("执行 1:4 负采样 (增加训练难度)...")
     all_movie_ids = df['movieId'].unique()
     
-    # 构造负样本
-    neg_df = df.copy()
-    neg_df['movieId'] = np.random.choice(all_movie_ids, size=len(neg_df))
-    neg_df['label'] = 0
-    df['label'] = 1
+    neg_ratio = 4
+    neg_dfs = []
+    for _ in range(neg_ratio):
+        neg_df = df.copy()
+        neg_df['movieId'] = np.random.choice(all_movie_ids, size=len(neg_df))
+        neg_df['label'] = 0
+        neg_dfs.append(neg_df)
     
-    # 合并
-    ranking_samples = pd.concat([df, neg_df], ignore_index=True)
+    df['label'] = 1
+    ranking_samples = pd.concat([df] + neg_dfs, ignore_index=True)
     
     # 4. 落地
     output_path = ranking_dir / "ranking_samples_prototype.parquet"

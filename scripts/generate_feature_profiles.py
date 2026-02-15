@@ -79,22 +79,19 @@ def generate_profiles(ref_ratings=None):
     user_stats = user_stats.reset_index()
     user_stats['user_rating_count_log'] = np.log1p(user_stats['user_rating_count'])
     
-    # 获取用户最喜欢的题材
-    user_feat_recall = pd.read_parquet(recall_data_dir / "user_features.parquet")
-    # 加载 ID 映射表以对齐原始 userId
-    with open(recall_data_dir / "user_map.pkl", "rb") as f:
-        user_map = pickle.load(f)
-    inv_user_map = {v: k for k, v in user_map.items()}
-    
-    # 将内部 ID 映射回原始 ID
-    user_feat_recall['userId'] = user_feat_recall['userId_int'].map(inv_user_map)
-    
+    # 获取用户最喜欢的题材 (动态计算)
+    logger.info("动态计算用户题材偏好...")
+    # 联表获取每个用户看过的题材分布
+    user_movie_genres = ratings.merge(movies[['movieId', 'genres_idx']], on='movieId')
+    # 展开题材列表
+    user_genre_exploded = user_movie_genres.explode('genres_idx')
+    # 统计每个用户最常看的 Top 3 题材
+    user_top_genres = user_genre_exploded.groupby('userId')['genres_idx'].apply(
+        lambda x: x.value_counts().head(3).index.tolist()
+    ).reset_index(name='user_top_genres_idx')
+
     # 合并统计特征与题材偏好
-    user_profile = user_stats.merge(
-        user_feat_recall[['userId', 'user_top_genres_idx']], 
-        on='userId', 
-        how='left'
-    )
+    user_profile = user_stats.merge(user_top_genres, on='userId', how='left')
     
     # 填充缺失题材为空列表
     user_profile['user_top_genres_idx'] = user_profile['user_top_genres_idx'].apply(
@@ -102,7 +99,7 @@ def generate_profiles(ref_ratings=None):
     )
     
     user_profile.to_parquet(output_dir / "user_profile_ranking.parquet", index=False)
-    logger.success(f"User Profile 已存至 {output_dir / 'user_profile_ranking.parquet'}")
+    logger.success(f"User Profile 已基于动态计算存至 {output_dir / 'user_profile_ranking.parquet'}")
 
     logger.info(f"特征底座构建完成。物品表: {item_profile.shape}, 用户表: {user_profile.shape}")
 
