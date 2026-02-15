@@ -40,8 +40,8 @@ class ListwiseRankingDataset(Dataset):
         dense_cols = ['user_avg_rating', 'vote_average', 'semantic_sim', 'genre_match_score']
         dense_vals = [float(row.get(c, 0.0)) for c in dense_cols]
         
-        # 获取原始评分 (回归目标)
-        rating = float(row.get('rating', 0.0))
+        # 获取原始评分并归一化到 [0, 1]，防止 MSE 梯度爆炸
+        rating = float(row.get('rating', 0.0)) / 5.0
         
         return mid_idx, seq_idx, dense_vals, rating
 

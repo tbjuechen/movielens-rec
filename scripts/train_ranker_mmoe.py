@@ -78,11 +78,12 @@ def train_mmoe():
                 rating_labels = batch['rating_label'].view(-1).to(device)
                 rating_loss = rating_criterion(rating_preds, rating_labels)
                 
-                # 联合优化：Click 权重设为 1.0, Rating 权重设为 0.1
-                loss = click_loss + 0.1 * rating_loss
+                # 联合优化：进一步调低 Rating 权重，防止干扰主任务
+                loss = click_loss + 0.01 * rating_loss
                 
                 if torch.isnan(loss):
-                    logger.warning("发现 NaN Loss，跳过本 Batch。")
+                    logger.warning(f"发现 NaN! ClickLoss: {click_loss.item():.4f}, RatingLoss: {rating_loss.item():.4f}")
+                    optimizer.zero_grad()
                     continue
 
                 loss.backward()

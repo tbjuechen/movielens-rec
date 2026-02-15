@@ -68,8 +68,9 @@ class UnifiedDeepRanker(nn.Module):
         # 4. DCN Layer
         self.cross_net = CrossNetV2(self.total_input_dim, num_layers=3)
         
-        # 5. Stability Layer: 关键补丁，防止数值爆炸
+        # 5. Stability Layers
         self.input_norm = nn.LayerNorm(self.total_input_dim)
+        self.cross_norm = nn.LayerNorm(self.total_input_dim) # 新增：稳定交叉后的数值
         
         # 6. MMoE Layer
         self.mmoe = MMoELayer(
@@ -118,6 +119,7 @@ class UnifiedDeepRanker(nn.Module):
         
         # D. DCN Cross
         cross_out = self.cross_net(all_features)
+        cross_out = self.cross_norm(cross_out) # 应用归一化
         
         # E. MMoE Experts
         task_specific_features = self.mmoe(cross_out)
