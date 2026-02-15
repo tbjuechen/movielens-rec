@@ -4,82 +4,89 @@ import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 from pathlib import Path
 from loguru import logger
-import pickle
 from scripts.generate_feature_profiles import generate_profiles
 from src.features.ranking_feature_engine import RankingFeatureEngine
 
-def train_ranker_v3():
+def train_ranker_v4_robust():
     data_dir = Path("data/processed")
     ranking_dir = data_dir / "ranking"
-    model_dir = Path("saved_models/ranking_xgboost_v3")
+    model_dir = Path("saved_models/ranking_xgboost_v4")
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 加载样本
-    logger.info("加载原型样本数据...")
+    # 1. 加载全量样本并按时间排序
+    logger.info("加载样本并执行三段式时间切分...")
     samples_df = pd.read_parquet(ranking_dir / "ranking_samples_prototype.parquet")
-
-    # 2. 严格时间切分
-    logger.info("执行基于时间戳的训练验证集切分...")
-    samples_df = samples_df.sort_values('timestamp')
-    split_idx = int(len(samples_df) * 0.8)
+    samples_df = samples_df.sort_values('timestamp').reset_index(drop=True)
     
-    train_samples = samples_df.iloc[:split_idx].copy()
-    test_samples = samples_df.iloc[split_idx:].copy()
+    # 三段式切分比例：60% 历史, 20% 训练, 20% 验证
+    n = len(samples_df)
+    history_end = int(n * 0.6)
+    train_end = int(n * 0.8)
+    
+    # 历史区：仅用于构建画像和索引
+    history_df = samples_df.iloc[:history_end]
+    # 训练区：用于训练模型
+    train_samples = samples_df.iloc[history_end:train_end].copy()
+    # 验证区：用于评估模型
+    val_samples = samples_df.iloc[train_end:].copy()
 
-    # 3. 【核心修正】基于训练集样本重新生成画像 (Feature Isolation)
-    # 获取训练集涉及的打分记录作为参考
-    logger.info("正在基于训练集数据重新生成画像底座，防止统计泄露...")
-    # 只取 train_samples 中 label=1 (即真实打分记录) 的数据来计算画像
-    train_ratings = train_samples[train_samples['label'] == 1][['userId', 'movieId', 'rating', 'timestamp']]
-    generate_profiles(ref_ratings=train_ratings)
+    # 2. 【核心隔离】基于『历史区』生成画像和索引
+    logger.info(f"正在基于历史区 (前 60%) 记录重制画像，确保训练集完全不可见...")
+    history_ratings = history_df[history_df['label'] == 1][['userId', 'movieId', 'rating', 'timestamp']]
+    generate_profiles(ref_ratings=history_ratings)
 
-    # 4. 初始化引擎并提取特征
+    # 3. 初始化引擎 (绑定历史数据)
     engine = RankingFeatureEngine(data_dir=str(data_dir))
-    engine.initialize(train_ratings) 
+    engine.initialize(history_ratings) 
     
-    logger.info("开始提取训练集和验证集特征...")
-    train_matrix = engine.build_feature_matrix(train_samples)
-    test_matrix = engine.build_feature_matrix(test_samples)
+    # 4. 提取特征
+    logger.info("提取训练集和验证集特征 (基于历史偏好)...")
+    X_train_full = engine.build_feature_matrix(train_samples)
+    X_val_full = engine.build_feature_matrix(val_samples)
 
-    # 5. 训练
+    # 5. 特征选择
     feature_cols = [
         'user_avg_rating', 'user_rating_std', 'user_rating_count_log',
         'year', 'runtime', 'budget_log', 'revenue_log', 'vote_average', 'vote_count',
         'is_director_match', 'actor_match_count', 'rating_diff', 'semantic_sim'
     ]
 
-    X_train = train_matrix[feature_cols].fillna(0)
-    y_train = train_matrix['label']
-    X_test = test_matrix[feature_cols].fillna(0)
-    y_test = test_matrix['label']
+    X_train = X_train_full[feature_cols].fillna(0)
+    y_train = X_train_full['label']
+    X_val = X_val_full[feature_cols].fillna(0)
+    y_val = X_val_full['label']
 
-    logger.info(f"开始训练隔离后的模型... 特征数: {len(feature_cols)}")
-    dtrain = xgb.DMatrix(X_train, label=y_train)
-    dtest = xgb.DMatrix(X_test, label=y_test)
-    
+    # 6. 训练 XGBoost
+    # 增加正则化，防止过拟合
     params = {
         'objective': 'binary:logistic',
-        'max_depth': 6,
+        'max_depth': 5,
         'eta': 0.1,
         'eval_metric': ['auc', 'logloss'],
         'tree_method': 'hist',
+        'lambda': 1,  # L2 正则
+        'alpha': 0.5, # L1 正则
         'subsample': 0.8,
         'colsample_bytree': 0.8
     }
 
+    logger.info("开始训练健壮版模型...")
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval = xgb.DMatrix(X_val, label=y_val)
+    
     model = xgb.train(
         params,
         dtrain,
         num_boost_round=100,
-        evals=[(dtrain, 'train'), (dtest, 'val')],
+        evals=[(dtrain, 'train'), (dval, 'val')],
         early_stopping_rounds=15,
         verbose_eval=10
     )
 
-    # 6. 最终评估与重要性输出
-    y_pred = model.predict(dtest)
-    auc = roc_auc_score(y_test, y_pred)
-    logger.success(f"最终隔离评估 AUC: {auc:.4f}")
+    # 7. 评估输出
+    y_pred = model.predict(dval)
+    auc = roc_auc_score(y_val, y_pred)
+    logger.success(f"三段式隔离后的真实 AUC: {auc:.4f}")
     
     importance = model.get_score(importance_type='gain')
     importance_df = pd.DataFrame({
@@ -88,12 +95,11 @@ def train_ranker_v3():
     }).sort_values(by='importance', ascending=False)
     
     print("\n" + "="*30)
-    print("Final Feature Importance (Gain):")
+    print("Robust Feature Importance (Gain):")
     print(importance_df.head(10))
     print("="*30 + "\n")
 
-    model.save_model(model_dir / "ranker_v3.json")
-    logger.info(f"模型已保存至 {model_dir}")
+    model.save_model(model_dir / "ranker_robust.json")
 
 if __name__ == "__main__":
-    train_ranker_v3()
+    train_ranker_v4_robust()
