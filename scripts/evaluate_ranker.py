@@ -44,7 +44,6 @@ def evaluate_ranker():
     samples_df = pd.read_parquet(ranking_dir / "ranking_samples_prototype.parquet")
     samples_df = samples_df.sort_values('timestamp').reset_index(drop=True)
     
-    # 重新构建历史偏好索引 (基于 60% 历史，确保评估无泄露)
     n = len(samples_df)
     history_ratings = samples_df.iloc[:int(n*0.6)]
     history_ratings = history_ratings[history_ratings['label'] == 1][['userId', 'movieId', 'rating', 'timestamp']]
@@ -60,7 +59,7 @@ def evaluate_ranker():
     
     # 3. 数据加载器 (Listwise)
     val_ds = ListwiseRankingDataset(val_df, item_profile)
-    # 覆盖 Dataset 的 mid_map 以确保与训练时一致
+    # 覆盖元数据
     val_ds.mid_map = meta['mid_map']
     val_loader = DataLoader(val_ds, batch_size=512, shuffle=False)
 
@@ -76,33 +75,31 @@ def evaluate_ranker():
             outputs = model(inputs)
             logits = outputs['click'].view(B, K) # (Batch, 5)
             
-            # 对每一组候选计算指标
             for i in range(B):
                 scores = logits[i].cpu().numpy()
-                # 真实的正样本永远在索引 0
-                rank = (scores > scores[0]).sum() + 1
+                # 真实的正样本在索引 0
+                # 公平排名计算：处理平分
+                num_strictly_greater = (scores > scores[0]).sum()
+                num_equal = (scores == scores[0]).sum()
+                rank = num_strictly_greater + (num_equal + 1) / 2.0
                 
-                # Top-1 Acc
-                metrics['top1_acc'].append(1 if rank == 1 else 0)
-                # MRR
+                metrics['top1_acc'].append(1 if rank <= 1.5 else 0)
                 metrics['mrr'].append(1.0 / rank)
-                # NDCG (对于 1个正样本，r 向量形如 [1, 0, 0, 0, 0] 的置换)
-                relevance = np.zeros(K)
-                # 预测排名对应的相关性
-                pred_order = np.argsort(-scores) # 从大到小排索引
+                
+                # NDCG 计算
+                pred_order = np.argsort(-scores)
                 binary_rel = [1 if idx == 0 else 0 for idx in pred_order]
                 metrics['ndcg5'].append(ndcg_at_k(binary_rel, 5))
 
     # 5. 输出报告
-    print("
-" + "="*40)
+    logger.success("性能评估完成。")
+    print("\n" + "="*40)
     print("精排模型性能报告 (Validation Set)")
     print("-" * 40)
     print(f"Top-1 Accuracy: {np.mean(metrics['top1_acc']):.4f}")
     print(f"Mean RR (MRR):  {np.mean(metrics['mrr']):.4f}")
     print(f"NDCG@5:         {np.mean(metrics['ndcg5']):.4f}")
-    print("="*40 + "
-")
+    print("="*40 + "\n")
 
 if __name__ == "__main__":
     evaluate_ranker()

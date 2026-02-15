@@ -125,19 +125,13 @@ class RankingFeatureEngine:
 
         df['semantic_sim'] = df.apply(compute_semantic_sim, axis=1)
         
-        # 3. 最终清理与缩放
-        # 选取所有数值型列进行简单的归一化
+        # 3. 最终清理
+        # 仅确保数值列中没有 NaN，不再执行动态 Min-Max，防止特征被抹平
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         cols_to_exclude = ['userId', 'movieId', 'label', 'timestamp', 'click_label']
         feature_cols = [c for c in numeric_cols if c not in cols_to_exclude]
         
-        # 简单的 Min-Max 缩放，确保数值稳定性
-        for col in feature_cols:
-            c_min, c_max = df[col].min(), df[col].max()
-            if c_max > c_min:
-                df[col] = (df[col] - c_min) / (c_max - c_min)
-            else:
-                df[col] = 0.0
+        df[feature_cols] = df[feature_cols].fillna(0.0)
         
         logger.success(f"特征矩阵构建完成。提取了 {len(feature_cols)} 个数值特征。")
         return df
