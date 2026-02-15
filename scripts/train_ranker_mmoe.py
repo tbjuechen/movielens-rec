@@ -23,10 +23,10 @@ def train_mmoe():
     
     n = len(samples_df)
     history_end, train_end = int(n * 0.6), int(n * 0.8)
+    history_ratings = samples_df.iloc[:history_end]
+    history_ratings = history_ratings[history_ratings['label'] == 1][['userId', 'movieId', 'rating', 'timestamp']]
     
-    # 修正警告：先取切片，再在切片内过滤
-    history_df = samples_df.iloc[:history_end]
-    history_ratings = history_df[history_df['label'] == 1][['userId', 'movieId', 'rating', 'timestamp']]
+    engine = RankingFeatureEngine(data_dir=str(data_dir))
     engine.initialize(history_ratings)
     
     train_df = engine.build_feature_matrix(samples_df.iloc[history_end:train_end])
@@ -39,19 +39,20 @@ def train_mmoe():
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
     
-    # 3. 初始化『完全体』模型
+    # 3. 初始化模型 (完全体 Pro)
     feature_map = {
         'sparse': {'movieId': train_ds.vocab_size},
         'dense': 4
     }
     model = UnifiedDeepRanker(
         feature_map, 
-        embedding_dim=128,  # 加大参数量
-        num_experts=4,      # MMoE 专家
+        embedding_dim=128,
+        num_experts=4,
         tasks=['click', 'rating']
     ).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+    # 使用较小的学习率以增加稳定性
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003)
     click_criterion = nn.CrossEntropyLoss()
     rating_criterion = nn.MSELoss()
 
@@ -73,14 +74,22 @@ def train_mmoe():
                 click_loss = click_criterion(click_logits, batch['click_label'].to(device))
                 
                 # B. Rating Loss (Pointwise MSE)
-                rating_preds = outputs['rating'] # (B*K)
+                rating_preds = outputs['rating']
                 rating_labels = batch['rating_label'].view(-1).to(device)
-                # 只有正样本计算 Rating Loss (可选策略)
                 rating_loss = rating_criterion(rating_preds, rating_labels)
                 
-                # 联合优化
+                # 联合优化：Click 权重设为 1.0, Rating 权重设为 0.1
                 loss = click_loss + 0.1 * rating_loss
+                
+                if torch.isnan(loss):
+                    logger.warning("发现 NaN Loss，跳过本 Batch。")
+                    continue
+
                 loss.backward()
+                
+                # 【关键】梯度裁剪
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 
                 # 统计

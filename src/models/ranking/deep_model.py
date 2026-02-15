@@ -68,7 +68,10 @@ class UnifiedDeepRanker(nn.Module):
         # 4. DCN Layer
         self.cross_net = CrossNetV2(self.total_input_dim, num_layers=3)
         
-        # 5. MMoE Layer
+        # 5. Stability Layer: 关键补丁，防止数值爆炸
+        self.input_norm = nn.LayerNorm(self.total_input_dim)
+        
+        # 6. MMoE Layer
         self.mmoe = MMoELayer(
             input_dim=self.total_input_dim,
             num_experts=num_experts,
@@ -109,6 +112,9 @@ class UnifiedDeepRanker(nn.Module):
         
         # C. Concatenate (B*K, D_total)
         all_features = torch.cat(sparse_embs + [interest_emb, flat_inputs['dense_feats']], dim=-1)
+        
+        # 稳定性修正：层归一化
+        all_features = self.input_norm(all_features)
         
         # D. DCN Cross
         cross_out = self.cross_net(all_features)
