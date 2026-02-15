@@ -33,10 +33,11 @@ def build_final_feature_store():
     output_dir = data_dir / "ranking/features"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 准备参考数据（共享内存）
+    # 1. 准备参考数据（仅保留必要的列以节省内存）
     ratings = pd.read_parquet(data_dir / "ratings.parquet")
     ratings = ratings.sort_values('timestamp')
-    history_ratings = ratings.head(int(len(ratings) * 0.8))
+    # 只保留 userId, movieId, rating 用于构建主创索引
+    history_ratings = ratings.head(int(len(ratings) * 0.8))[['userId', 'movieId', 'rating']]
     del ratings
     gc.collect()
 

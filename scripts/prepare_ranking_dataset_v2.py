@@ -25,7 +25,7 @@ def process_user_chunk(user_chunk_data, movie_to_genres, genre_to_movies, all_mo
             
             # 难负样本 (5个)
             m_genres = movie_to_genres.get(row.movieId, [])
-            if m_genres:
+            if isinstance(m_genres, (list, np.ndarray)) and len(m_genres) > 0:
                 candidates = genre_to_movies.get(m_genres[0], all_movie_ids)
                 hard_negs = np.random.choice(candidates, 5).tolist()
             else:
