@@ -81,12 +81,13 @@ def generate_profiles(ref_ratings=None):
     
     # 获取用户最喜欢的题材 (动态计算)
     logger.info("动态计算用户题材偏好...")
-    # 联表获取每个用户看过的题材分布
-    user_movie_genres = ratings.merge(movies[['movieId', 'genres_idx']], on='movieId')
+    # 兼容性处理：如果 movies 里没有 genres_idx，使用原始 genres 字段
+    genre_col = 'genres_idx' if 'genres_idx' in movies.columns else 'genres'
+    user_movie_genres = ratings.merge(movies[['movieId', genre_col]], on='movieId')
     # 展开题材列表
-    user_genre_exploded = user_movie_genres.explode('genres_idx')
+    user_genre_exploded = user_movie_genres.explode(genre_col)
     # 统计每个用户最常看的 Top 3 题材
-    user_top_genres = user_genre_exploded.groupby('userId')['genres_idx'].apply(
+    user_top_genres = user_genre_exploded.groupby('userId')[genre_col].apply(
         lambda x: x.value_counts().head(3).index.tolist()
     ).reset_index(name='user_top_genres_idx')
 
