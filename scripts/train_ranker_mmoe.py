@@ -23,9 +23,10 @@ def train_mmoe():
     
     n = len(samples_df)
     history_end, train_end = int(n * 0.6), int(n * 0.8)
-    history_ratings = samples_df.iloc[:history_end][samples_df['label'] == 1]
     
-    engine = RankingFeatureEngine(data_dir=str(data_dir))
+    # 修正警告：先取切片，再在切片内过滤
+    history_df = samples_df.iloc[:history_end]
+    history_ratings = history_df[history_df['label'] == 1][['userId', 'movieId', 'rating', 'timestamp']]
     engine.initialize(history_ratings)
     
     train_df = engine.build_feature_matrix(samples_df.iloc[history_end:train_end])
