@@ -5,12 +5,13 @@ from .layers import CrossNetV2, AttentionSequencePooling
 
 class UnifiedDeepRanker(nn.Module):
     """
-    增强版精排模型：优化了初始化与激活函数，引入温度系数打破数值平衡。
+    高正则化精排模型：针对 99% 过拟合现象进行了强力约束。
     """
     def __init__(self, 
                  feature_map: dict, 
                  embedding_dim: int = 128,
-                 hidden_units: list = [512, 256, 128]):
+                 hidden_units: list = [512, 256, 128],
+                 dropout_rate: float = 0.5): # 提高默认 Dropout
         super().__init__()
         self.feature_map = feature_map
         
@@ -31,21 +32,20 @@ class UnifiedDeepRanker(nn.Module):
         # 4. DCN Layer
         self.cross_net = CrossNetV2(self.total_input_dim, num_layers=2)
         
-        # 5. Stability Layer (仅入口 BatchNorm，比 LayerNorm 更能保持方差)
+        # 5. Stability Layer
         self.input_bn = nn.BatchNorm1d(self.total_input_dim)
         
-        # 6. Deep MLP Tower
+        # 6. Deep MLP Tower (带强力 Dropout)
         input_dim = self.total_input_dim
         curr_units = [input_dim] + hidden_units
         layers = []
         for i in range(len(curr_units) - 1):
             fc = nn.Linear(curr_units[i], curr_units[i+1])
-            # 使用 Kaiming 初始化
             nn.init.kaiming_normal_(fc.weight, mode='fan_out', nonlinearity='leaky_relu')
             layers.append(fc)
             layers.append(nn.BatchNorm1d(curr_units[i+1]))
-            layers.append(nn.LeakyReLU(0.1)) # 替换 ReLU 为 LeakyReLU
-            layers.append(nn.Dropout(0.1))
+            layers.append(nn.LeakyReLU(0.1))
+            layers.append(nn.Dropout(dropout_rate)) # 0.5 的激进丢弃
         
         self.mlp_tower = nn.Sequential(*layers)
         
@@ -54,7 +54,6 @@ class UnifiedDeepRanker(nn.Module):
         nn.init.xavier_normal_(self.click_head.weight)
 
     def forward(self, inputs):
-        # 1. 展平
         is_listwise = inputs['movieId'].dim() == 2
         if is_listwise:
             B, K = inputs['movieId'].shape
@@ -86,8 +85,10 @@ class UnifiedDeepRanker(nn.Module):
         # E. MLP Tower
         deep_out = self.mlp_tower(cross_out)
         
-        # F. Output Logits (温度系数设置为 5.0，放大差异)
+        # F. Output Logits
         logits = self.click_head(deep_out).squeeze(-1)
-        logits = logits * 5.0 
+        # 训练时使用温度缩放，推理时保持原始
+        if self.training:
+            logits = logits * 5.0 
         
         return {'click': logits}

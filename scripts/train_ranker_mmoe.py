@@ -46,8 +46,8 @@ def train_click_only():
     }
     model = UnifiedDeepRanker(feature_map, embedding_dim=128).to(device)
     
-    # 使用较大的学习率打破数值平衡
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+    # 调高权重衰减 (L2 正则)，强制模型学习更通用的特征
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     # 4. 训练
