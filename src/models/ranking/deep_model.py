@@ -6,6 +6,7 @@ from .layers import CrossNetV2, AttentionSequencePooling
 class UnifiedDeepRanker(nn.Module):
     """
     精简版精排模型：DIN + DCN-V2 + DNN (Single Task: Click)
+    优化了数值稳定性与收敛动力学。
     """
     def __init__(self, 
                  feature_map: dict, 
@@ -18,6 +19,8 @@ class UnifiedDeepRanker(nn.Module):
         self.embeddings = nn.ModuleDict()
         for feat, size in feature_map['sparse'].items():
             self.embeddings[feat] = nn.Embedding(size + 1, embedding_dim, padding_idx=0)
+            # 初始化：Xavier Normal
+            nn.init.xavier_normal_(self.embeddings[feat].weight)
             
         # 2. Sequence Layer (DIN)
         self.din_attention = AttentionSequencePooling(embedding_dim)
@@ -28,13 +31,12 @@ class UnifiedDeepRanker(nn.Module):
                                feature_map['dense']
         
         # 4. DCN Layer (高阶交叉)
-        self.cross_net = CrossNetV2(self.total_input_dim, num_layers=2) # 减少层数以增加稳定性
+        self.cross_net = CrossNetV2(self.total_input_dim, num_layers=2)
         
-        # 5. Stability Layers
+        # 5. Stability Layers (仅保留入口处 Norm)
         self.input_norm = nn.LayerNorm(self.total_input_dim)
-        self.cross_norm = nn.LayerNorm(self.total_input_dim)
         
-        # 6. Deep MLP Tower (替代 MMoE)
+        # 6. Deep MLP Tower
         input_dim = self.total_input_dim
         curr_units = [input_dim] + hidden_units
         layers = []
@@ -48,6 +50,8 @@ class UnifiedDeepRanker(nn.Module):
         
         # 7. Final Output Head
         self.click_head = nn.Linear(hidden_units[-1], 1)
+        # 初始化：稍微大一点的方差，打破 symmetry
+        nn.init.normal_(self.click_head.weight, std=0.01)
 
     def forward(self, inputs):
         # 1. 展平 Listwise 维度 (B, K, ...) -> (B*K, ...)
@@ -74,11 +78,10 @@ class UnifiedDeepRanker(nn.Module):
         
         # C. Concatenate & Norm
         all_features = torch.cat(sparse_embs + [interest_emb, flat_inputs['dense_feats']], dim=-1)
-        all_features = self.input_norm(all_features)
+        all_features = self.input_norm(all_features) # 限压阀：放在入口
         
-        # D. DCN & Norm
+        # D. DCN
         cross_out = self.cross_net(all_features)
-        cross_out = self.cross_norm(cross_out)
         
         # E. MLP Tower
         deep_out = self.mlp_tower(cross_out)

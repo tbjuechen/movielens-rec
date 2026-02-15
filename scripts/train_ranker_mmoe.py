@@ -46,13 +46,14 @@ def train_click_only():
     }
     model = UnifiedDeepRanker(feature_map, embedding_dim=128).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # 使用较大的学习率打破数值平衡
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
     criterion = nn.CrossEntropyLoss()
 
     # 4. 训练
     for epoch in range(5):
         model.train()
-        total_loss, correct_top1 = 0, 0
+        total_loss, correct_top1, total_samples = 0, 0, 0
         
         with tqdm(train_loader, desc=f"Epoch {epoch+1}") as pbar:
             for batch in pbar:
@@ -66,26 +67,25 @@ def train_click_only():
                 loss = criterion(logits, batch['click_label'].to(device))
                 
                 if torch.isnan(loss):
-                    logger.warning("NaN detected, skipping...")
                     continue
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
+                # 修复统计逻辑：累加样本总数
                 preds = torch.argmax(logits, dim=1)
                 correct_top1 += (preds == 0).sum().item()
                 total_loss += loss.item()
-                pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{correct_top1/((pbar.n+1)*B):.4f}"})
+                total_samples += B
+                pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{correct_top1/total_samples:.4f}"})
 
         logger.success(f"Epoch {epoch+1} 训练结束。")
 
-    # 5. 保存模型与元数据
+    # 5. 保存
     model_dir = Path("saved_models/unified_ranker")
     model_dir.mkdir(parents=True, exist_ok=True)
-    
     torch.save(model.state_dict(), model_dir / "model.pth")
-    # 保存特征配置，以便评估脚本恢复模型结构
     import pickle
     with open(model_dir / "model_meta.pkl", "wb") as f:
         pickle.dump({
@@ -94,8 +94,7 @@ def train_click_only():
             'dense_cols': train_ds.dense_cols,
             'mid_map': train_ds.mid_map
         }, f)
-    
-    logger.success(f"模型与配置已保存至 {model_dir}")
+    logger.success(f"模型已保存至 {model_dir}")
 
 if __name__ == "__main__":
     train_click_only()
