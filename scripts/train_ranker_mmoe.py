@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score
 import pandas as pd
 from pathlib import Path
 from loguru import logger
@@ -10,14 +9,14 @@ from src.features.ranking_feature_engine import RankingFeatureEngine
 from src.data_loader_listwise import ListwiseRankingDataset
 from src.models.ranking.deep_model import UnifiedDeepRanker
 
-def train_mmoe():
+def train_click_only():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
     data_dir = Path("data/processed")
     ranking_dir = data_dir / "ranking"
     
-    # 1. 准备数据
+    # 1. 准备数据 (三段式隔离)
     samples_df = pd.read_parquet(ranking_dir / "ranking_samples_prototype.parquet")
     samples_df = samples_df.sort_values('timestamp').reset_index(drop=True)
     
@@ -39,22 +38,18 @@ def train_mmoe():
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
     
-    # 3. 初始化模型 (完全体 Pro)
+    # 3. 初始化模型 (单任务版)
     feature_map = {
         'sparse': {'movieId': train_ds.vocab_size},
         'dense': 4
     }
     model = UnifiedDeepRanker(
         feature_map, 
-        embedding_dim=128,
-        num_experts=4,
-        tasks=['click', 'rating']
+        embedding_dim=128
     ).to(device)
     
-    # 使用较小的学习率以增加稳定性
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0003)
-    click_criterion = nn.CrossEntropyLoss()
-    rating_criterion = nn.MSELoss()
+    criterion = nn.CrossEntropyLoss()
 
     # 4. 训练
     for epoch in range(5):
@@ -69,32 +64,21 @@ def train_mmoe():
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 
-                # A. Click Loss (Listwise)
-                click_logits = outputs['click'].view(B, K)
-                click_loss = click_criterion(click_logits, batch['click_label'].to(device))
-                
-                # B. Rating Loss (Pointwise MSE)
-                rating_preds = outputs['rating']
-                rating_labels = batch['rating_label'].view(-1).to(device)
-                rating_loss = rating_criterion(rating_preds, rating_labels)
-                
-                # 联合优化：进一步调低 Rating 权重，防止干扰主任务
-                loss = click_loss + 0.01 * rating_loss
+                # Reshape logits to (B, K) for Listwise CrossEntropy
+                logits = outputs['click'].view(B, K)
+                loss = criterion(logits, batch['click_label'].to(device))
                 
                 if torch.isnan(loss):
-                    logger.warning(f"发现 NaN! ClickLoss: {click_loss.item():.4f}, RatingLoss: {rating_loss.item():.4f}")
+                    logger.warning("发现 NaN Loss，重置模型梯度并跳过。")
                     optimizer.zero_grad()
                     continue
 
                 loss.backward()
-                
-                # 【关键】梯度裁剪
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 
-                # 统计
-                preds = torch.argmax(click_logits, dim=1)
+                # 统计 Top-1 Accuracy
+                preds = torch.argmax(logits, dim=1)
                 correct_top1 += (preds == 0).sum().item()
                 total_loss += loss.item()
                 pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{correct_top1/((pbar.n+1)*B):.4f}"})
@@ -102,4 +86,4 @@ def train_mmoe():
         logger.success(f"Epoch {epoch+1} 训练结束。")
 
 if __name__ == "__main__":
-    train_mmoe()
+    train_click_only()
