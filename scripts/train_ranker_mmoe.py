@@ -80,5 +80,22 @@ def train_click_only():
 
         logger.success(f"Epoch {epoch+1} 训练结束。")
 
+    # 5. 保存模型与元数据
+    model_dir = Path("saved_models/unified_ranker")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    torch.save(model.state_dict(), model_dir / "model.pth")
+    # 保存特征配置，以便评估脚本恢复模型结构
+    import pickle
+    with open(model_dir / "model_meta.pkl", "wb") as f:
+        pickle.dump({
+            'feature_map': feature_map,
+            'embedding_dim': 128,
+            'dense_cols': train_ds.dense_cols,
+            'mid_map': train_ds.mid_map
+        }, f)
+    
+    logger.success(f"模型与配置已保存至 {model_dir}")
+
 if __name__ == "__main__":
     train_click_only()
