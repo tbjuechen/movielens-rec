@@ -68,15 +68,25 @@ PYTHONPATH=. python scripts/evaluate_recall.py
 
 ## 4. 排序层 (Ranking)
 
-本项目实现了从基础 XGBoost 到顶级深度模型 (UnifiedRanker Pro) 的全进化。
+本项目实现了从基础 XGBoost 到顶级深度模型 (UnifiedRanker Pro) 的全进化，并支持千万级样本的全量处理。
 
-### 4.1 训练精排模型
+### 4.1 全量样本准备 (32M 全量 + 1:9 混合采样)
+针对大规模数据，采用多进程并发与分片存储策略：
+```bash
+# 1. 构造 1:9 混合采样样本 (含 Hard Negatives，多进程加速)
+PYTHONPATH=. python scripts/prepare_ranking_dataset_v2.py
+
+# 2. 预计算并持久化精排特征大宽表 (分片处理，防止内存溢出)
+PYTHONPATH=. python scripts/build_final_feature_matrix.py
+```
+
+### 4.2 训练精排模型
 ```bash
 # 1. 训练 XGBoost 基准模型 (AUC 约 0.67)
 PYTHONPATH=. python scripts/train_ranker_xgboost.py
 
 # 2. 训练 UnifiedRanker Pro (DIN + DCN-V2 + MMoE)
-# 支持 Listwise 偏好学习与多任务预测
+# 支持流式分片加载，可在普通内存机器上处理亿级样本
 PYTHONPATH=. python scripts/train_ranker_mmoe.py
 ```
 

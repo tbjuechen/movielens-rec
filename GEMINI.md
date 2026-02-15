@@ -28,34 +28,32 @@
 - [x] **语义增强**: 50 线程元数据抓取 + BGE-M3 语义向量化 (Completed).
 - [x] **特征工程**: 构建用户画像、物品画像及历史行为序列 (Completed).
 - [x] **特征引擎**: 实现 `RankingFeatureEngine` 用于特征交叉与实时计算 (Completed).
-- [x] **模型实现**: UnifiedRanker Pro (DIN + DCN-V2 + MMoE) (Completed).
+- [x] **样本构造**: 全量 32M 样本 1:9 混合负采样 + 多进程加速 (Completed).
+- [/] **模型实现**: UnifiedRanker Pro (DIN + DCN-V2 + MMoE) (Training in Progress).
 
 ## 排序阶段待办清单 (Ranking Phase To-Do List)
 
 ### 3.1 语义向量化 (Phase 3.1)
 - [x] **实现 `api_embedder.py`**: 支持多线程并发，适配厂商 Batch 限制 (Completed).
-- [x] **获取全量 Embedding**: BGE-M3 1024 维向量全量落地 (In Progress - Resume anytime).
+- [x] **获取全量 Embedding**: BGE-M3 1024 维向量全量落地 (Completed).
 
 ### 3.2 特征底座建设 (Phase 3.2)
-- [x] **构建 `User_Profile`**: 整合用户平均分、题材偏好、活跃度等 (Script Ready).
-- [x] **构建 `Item_Profile`**: 整合电影题材、TMDb 时长/预算、导演/主演影响力、语义向量等 (Script Ready).
-- [x] **行为序列处理**: 实现 Time-sorted 滑动窗口 (Script Ready).
+- [x] **构建 `User_Profile`**: 整合用户平均分、题材偏好、活跃度等 (Completed).
+- [x] **构建 `Item_Profile`**: 整合电影题材、TMDb 时长/预算、导演/主演影响力、语义向量等 (Completed).
+- [x] **行为序列处理**: 实现 Time-sorted 滑动窗口 (Completed).
 
 ### 3.3 特征交叉引擎 (Phase 3.3)
 - [x] **开发 `RankingFeatureEngine`**: 实现导演匹配、演员计数、数值偏离 (Completed).
 
 ### 3.4 模型训练与评估 (Phase 3.4)
-- [ ] **生成全量样本**: 运行 `prepare_ranking_dataset.py`。
-- [ ] **模型开发**: 训练 XGBoost 排序器。
-
-### 3.4 模型训练与评估 (Phase 3.4)
-- [ ] **负采样**: 1:10 曝光未点击采样 + 随机负采样。
-- [ ] **模型开发**: 训练第一个 XGBoost 排序器作为强基准。
+- [x] **生成全量样本**: 运行 `prepare_ranking_dataset_v2.py` (Completed).
+- [ ] **模型开发**: 训练全量 UnifiedRanker Pro。
 
 ## 技术深度决策 (Technical Decisions)
 1. **建模范式**: 采用 **Star Schema**（星型模型）处理“电影-人员-关系”数据。
 2. **硬件加速**: 针对 MPS 手动实现 `mean` 聚合算子，支持 M4 芯片。
-3. **语义特征存储**: 采用 **“全量存储、全量读取”** 策略。使用 OpenAI 或 BAAI 模型获取并持久化全量向量作为黄金数据源，后续精排引擎将直接利用全量维度以保证最高的语义精度。
+3. **语义特征存储**: 采用 **“全量存储、全量读取”** 策略。使用 OpenAI 或 BAAI 模型获取并持久化全量向量作为黄金数据源。
+4. **大规模工程**: 针对 3.2 亿行采样数据，实现 **“分片 (Sharding) + 多进程 (Multi-processing)”** 采样与特征持久化，确保内存安全并最大化 CPU 利用率。
 
 ## 开发规范
 - **原子提交**: 每个 commit 必须是功能原子化的。
