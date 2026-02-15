@@ -28,8 +28,7 @@
 - [x] **语义增强**: 50 线程元数据抓取 + BGE-M3 语义向量化 (Completed).
 - [x] **特征工程**: 构建用户画像、物品画像及历史行为序列 (Completed).
 - [x] **特征引擎**: 实现 `RankingFeatureEngine` 用于特征交叉与实时计算 (Completed).
-- [ ] **样本构造**: 实现精排正负样本采样 (Prototype Ready).
-- [ ] **模型实现**: XGBoost / DeepFM.
+- [x] **模型实现**: UnifiedRanker Pro (DIN + DCN-V2 + MMoE) (Completed).
 
 ## 排序阶段待办清单 (Ranking Phase To-Do List)
 

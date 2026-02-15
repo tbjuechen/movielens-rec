@@ -66,8 +66,19 @@ PYTHONPATH=. python scripts/train_recall.py --model two_tower --epochs 5 --batch
 PYTHONPATH=. python scripts/evaluate_recall.py
 ```
 
-## 4. 排序层 (Ranking) - 开发中
-利用采集到的文本向量与业务特征，实现精细化特征交叉与打分。
+## 4. 排序层 (Ranking)
+
+本项目实现了从基础 XGBoost 到顶级深度模型 (UnifiedRanker Pro) 的全进化。
+
+### 4.1 训练精排模型
+```bash
+# 1. 训练 XGBoost 基准模型 (AUC 约 0.67)
+PYTHONPATH=. python scripts/train_ranker_xgboost.py
+
+# 2. 训练 UnifiedRanker Pro (DIN + DCN-V2 + MMoE)
+# 支持 Listwise 偏好学习与多任务预测
+PYTHONPATH=. python scripts/train_ranker_mmoe.py
+```
 
 ---
 
