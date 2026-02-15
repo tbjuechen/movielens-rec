@@ -78,6 +78,18 @@ def train_ranker_v2():
     auc = roc_auc_score(y_test, y_pred)
     logger.success(f"修正后的 Offline AUC: {auc:.4f}")
     
+    # 特征重要性分析
+    importance = model.get_score(importance_type='gain')
+    importance_df = pd.DataFrame({
+        'feature': list(importance.keys()),
+        'importance': list(importance.values())
+    }).sort_values(by='importance', ascending=False)
+    
+    print("\n" + "="*30)
+    print("Top Feature Importance (Gain):")
+    print(importance_df.head(10))
+    print("="*30 + "\n")
+
     if auc > 0.88:
         logger.warning("AUC 依然偏高，可能存在特征强关联或 Easy Negatives 问题。")
 
