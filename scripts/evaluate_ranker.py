@@ -8,7 +8,7 @@ from pathlib import Path
 from loguru import logger
 from tqdm import tqdm
 from src.features.ranking_feature_engine import RankingFeatureEngine
-from src.data_loader_listwise import ListwiseRankingDataset
+from src.data_loader_listwise import ShardedListwiseRankingDataset
 from src.models.ranking.deep_model import UnifiedDeepRanker
 
 def dcg_at_k(r, k):
@@ -50,6 +50,11 @@ def evaluate_ranker():
     
     val_samples = samples_df.iloc[int(n*0.8):].copy()
     
+    # 🚀 采样优化：为了评估效率，随机采样 50,000 条进行快速体检
+    if len(val_samples) > 50000:
+        logger.info("验证集过大，采样 50,000 条进行快速评估...")
+        val_samples = val_samples.sample(50000, random_state=42)
+    
     engine = RankingFeatureEngine(data_dir=str(data_dir))
     engine.initialize(history_ratings)
     
@@ -57,8 +62,16 @@ def evaluate_ranker():
     val_df = engine.build_feature_matrix(val_samples)
     item_profile = pd.read_parquet(ranking_dir / "item_profile_ranking.parquet")
     
-    # 3. 数据加载器 (Listwise)
-    val_ds = ListwiseRankingDataset(val_df, item_profile)
+    # 3. 数据加载器 (Sharded Listwise)
+    # 对于验证集，我们将 val_df 存为一个临时分片进行加载，或者直接通过 mock 路径列表
+    # 这里为了简单，我们先将 val_df 存盘
+    val_shard_path = ranking_dir / "val_shard_temp.parquet"
+    val_df.to_parquet(val_shard_path, index=False)
+    
+    val_ds = ShardedListwiseRankingDataset([val_shard_path], item_profile, neg_ratio=4)
+    # 手动触发加载当前分片
+    val_ds._load_shard(0)
+    
     # 覆盖元数据
     val_ds.mid_map = meta['mid_map']
     val_loader = DataLoader(val_ds, batch_size=512, shuffle=False)
