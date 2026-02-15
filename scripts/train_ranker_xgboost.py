@@ -48,7 +48,8 @@ def train_ranker_v4_robust():
     feature_cols = [
         'user_avg_rating', 'user_rating_std', 'user_rating_count_log',
         'year', 'runtime', 'budget_log', 'revenue_log', 'vote_average', 'vote_count',
-        'is_director_match', 'actor_match_count', 'rating_diff', 'semantic_sim'
+        'is_director_match', 'actor_match_count', 'rating_diff', 'semantic_sim',
+        'genre_match_score'
     ]
 
     X_train = X_train_full[feature_cols].fillna(0)

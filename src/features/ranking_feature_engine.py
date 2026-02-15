@@ -87,7 +87,23 @@ class RankingFeatureEngine:
         # 2.3 评分差值
         df['rating_diff'] = df['vote_average'] - df['user_avg_rating']
         
-        # 2.4 语义相似度 (余弦相似度)
+        # 2.4 题材匹配度 (个性化核心)
+        logger.info("计算题材匹配度特征...")
+        # 假设画像中包含 user_top_genres_idx (List) 和 item_genres (List)
+        def compute_genre_sim(row):
+            u_genres = row.get('user_top_genres_idx')
+            i_genres = row.get('genres')
+            if not isinstance(u_genres, (list, np.ndarray)) or not isinstance(i_genres, (list, np.ndarray)):
+                return 0.0
+            
+            # 计算交集大小 / 并集大小 (Jaccard)
+            set_u, set_i = set(u_genres), set(i_genres)
+            if not set_u or not set_i: return 0.0
+            return len(set_u & set_i) / len(set_u | set_i)
+
+        df['genre_match_score'] = df.apply(compute_genre_sim, axis=1)
+        
+        # 2.5 语义相似度 (余弦相似度)
         # 逻辑：将用户最近看过的 Last-5 电影的 Embedding 取均值，作为用户的瞬时兴趣向量
         # 然后计算该向量与当前电影 Embedding 的余弦相似度
         logger.info("计算语义相似度特征...")

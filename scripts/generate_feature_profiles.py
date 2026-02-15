@@ -79,17 +79,28 @@ def generate_profiles(ref_ratings=None):
     user_stats = user_stats.reset_index()
     user_stats['user_rating_count_log'] = np.log1p(user_stats['user_rating_count'])
     
-    # 获取用户最喜欢的题材 (复用之前的逻辑)
-    # 此处假设 prepare_two_tower_data.py 已生成过 user_features
+    # 获取用户最喜欢的题材
     user_feat_recall = pd.read_parquet(recall_data_dir / "user_features.parquet")
-    user_profile = user_stats.merge(user_feat_recall[['userId_int', 'user_top_genres_idx']], left_on='userId', right_index=True, how='left') # 注意映射关系
-    
-    # 修正：由于之前的 user_features 使用的是内部 ID，这里我们要对齐原始 userId
+    # 加载 ID 映射表以对齐原始 userId
     with open(recall_data_dir / "user_map.pkl", "rb") as f:
         user_map = pickle.load(f)
-    user_profile = user_stats.copy()
+    inv_user_map = {v: k for k, v in user_map.items()}
     
-    # 这里的 user_profile 直接使用原始 userId 作为主键
+    # 将内部 ID 映射回原始 ID
+    user_feat_recall['userId'] = user_feat_recall['userId_int'].map(inv_user_map)
+    
+    # 合并统计特征与题材偏好
+    user_profile = user_stats.merge(
+        user_feat_recall[['userId', 'user_top_genres_idx']], 
+        on='userId', 
+        how='left'
+    )
+    
+    # 填充缺失题材为空列表
+    user_profile['user_top_genres_idx'] = user_profile['user_top_genres_idx'].apply(
+        lambda x: x if isinstance(x, (list, np.ndarray)) else []
+    )
+    
     user_profile.to_parquet(output_dir / "user_profile_ranking.parquet", index=False)
     logger.success(f"User Profile 已存至 {output_dir / 'user_profile_ranking.parquet'}")
 
