@@ -91,8 +91,7 @@ class UnifiedDeepRanker(nn.Module):
         outputs = {}
         for task, head in self.heads.items():
             out = head(deep_out)
-            if task == 'click':
-                out = torch.sigmoid(out)
+            # 输出 Logits，由 Loss 函数处理 Sigmoid
             outputs[task] = out.squeeze(1)
             
         return outputs
