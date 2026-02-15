@@ -34,8 +34,19 @@ def train_click_only():
     item_profile = pd.read_parquet(ranking_dir / "item_profile_ranking.parquet")
     
     # 2. Dataset & Loader
+    # ⚠️ 诊断：你可以通过此列表屏蔽掉那些“过于强大”的大众特征，看 Acc 会不会回落到正常水平
+    # blacklist = ['revenue_log', 'vote_count', 'vote_average', 'year']
+    blacklist = [] 
+    
     train_ds = ListwiseRankingDataset(train_df, item_profile)
+    # 在 Dataset 层面过滤特征
+    if blacklist:
+        train_ds.dense_cols = [c for c in train_ds.dense_cols if c not in blacklist]
+        logger.warning(f"已屏蔽可疑特征: {blacklist}")
+
     val_ds = ListwiseRankingDataset(val_df, item_profile)
+    if blacklist: val_ds.dense_cols = [c for c in val_ds.dense_cols if c not in blacklist]
+    
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
     

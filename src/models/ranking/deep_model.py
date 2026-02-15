@@ -11,7 +11,7 @@ class UnifiedDeepRanker(nn.Module):
                  feature_map: dict, 
                  embedding_dim: int = 128,
                  hidden_units: list = [512, 256, 128],
-                 dropout_rate: float = 0.5): # 提高默认 Dropout
+                 dropout_rate: float = 0.2): # 恢复到 0.2
         super().__init__()
         self.feature_map = feature_map
         
