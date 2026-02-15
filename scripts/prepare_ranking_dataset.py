@@ -50,7 +50,7 @@ def prepare_ranking_dataset():
     ranking_samples.to_parquet(output_path, index=False)
     
     logger.success(f"精排原型样本集已生成：{output_path}")
-    logger.info(f"样本总数: {len(ranking_samples):,} | 正负比例 1:1")
+    logger.info(f"样本总数: {len(ranking_samples):,} | 正负比例 1:4")
 
 if __name__ == "__main__":
     prepare_ranking_dataset()
