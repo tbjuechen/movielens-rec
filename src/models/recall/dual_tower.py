@@ -95,40 +95,52 @@ class DualTowerModel(nn.Module):
         item_emb = self.item_tower(item_features)
         return user_emb, item_emb
 
-    def compute_loss(self, user_features, item_features, item_log_q, extra_item_features=None, extra_item_log_q=None):
+    def compute_loss(self, user_features, item_features, item_log_q, 
+                     simple_neg_features=None, simple_neg_log_q=None,
+                     hard_neg_features=None):
         """
-        用于训练：计算带有 Log-Q 纠偏的 InfoNCE Loss (In-batch + Global Negative Sampling)
-        item_log_q: (B,) 正样本物品的采样概率的对数
-        extra_item_log_q: (M,) 全局负样本物品的采样概率的对数
+        混合损失函数：
+        1. InfoNCE: 处理 In-batch 和 随机负样本 (针对召回的全域分布优化)
+        2. BPR: 处理 困难负样本 (针对正样本 vs 困难负样本的相对排序优化)
         """
         user_emb = self.user_tower(user_features) # (B, D)
         item_emb = self.item_tower(item_features) # (B, D)
         
-        # 1. 计算 In-batch 相似度: (B, B)
-        logits = torch.matmul(user_emb, item_emb.T) # (B, B)
+        # --- 1. InfoNCE Loss (Simple Negatives) ---
+        # 计算正样本得分 (对角线)
+        pos_scores = torch.sum(user_emb * item_emb, dim=-1) # (B,)
         
-        # 2. Log-Q 纠偏 (针对 In-batch 物品)
-        # 减去 log(P(i))。注意：item_log_q 对应的是列方向上的物品概率
-        # logits[i, j] 对应 user_i 和 item_j，因此减去的是 item_j 的 log_q
+        # In-batch 相似度矩阵 (B, B)
+        logits = torch.matmul(user_emb, item_emb.T) 
+        # Log-Q 纠偏
         logits = logits - item_log_q.view(1, -1)
         
-        # 3. 如果有额外的全局负样本 (M, D)
-        if extra_item_features is not None:
-            extra_item_emb = self.item_tower(extra_item_features) # (M, D)
-            extra_logits = torch.matmul(user_emb, extra_item_emb.T) # (B, M)
-            
-            # 对全局负样本也进行 Log-Q 纠偏
-            if extra_item_log_q is not None:
-                extra_logits = extra_logits - extra_item_log_q.view(1, -1)
-                
-            # 拼接列，得到 (B, B + M) 的 Logits
-            logits = torch.cat([logits, extra_logits], dim=1)
+        if simple_neg_features is not None:
+            simple_neg_emb = self.item_tower(simple_neg_features) # (M1, D)
+            simple_logits = torch.matmul(user_emb, simple_neg_emb.T) # (B, M1)
+            if simple_neg_log_q is not None:
+                simple_logits = simple_logits - simple_neg_log_q.view(1, -1)
+            logits = torch.cat([logits, simple_logits], dim=1)
             
         logits = logits / self.tau
-        
-        # Labels are still the diagonal indices (0, 1, ..., B-1)
         batch_size = user_emb.size(0)
         labels = torch.arange(batch_size, device=user_emb.device)
+        loss_infonce = F.cross_entropy(logits, labels)
         
-        loss = F.cross_entropy(logits, labels)
-        return loss
+        # --- 2. BPR Loss (Hard Negatives) ---
+        loss_bpr = torch.tensor(0.0, device=user_emb.device)
+        if hard_neg_features is not None:
+            # 这里的 hard_neg_features 可能是全局热门物品 (M2, D)
+            hard_neg_emb = self.item_tower(hard_neg_features) # (M2, D)
+            # 计算每个 user 与所有 hard 负样本的得分 (B, M2)
+            hard_scores = torch.matmul(user_emb, hard_neg_emb.T)
+            
+            # 计算 BPR: -log(sigmoid(pos_score - hard_score))
+            # 我们取所有 hard 负样本的平均 BPR 贡献
+            # pos_scores 是 (B, 1), hard_scores 是 (B, M2)
+            diff = pos_scores.view(-1, 1) - hard_scores # (B, M2)
+            loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
+            
+        # 混合权重建议 1.0 : 1.0，具体可调
+        total_loss = loss_infonce + loss_bpr
+        return total_loss, loss_infonce, loss_bpr

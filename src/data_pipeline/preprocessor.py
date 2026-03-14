@@ -104,5 +104,30 @@ def process_all_data():
     user_profile.to_parquet(processed_dir / "user_profile.parquet", index=False)
     print(f"User Profile saved. Shape: {user_profile.shape}")
 
+    # 4. Building Inverted Index (Genre -> Items) and Popularity List for Hard Negatives
+    print("Building Inverted Index and Popularity List...")
+    # Genre-to-Items Inverted Index
+    item_genres = movies[['movieId', 'genres']].copy()
+    item_genres['genre_list'] = item_genres['genres'].str.split('|')
+    exploded_item_genres = item_genres.explode('genre_list')
+    
+    genre_to_items = exploded_item_genres.groupby('genre_list')['movieId'].apply(list).to_dict()
+    
+    # Global Popularity List (Sorted by vote_count_ml)
+    # Using item_profile because it already has merged stats
+    item_profile = pd.read_parquet(processed_dir / "item_profile.parquet")
+    popularity_list = item_profile.sort_values('vote_count_ml', ascending=False)['movieId'].tolist()
+    
+    # Save these as artifacts in feature_store
+    import json
+    feature_store_dir = Path("data/feature_store")
+    with open(feature_store_dir / "genre_to_items.json", "w") as f:
+        json.dump(genre_to_items, f)
+    
+    with open(feature_store_dir / "popularity_list.json", "w") as f:
+        json.dump(popularity_list, f)
+        
+    print("Hard Negative Sampling artifacts saved to feature_store.")
+
 if __name__ == "__main__":
     process_all_data()

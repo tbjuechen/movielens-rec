@@ -1,5 +1,6 @@
 import argparse
 import sys
+import json
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -20,6 +21,9 @@ def train_dual_tower():
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
     item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
     
+    with open(Path(FEATURE_STORE_DIR) / "popularity_list.json", "r") as f:
+        popularity_list = json.load(f)
+
     # Positive samples for training
     train_data = train_data[train_data['rating'] >= 3.0]
 
@@ -49,33 +53,22 @@ def train_dual_tower():
     item_profile['revenue'] = item_cont['revenue']
     encoder.save()
 
-    print("Calculating Log-Q (Sampling Probabilities) for Correction...")
-    # Count occurrences of each movieId in training data
+    print("Calculating Log-Q (Sampling Probabilities)...")
     item_counts = train_data['movieId'].value_counts()
     total_count = len(train_data)
-    
-    # Vectorized mapping: Create an array indexed by encoded movieId
-    # Size: max_encoded_id + 1
     max_id = encoder.vocab_sizes['movieId']
-    log_q_array = np.full(max_id + 1, np.log(1e-10), dtype=np.float32) # Default for unseen items
-    
-    # Map original movieId to encoded index using the vocabulary
+    log_q_array = np.full(max_id + 1, np.log(1e-10), dtype=np.float32)
     movie_vocab = encoder.vocabularies['movieId']
     
-    # Build a lookup for counts keyed by encoded indices
-    encoded_ids = []
-    counts = []
-    for orig_id, count in item_counts.items():
-        if orig_id in movie_vocab:
-            encoded_ids.append(movie_vocab[orig_id])
-            counts.append(count)
-    
-    # Batch update the log_q array
+    encoded_ids = [movie_vocab[orig_id] for orig_id in item_counts.index if orig_id in movie_vocab]
+    counts = [item_counts[orig_id] for orig_id in item_counts.index if orig_id in movie_vocab]
     if encoded_ids:
         log_q_array[encoded_ids] = np.log((np.array(counts) / total_count) + 1e-10)
-    
-    # Assign back to item_profile using vectorized indexing
     item_profile['log_q'] = log_q_array[item_profile['movieId'].values]
+
+    # Pre-encode Top 1000 items as potential hard negatives (Popular pool)
+    print("Pre-encoding Popularity List for Hard Negatives...")
+    encoded_pop_list = [movie_vocab[mid] for mid in popularity_list[:1000] if mid in movie_vocab]
 
     print("Preparing Global Item Features Lookup...")
     item_profile = item_profile.sort_values('movieId')
@@ -99,10 +92,20 @@ def train_dual_tower():
     model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=64).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    print("Starting Training (with Log-Q Correction)...")
+    print("Starting Training (InfoNCE for Simple Negatives, BPR for Hard Negatives)...")
     epochs = 3
-    num_neg_per_batch = 512
+    num_simple_neg = 512
+    num_hard_neg = 128
     all_item_indices = np.arange(len(item_profile))
+
+    def get_batch_features(indices):
+        return {
+            'item_id': item_lookup['item_id'][indices],
+            'release_year': item_lookup['release_year'][indices],
+            'avg_rating': item_lookup['avg_rating'][indices],
+            'revenue': item_lookup['revenue'][indices],
+            'tmdb_genres': item_lookup['tmdb_genres'][indices]
+        }
 
     for epoch in range(epochs):
         model.train()
@@ -112,31 +115,30 @@ def train_dual_tower():
             user_feat = {k: v.to(device) for k, v in user_feat.items()}
             item_feat = {k: v.to(device) for k, v in item_feat.items()}
             
-            # Sampling global negatives
-            neg_indices = np.random.choice(all_item_indices, num_neg_per_batch, replace=True)
-            neg_feat = {
-                'item_id': item_lookup['item_id'][neg_indices],
-                'release_year': item_lookup['release_year'][neg_indices],
-                'avg_rating': item_lookup['avg_rating'][neg_indices],
-                'revenue': item_lookup['revenue'][neg_indices],
-                'tmdb_genres': item_lookup['tmdb_genres'][neg_indices]
-            }
-            neg_log_q = item_lookup['log_q'][neg_indices]
+            # 1. Sample Simple Negatives (Global Random)
+            simple_neg_idx = np.random.choice(all_item_indices, num_simple_neg, replace=True)
+            simple_neg_feat = get_batch_features(simple_neg_idx)
+            simple_neg_log_q = item_lookup['log_q'][simple_neg_idx]
+            
+            # 2. Sample Hard Negatives (Popular)
+            hard_neg_idx = np.random.choice(encoded_pop_list, num_hard_neg, replace=True)
+            hard_neg_feat = get_batch_features(hard_neg_idx)
             
             optimizer.zero_grad()
-            # Pass log_q of positive items and negative items for correction
-            loss = model.compute_loss(
+            # Dual-Tower Mixed Loss
+            loss, l_infonce, l_bpr = model.compute_loss(
                 user_feat, 
                 item_feat, 
                 item_log_q=item_feat['log_q'], 
-                extra_item_features=neg_feat, 
-                extra_item_log_q=neg_log_q
+                simple_neg_features=simple_neg_feat,
+                simple_neg_log_q=simple_neg_log_q,
+                hard_neg_features=hard_neg_feat
             )
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_infonce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}"})
             
         print(f"Epoch {epoch+1} Average Loss: {total_loss / len(dataloader):.4f}")
 
