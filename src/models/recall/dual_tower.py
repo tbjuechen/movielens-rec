@@ -111,18 +111,21 @@ class DualTowerModel(nn.Module):
         pos_scores = torch.sum(user_emb * item_emb, dim=-1) # (B,)
         
         # In-batch 相似度矩阵 (B, B)
-        logits = torch.matmul(user_emb, item_emb.T) 
-        # Log-Q 纠偏
+        logits = torch.matmul(user_emb, item_emb.T) # (B, B)
+        # 先进行温度缩放
+        logits = logits / self.tau
+        # 后进行 Log-Q 纠偏
         logits = logits - item_log_q.view(1, -1)
         
         if simple_neg_features is not None:
             simple_neg_emb = self.item_tower(simple_neg_features) # (M1, D)
             simple_logits = torch.matmul(user_emb, simple_neg_emb.T) # (B, M1)
+            # 全局负样本同样：先缩放，后纠偏
+            simple_logits = simple_logits / self.tau
             if simple_neg_log_q is not None:
                 simple_logits = simple_logits - simple_neg_log_q.view(1, -1)
             logits = torch.cat([logits, simple_logits], dim=1)
             
-        logits = logits / self.tau
         batch_size = user_emb.size(0)
         labels = torch.arange(batch_size, device=user_emb.device)
         loss_infonce = F.cross_entropy(logits, labels)
@@ -130,15 +133,13 @@ class DualTowerModel(nn.Module):
         # --- 2. BPR Loss (Hard Negatives) ---
         loss_bpr = torch.tensor(0.0, device=user_emb.device)
         if hard_neg_features is not None:
-            # 这里的 hard_neg_features 可能是全局热门物品 (M2, D)
             hard_neg_emb = self.item_tower(hard_neg_features) # (M2, D)
-            # 计算每个 user 与所有 hard 负样本的得分 (B, M2)
-            hard_scores = torch.matmul(user_emb, hard_neg_emb.T)
+            # BPR 支路通常用于 Hard Negatives，不需要 Log-Q 纠偏，但需要温度缩放
+            hard_scores = torch.matmul(user_emb, hard_neg_emb.T) / self.tau
             
-            # 计算 BPR: -log(sigmoid(pos_score - hard_score))
-            # 我们取所有 hard 负样本的平均 BPR 贡献
-            # pos_scores 是 (B, 1), hard_scores 是 (B, M2)
-            diff = pos_scores.view(-1, 1) - hard_scores # (B, M2)
+            # pos_scores 也需要缩放
+            scaled_pos_scores = pos_scores / self.tau
+            diff = scaled_pos_scores.view(-1, 1) - hard_scores # (B, M2)
             loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
             
         # 混合权重建议 1.0 : 1.0，具体可调
