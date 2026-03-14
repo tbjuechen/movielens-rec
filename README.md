@@ -43,9 +43,9 @@ pip install -r requirements.txt
 ### 2. 数据流水线 (Pipeline)
 
 #### Step 0: 聚合 TMDB 数据
-将 8 万个小 JSON 合并为 Parquet 格式：
+将 8.6 万个小 JSON 缓存合并为高效的 Parquet 格式，加速后续 IO：
 ```bash
-conda run -n movielens-rec python -c "import os, json, pandas as pd; from tqdm import tqdm; tmdb_dir = 'data/raw/tmdb_cache/'; files = [f for f in os.listdir(tmdb_dir) if f.endswith('.json')]; data_list = [json.load(open(os.path.join(tmdb_dir, f))) for f in tqdm(files)]; df = pd.DataFrame([{ 'tmdb_id': d.get('id'), 'imdb_id': d.get('imdb_id'), 'original_language': d.get('original_language'), 'budget': d.get('budget', 0), 'revenue': d.get('revenue', 0), 'runtime': d.get('runtime', 0), 'vote_average': d.get('vote_average', 0.0), 'vote_count': d.get('vote_count', 0), 'tmdb_genres': [g['name'] for g in d.get('genres', [])] } for d in data_list]); df.to_parquet('data/processed/tmdb_features.parquet', index=False)"
+conda run -n movielens-rec python scripts/00_prepare_tmdb.py
 ```
 
 #### Step 1: 预处理与切分
