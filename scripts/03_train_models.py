@@ -49,18 +49,44 @@ def train_dual_tower():
     item_profile['revenue'] = item_cont['revenue']
     encoder.save()
 
-    print("Preparing Global Item Features Lookup...")
-    # Map movieId (encoded) to its full features for fast negative sampling
-    # We sort item_profile by movieId (which is now 1, 2, 3...) to allow direct tensor indexing
-    item_profile = item_profile.sort_values('movieId')
+    print("Calculating Log-Q (Sampling Probabilities) for Correction...")
+    # Count occurrences of each movieId in training data
+    item_counts = train_data['movieId'].value_counts()
+    # Map back to encoded indices
+    # We use a small smoothing factor to avoid log(0)
+    total_count = len(train_data)
     
-    # Pre-convert item features to tensors
+    def get_log_q(row):
+        # We need the original movieId (unencoded) or we map our counts to the new indices
+        # Let's use the encoder's vocabulary to map correctly
+        orig_id = row.name # This is index if we're not careful. 
+        # Actually, simpler: map the counts directly to item_profile.
+        return np.log((item_counts.get(row['movieId_orig'], 0) / total_count) + 1e-10)
+
+    # Temporary store original ID to match counts
+    # item_profile['movieId'] is already encoded. We need to match with train_data's movieId.
+    # Let's map counts to encoded IDs.
+    movie_vocab = encoder.vocabularies['movieId']
+    encoded_counts = {}
+    for orig_id, count in item_counts.items():
+        if orig_id in movie_vocab:
+            encoded_counts[movie_vocab[orig_id]] = count
+    
+    def calculate_item_log_q(encoded_id):
+        cnt = encoded_counts.get(encoded_id, 0)
+        return np.log((cnt / total_count) + 1e-10)
+
+    item_profile['log_q'] = item_profile['movieId'].apply(calculate_item_log_q)
+
+    print("Preparing Global Item Features Lookup...")
+    item_profile = item_profile.sort_values('movieId')
     item_lookup = {
         'item_id': torch.tensor(item_profile['movieId'].values, dtype=torch.long),
         'release_year': torch.tensor(item_profile['release_year'].values, dtype=torch.float32),
         'avg_rating': torch.tensor(item_profile['avg_rating'].values, dtype=torch.float32),
         'revenue': torch.tensor(item_profile['revenue'].values, dtype=torch.float32),
-        'tmdb_genres': torch.tensor(np.stack(item_profile['tmdb_genres'].values), dtype=torch.long)
+        'tmdb_genres': torch.tensor(np.stack(item_profile['tmdb_genres'].values), dtype=torch.long),
+        'log_q': torch.tensor(item_profile['log_q'].values, dtype=torch.float32)
     }
 
     print("Building DataLoader...")
@@ -70,13 +96,11 @@ def train_dual_tower():
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Using device: {device}")
 
-    # Move item lookup to device
     item_lookup = {k: v.to(device) for k, v in item_lookup.items()}
-
     model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=64).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    print("Starting Training (In-Batch + Global Negative Sampling)...")
+    print("Starting Training (with Log-Q Correction)...")
     epochs = 3
     num_neg_per_batch = 512
     all_item_indices = np.arange(len(item_profile))
@@ -86,11 +110,10 @@ def train_dual_tower():
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         for user_feat, item_feat in pbar:
-            # 1. Prepare Positive Samples
             user_feat = {k: v.to(device) for k, v in user_feat.items()}
             item_feat = {k: v.to(device) for k, v in item_feat.items()}
             
-            # 2. Sample Global Negatives
+            # Sampling global negatives
             neg_indices = np.random.choice(all_item_indices, num_neg_per_batch, replace=True)
             neg_feat = {
                 'item_id': item_lookup['item_id'][neg_indices],
@@ -99,10 +122,17 @@ def train_dual_tower():
                 'revenue': item_lookup['revenue'][neg_indices],
                 'tmdb_genres': item_lookup['tmdb_genres'][neg_indices]
             }
+            neg_log_q = item_lookup['log_q'][neg_indices]
             
-            # 3. Step
             optimizer.zero_grad()
-            loss = model.compute_loss(user_feat, item_feat, extra_item_features=neg_feat)
+            # Pass log_q of positive items and negative items for correction
+            loss = model.compute_loss(
+                user_feat, 
+                item_feat, 
+                item_log_q=item_feat['log_q'], 
+                extra_item_features=neg_feat, 
+                extra_item_log_q=neg_log_q
+            )
             loss.backward()
             optimizer.step()
             

@@ -95,9 +95,11 @@ class DualTowerModel(nn.Module):
         item_emb = self.item_tower(item_features)
         return user_emb, item_emb
 
-    def compute_loss(self, user_features, item_features, extra_item_features=None):
+    def compute_loss(self, user_features, item_features, item_log_q, extra_item_features=None, extra_item_log_q=None):
         """
-        用于训练：计算 InfoNCE Loss (In-batch + Global Negative Sampling)
+        用于训练：计算带有 Log-Q 纠偏的 InfoNCE Loss (In-batch + Global Negative Sampling)
+        item_log_q: (B,) 正样本物品的采样概率的对数
+        extra_item_log_q: (M,) 全局负样本物品的采样概率的对数
         """
         user_emb = self.user_tower(user_features) # (B, D)
         item_emb = self.item_tower(item_features) # (B, D)
@@ -105,10 +107,20 @@ class DualTowerModel(nn.Module):
         # 1. 计算 In-batch 相似度: (B, B)
         logits = torch.matmul(user_emb, item_emb.T) # (B, B)
         
-        # 2. 如果有额外的全局负样本 (M, D)
+        # 2. Log-Q 纠偏 (针对 In-batch 物品)
+        # 减去 log(P(i))。注意：item_log_q 对应的是列方向上的物品概率
+        # logits[i, j] 对应 user_i 和 item_j，因此减去的是 item_j 的 log_q
+        logits = logits - item_log_q.view(1, -1)
+        
+        # 3. 如果有额外的全局负样本 (M, D)
         if extra_item_features is not None:
             extra_item_emb = self.item_tower(extra_item_features) # (M, D)
             extra_logits = torch.matmul(user_emb, extra_item_emb.T) # (B, M)
+            
+            # 对全局负样本也进行 Log-Q 纠偏
+            if extra_item_log_q is not None:
+                extra_logits = extra_logits - extra_item_log_q.view(1, -1)
+                
             # 拼接列，得到 (B, B + M) 的 Logits
             logits = torch.cat([logits, extra_logits], dim=1)
             

@@ -50,7 +50,8 @@ class MovielensRecallDataset(Dataset):
             'release_year': torch.tensor(item_feat['release_year'], dtype=torch.float32),
             'avg_rating': torch.tensor(item_feat.get('avg_rating', 0.0), dtype=torch.float32),
             'revenue': torch.tensor(item_feat.get('revenue', 0.0), dtype=torch.float32),
-            'tmdb_genres': torch.tensor(item_feat['tmdb_genres'], dtype=torch.long) # list of ints
+            'tmdb_genres': torch.tensor(item_feat['tmdb_genres'], dtype=torch.long), # list of ints
+            'log_q': torch.tensor(item_feat.get('log_q', 0.0), dtype=torch.float32)
         }
         
         return user_tensor_dict, item_tensor_dict
