@@ -54,7 +54,7 @@ df.to_parquet('data/processed/tmdb_features.parquet', index=False)"
 #### Step 1: 数据清洗与特征预处理 (生成宽表)
 执行 MovieLens 与 TMDB 数据合并、特征 Log 变换、年份分箱、数据集 Leave-One-Out 切分：
 ```bash
-conda run -n movielens-rec python src/data_pipeline/preprocessor.py
+conda run -n movielens-rec python scripts/01_process_data.py
 ```
 
 #### Step 2: 启动双塔召回模型训练
