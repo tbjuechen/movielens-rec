@@ -1,90 +1,78 @@
 # MovieLens Recommendation System v2
 
-本项目是一个基于 [MovieLens-32M](https://grouplens.org/datasets/movielens/) 和 TMDB 外部数据的工业级推荐系统实验平台。旨在模拟搜推实习面试中的召回与排序实战场景。
+本项目是一个基于 [MovieLens-32M](https://grouplens.org/datasets/movielens/) 和 TMDB 外部数据的工业级推荐系统召回模型方案。它模拟了真实业务中处理千万级数据量、多路召回融合以及深度兴趣建模的实战场景。
 
-## 核心特性
-- **数据工程**：处理 3200 万级交互数据，融合 TMDB 票房、语言、演职员等多维特征。
-- **召回模型**：
-    - **双塔模型 (Dual-Tower)**：支持 In-batch 负采样、全局随机采样、热门负采样。
-    - **混合损失函数**：结合 InfoNCE (全域对比) 与 BPR (困难对排序)。
-    - **特征纠偏**：应用 Log-Q Correction 修正采样偏差。
-    - **时序感知**：用户历史序列采用时间衰减加权 (Time-Decay Weighting)。
-- **高性能组件**：特征向量化处理、Parquet 存储格式、PyTorch 加速训练。
+## 🚀 技术亮点
 
-## 项目结构
+### 1. 召回算法 (Retrieval Strategies)
+- **深度双塔 (Neural Dual-Tower)**: 
+    - **共享嵌入层**: 用户历史序列与物品 ID 强共享 Embedding，增强语义一致性。
+    - **混合损失 (Mixed Loss)**: 同时使用 InfoNCE (全域对比) 和 BPR (困难对排序)。
+    - **采样纠偏 (Log-Q Correction)**: 修正 In-batch 负采样带来的流行度偏差 (Popularity Bias)。
+    - **时序加权 (Time-Decay)**: 采用指数衰减函数对用户最近观看历史进行动态加权。
+- **协同过滤 (Collaborative Filtering)**: 实现并优化了带 IUF/IIF 惩罚的 **ItemCF** 和 **UserCF**。
+- **冷启动召回**: 包含 **Genre-based (标签)** 和 **Popularity (热门)** 兜底通道。
+
+### 2. 工程优化 (Engineering)
+- **高性能 IO**: 将 8.6 万个小文件与 32M 行 CSV 聚合为 **Parquet** 宽表，读取速度提升 100x。
+- **向量化处理**: 特征编码与纠偏计算全量采用 **Pandas/NumPy 向量化映射**。
+- **混合负采样**: 每个 Batch 同时包含 In-batch、Global Uniform 和 Popular Hard Negatives。
+
+## 📂 项目结构
 ```bash
 .
-├── data/               # 原始数据与处理后的 Parquet 宽表 (Git 忽略)
-├── docs/               # 详细的技术方案与实验报告
-│   └── design_spec.md  # 初始设计方案与特征工程定义
-├── scripts/            # 一键执行流水线 (01-04 脚本)
-├── src/                # 核心源代码 (特征工程、模型、数据流)
-└── requirements.txt    # 项目依赖
+├── data/               # 数据存储 (processed/ 内存放生成的宽表)
+├── docs/               # 技术文档与实验报告
+├── scripts/            # 执行流水线 (01-04 入口脚本)
+├── src/
+│   ├── data_pipeline/  # 预处理与 Dataset 构建
+│   ├── features/       # 特征编码器
+│   ├── models/         # 召回模型 (DualTower, ItemCF, UserCF, Merger)
+│   └── pipeline/       # 离线评估链路
+└── GEMINI.md           # 项目开发规范与共识
 ```
 
-## 快速开始
+## 🛠 快速开始
 
-### 1. 环境配置
-推荐使用 Conda 环境：
+### 1. 环境准备
 ```bash
 conda activate movielens-rec
-# 或手动安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 数据准备
-1. 下载 [MovieLens-32M](https://grouplens.org/datasets/movielens/) 并解压到 `data/raw/ml-32m`。
-2. 将 TMDB 的 JSON 缓存放置在 `data/raw/tmdb_cache`。
+### 2. 数据流水线 (Pipeline)
 
-### 3. 一键执行流水线 (Commands)
-按顺序执行以下脚本完成端到端流程：
-
-#### Step 0: 聚合 TMDB 缓存数据 (加速 IO)
-将 8 万个小 JSON 文件合并为高效的 Parquet 格式：
+#### Step 0: 聚合 TMDB 数据
+将 8 万个小 JSON 合并为 Parquet 格式：
 ```bash
-conda run -n movielens-rec python -c "
-import os, json, pandas as pd; from tqdm import tqdm; \
-tmdb_dir = 'data/raw/tmdb_cache/'; \
-files = [f for f in os.listdir(tmdb_dir) if f.endswith('.json')]; \
-data_list = [json.load(open(os.path.join(tmdb_dir, f))) for f in tqdm(files)]; \
-df = pd.DataFrame([{ 'tmdb_id': d.get('id'), 'imdb_id': d.get('imdb_id'), 'original_language': d.get('original_language'), 'budget': d.get('budget', 0), 'revenue': d.get('revenue', 0), 'runtime': d.get('runtime', 0), 'vote_average': d.get('vote_average', 0.0), 'vote_count': d.get('vote_count', 0), 'tmdb_genres': [g['name'] for g in d.get('genres', [])] } for d in data_list]); \
-df.to_parquet('data/processed/tmdb_features.parquet', index=False)"
+conda run -n movielens-rec python -c "import os, json, pandas as pd; from tqdm import tqdm; tmdb_dir = 'data/raw/tmdb_cache/'; files = [f for f in os.listdir(tmdb_dir) if f.endswith('.json')]; data_list = [json.load(open(os.path.join(tmdb_dir, f))) for f in tqdm(files)]; df = pd.DataFrame([{ 'tmdb_id': d.get('id'), 'imdb_id': d.get('imdb_id'), 'original_language': d.get('original_language'), 'budget': d.get('budget', 0), 'revenue': d.get('revenue', 0), 'runtime': d.get('runtime', 0), 'vote_average': d.get('vote_average', 0.0), 'vote_count': d.get('vote_count', 0), 'tmdb_genres': [g['name'] for g in d.get('genres', [])] } for d in data_list]); df.to_parquet('data/processed/tmdb_features.parquet', index=False)"
 ```
 
-#### Step 1: 数据清洗与特征预处理 (生成宽表)
-执行 MovieLens 与 TMDB 数据合并、特征 Log 变换、年份分箱、数据集 Leave-One-Out 切分：
+#### Step 1: 预处理与切分
+生成宽表、进行特征 Log 变换、完成用户时间线 Leave-One-Out 切分：
 ```bash
 conda run -n movielens-rec python scripts/01_process_data.py
 ```
 
-#### Step 2: 特征工程与词表构建 (固化 Encoders)
-统计全局类别词表、拟合数值归一化器，并将元数据存入 feature_store，供后续多模型共享：
+#### Step 2: 特征词表固化
+统计全局词表、拟合归一化器，固化 Encoders：
 ```bash
 conda run -n movielens-rec python scripts/02_build_features.py
 ```
 
-#### Step 3: 启动召回模型训练
-训练带 Log-Q 纠偏、混合 Loss (InfoNCE + BPR)、时间衰减加权的神经网络模型，或计算协同过滤矩阵：
+#### Step 3: 模型训练
+支持三路训练/离线计算：
 ```bash
-# 训练双塔模型 (最核心)
+# 训练双塔神经网络 (支持 GPU/MPS 加速)
 conda run -n movielens-rec python scripts/03_train_models.py --model dual_tower
 
-# 计算 ItemCF 矩阵
+# 计算 ItemCF / UserCF 相似度矩阵
 conda run -n movielens-rec python scripts/03_train_models.py --model item_cf
-
-# 计算 UserCF 矩阵
 conda run -n movielens-rec python scripts/03_train_models.py --model user_cf
 ```
 
-#### Step 4: 召回指标评测 (待开发)
-基于训练好的权重生成全量物品向量库，在测试集上计算 Recall@50：
-```bash
-conda run -n movielens-rec python scripts/04_evaluate_e2e.py
-```
-
-## 技术文档索引
-- [技术方案与字段定义 (docs/design_spec.md)](docs/design_spec.md)
-- [指标评估报告 (待生成)](docs/evaluation_report.md)
+#### Step 4: 指标评测 (开发中)
+构建 FAISS 索引并计算测试集 Recall@50/NDCG@50。
 
 ---
-2026.3.14 - 搜推实习项目准备
+2026.3.14 - 搜推实习准备项目
