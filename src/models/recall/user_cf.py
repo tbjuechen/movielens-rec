@@ -1,10 +1,9 @@
 import pandas as pd
 import numpy as np
 import pickle
-from tqdm import tqdm
-from collections import defaultdict
-import math
+from scipy.sparse import csr_matrix
 from pathlib import Path
+from tqdm import tqdm
 
 class UserCFModel:
     def __init__(self, sim_save_path: str):
@@ -14,54 +13,83 @@ class UserCFModel:
 
     def fit(self, train_df: pd.DataFrame, top_k=50):
         """
-        计算用户相似度矩阵。
+        使用稀疏矩阵加速计算 UserCF 相似度。
         """
-        print("UserCF: Calculating user similarity via item-inverted index...")
-        # 1. 建立物品到用户的倒排表
-        item_user_dict = train_df.groupby('movieId')['userId'].apply(list).to_dict()
+        print("UserCF: Encoding IDs for sparse matrix...")
+        user_ids = train_df['userId'].unique()
+        item_ids = train_df['movieId'].unique()
+        
+        user_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+        item_to_idx = {iid: i for i, iid in enumerate(item_ids)}
+        idx_to_user = {i: uid for uid, i in user_to_idx.items()}
+        
+        # 记录用户看过的物品，用于召回时去重
         self.user_item_dict = train_df.groupby('userId')['movieId'].apply(list).to_dict()
         
-        user_cnt = defaultdict(int)
-        user_sim_matrix = defaultdict(lambda: defaultdict(int))
+        u_idx = train_df['userId'].map(user_to_idx).values
+        i_idx = train_df['movieId'].map(item_to_idx).values
         
-        for item, users in tqdm(item_user_dict.items(), desc="Processing Item-User Inverted Index"):
-            for u in users:
-                user_cnt[u] += 1
-                for v in users:
-                    if u == v:
-                        continue
-                    # 惩罚热门物品 (IIF: Inverse Item Frequency)
-                    user_sim_matrix[u][v] += 1 / math.log(1 + len(users))
+        # 1. 构建 User-Item 稀疏矩阵
+        print("UserCF: Building User-Item sparse matrix...")
+        ui_matrix = csr_matrix((np.ones(len(train_df)), (u_idx, i_idx)), 
+                                shape=(len(user_ids), len(item_ids)))
         
-        print("UserCF: Normalizing similarity matrix...")
+        # 2. 计算用户相似度矩阵 S = R * R^T
+        print("UserCF: Calculating user similarity matrix (Matrix Multiplication)...")
+        # 这是计算用户两两之间共同看过多少物品
+        uu_matrix = ui_matrix.dot(ui_matrix.T)
+        
+        # 3. 余弦归一化
+        print("UserCF: Normalizing similarity scores...")
+        user_counts = np.array(uu_matrix.diagonal()).flatten()
+        uu_matrix = uu_matrix.tocoo()
+        row_idx = uu_matrix.row
+        col_idx = uu_matrix.col
+        sim_data = uu_matrix.data
+        
+        norm = np.sqrt(user_counts[row_idx] * user_counts[col_idx])
+        sim_data = sim_data / (norm + 1e-8)
+        
+        # 4. 构建字典并截断
+        print(f"UserCF: Pruning to Top-{top_k} per user...")
         final_sim_matrix = {}
-        for u, related_users in tqdm(user_sim_matrix.items(), desc="Normalizing Matrix"):
-            # Sort and keep top_k
-            sorted_users = sorted(
-                related_users.items(), 
-                key=lambda x: x[1] / math.sqrt(user_cnt[u] * user_cnt[x[0]]), 
-                reverse=True
-            )[:top_k]
-            final_sim_matrix[u] = {k: v / math.sqrt(user_cnt[u] * user_cnt[k]) for k, v in sorted_users}
+        refined_matrix = csr_matrix((sim_data, (row_idx, col_idx)), shape=uu_matrix.shape)
+        
+        for i in tqdm(range(len(user_ids)), desc="Building User Map"):
+            row = refined_matrix.getrow(i)
+            indices = row.indices
+            scores = row.data
+            
+            mask = indices != i
+            indices = indices[mask]
+            scores = scores[mask]
+            
+            if len(scores) == 0:
+                continue
+                
+            if len(scores) > top_k:
+                top_idx = np.argpartition(scores, -top_k)[-top_k:]
+                indices = indices[top_idx]
+                scores = scores[top_idx]
+            
+            orig_user_i = idx_to_user[i]
+            final_sim_matrix[orig_user_i] = {idx_to_user[idx]: float(score) for idx, score in zip(indices, scores)}
             
         self.user_sim_matrix = final_sim_matrix
         self.save()
 
     def retrieve(self, user_id: int, k=50):
-        """
-        根据相似用户召回物品。
-        """
         if user_id not in self.user_sim_matrix:
             return []
             
-        rank = defaultdict(float)
+        rank = {}
         interacted_items = set(self.user_item_dict.get(user_id, []))
         
         for v, sim in self.user_sim_matrix[user_id].items():
             for item in self.user_item_dict.get(v, []):
                 if item in interacted_items:
                     continue
-                rank[item] += sim
+                rank[item] = rank.get(item, 0) + sim
                 
         sorted_res = sorted(rank.items(), key=lambda x: x[1], reverse=True)[:k]
         return [res[0] for res in sorted_res]
@@ -71,11 +99,11 @@ class UserCFModel:
         with open(self.sim_save_path, "wb") as f:
             data = {'matrix': self.user_sim_matrix, 'user_item': self.user_item_dict}
             pickle.dump(data, f)
-        print(f"UserCF artifacts saved to {self.sim_save_path}")
+        print(f"High-performance UserCF saved to {self.sim_save_path}")
 
     def load(self):
         with open(self.sim_save_path, "rb") as f:
             data = pickle.load(f)
             self.user_sim_matrix = data['matrix']
             self.user_item_dict = data['user_item']
-        print("UserCF artifacts loaded.")
+        print("UserCF matrix loaded.")
