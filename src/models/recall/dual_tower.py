@@ -100,12 +100,10 @@ class DualTowerModel(nn.Module):
         loss_infonce = F.cross_entropy(infonce_logits, labels)
         
         # 2. BPR Loss (Rank-based, no Log-Q needed)
-        # Both pos and hard scores should be scaled by tau for consistent gradient magnitude
-        hard_scores = torch.matmul(user_emb, hard_neg_emb.T) / self.tau
-        pos_scores_scaled = pos_scores.view(-1, 1) / self.tau
-        
-        # BPR: -log(sigmoid(pos - hard))
-        diff = pos_scores_scaled - hard_scores
+        # BPR uses raw similarity scores (no tau scaling) to avoid vanishing gradients.
+        # With tau=0.1, scaling would amplify diff by 10x, pushing sigmoid to extremes.
+        hard_scores = torch.matmul(user_emb, hard_neg_emb.T) # (B, Hard_Size)
+        diff = pos_scores.view(-1, 1) - hard_scores
         loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
 
         
