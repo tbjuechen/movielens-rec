@@ -1,100 +1,61 @@
-# movielens 推荐项目
+# MovieLens Recommendation System v2
 
-2026.3.6 搜推实习项目准备
+本项目是一个基于 [MovieLens-32M](https://grouplens.org/datasets/movielens/) 和 TMDB 外部数据的工业级推荐系统实验平台。旨在模拟搜推实习面试中的召回与排序实战场景。
 
-## 一、项目结构
+## 核心特性
+- **数据工程**：处理 3200 万级交互数据，融合 TMDB 票房、语言、演职员等多维特征。
+- **召回模型**：
+    - **双塔模型 (Dual-Tower)**：支持 In-batch 负采样、全局随机采样、热门负采样。
+    - **混合损失函数**：结合 InfoNCE (全域对比) 与 BPR (困难对排序)。
+    - **特征纠偏**：应用 Log-Q Correction 修正采样偏差。
+    - **时序感知**：用户历史序列采用时间衰减加权 (Time-Decay Weighting)。
+- **高性能组件**：特征向量化处理、Parquet 存储格式、PyTorch 加速训练。
 
-```jsx
-movielens_recsys/
-├── data/                      # 数据存放目录 (需在 .gitignore 中忽略)
-│   ├── raw/                   # 原始 MovieLens 数据 
-│   ├── processed/             # 清洗切分后的离线数据集 (train/val/test)
-│   ├── feature_store/         # 【模拟线上】预处理好的静态特征字典
-│   └── model_weights/         # 训练好的模型权重与索引
-├── notebooks/                 # Jupyter Notebooks (实验与探索)
-├── src/                       # 核心源代码目录
-│   ├── config/                # 全局配置
-│   │   └── settings.py        # 路径、特征维度、召回K值等
-│   ├── data_pipeline/         # 离线数据处理流
-│   │   ├── preprocessor.py    # 清洗去噪、数据集切分
-│   │   └── dataset.py         # 构建 Dataset/DataLoader
-│   ├── features/              # 特征工程模块
-│   │   ├── encoder.py         # 类别编码、连续值归一化
-│   │   └── feature_builder.py # 提取特征并落盘到 feature_store
-│   ├── models/                # 模型层 (仅保留抽象接口)
-│   │   ├── recall/            
-│   │   │   ├── base.py        # 召回基类 (定义 fit, retrieve 标准接口)
-│   │   │   └── merger.py      # 多路召回的结果融合与截断
-│   │   └── ranking/           
-│   │       └── base.py        # 排序基类 (定义 fit, predict 标准接口)
-│   ├── evaluation/            # 评估模块
-│   │   └── metrics.py         # 评估指标实现
-│   └── pipeline/              # 端到端推断与评测链路
-│       ├── retriever.py       # 召回调度器 (面向 recall/base.py 编程)
-│       ├── feature_fetcher.py # 特征组装器 (从 feature_store 拉取数据)
-│       ├── ranker.py          # 排序调度器 (面向 ranking/base.py 编程)
-│       └── evaluator.py       # 链路总控，输出最终指标报表
-├── scripts/                   # 一键执行流水线
-│   ├── 01_process_data.py     # 运行清洗与切分
-│   ├── 02_build_features.py   # 生成并存储特征库
-│   ├── 03_train_models.py     # 触发模型训练 (召回+排序)
-│   └── 04_evaluate_e2e.py     # 执行端到端评测
-├── requirements.txt           
-└── README.md
+## 项目结构
+```bash
+.
+├── data/               # 原始数据与处理后的 Parquet 宽表 (Git 忽略)
+├── docs/               # 详细的技术方案与实验报告
+│   └── design_spec.md  # 初始设计方案与特征工程定义
+├── scripts/            # 一键执行流水线 (01-04 脚本)
+├── src/                # 核心源代码 (特征工程、模型、数据流)
+└── requirements.txt    # 项目依赖
 ```
 
-## 二、数据准备
+## 快速开始
 
-- MovieLens-32M https://grouplens.org/datasets/movielens/
-    - movies.csv 电影表：movieID, title, genres
-    - ratings.csv 交互表：userID, movieID, rating, ts
-    - tags.csv 交互表：userID, movieID, tag, ts
-    - links.csv 电影外部数据库表：movieID, imdbID, tmdbID
-- IMDB https://www.imdb.com/
+### 1. 环境配置
+推荐使用 Conda 环境：
+```bash
+conda activate movielens-rec
+# 或手动安装依赖
+pip install -r requirements.txt
+```
 
-通过爬虫脚本和IMDB官方api获取额外的电影特征
+### 2. 数据准备
+1. 下载 [MovieLens-32M](https://grouplens.org/datasets/movielens/) 并解压到 `data/raw/ml-32m`。
+2. 将 TMDB 的 JSON 缓存放置在 `data/raw/tmdb_cache`。
 
-| **字段名 (Field)** | **数据类型 (Type)** | **描述 (Description)** |
-| --- | --- | --- |
-| **`id`** | Number | 平台内部标识符 |
-| **`imdb_id`** | String | IMDB 标识符 |
-| **`title`** | String | 片名 |
-| **`original_title`** | String | 原片名 |
-| **`overview`** | String | 剧情简介 |
-| **`genres`** | Array[Object] | 类型数组 |
-| **`credits`** | Object | 演职人员表 |
-| **`keywords`** | Object | 关键词 |
-*(...更多详见IMDB)*
+### 3. 运行流水线
+按顺序执行以下脚本完成端到端流程：
 
-## 三、召回模型
+```bash
+# 01. 数据预处理：清洗、特征提取、数据集 Leave-One-Out 切分
+python src/data_pipeline/preprocessor.py
 
-### 3.1 召回通道
-- 双塔模型
-- ItemCF
-- UserCF
-- 热门召回
-- 标签召回
+# 02. 特征构建：生成特征词表、归一化器 (可选，训练脚本内包含)
+python scripts/02_build_features.py
 
-### 3.2 双塔模型
-- 用户塔
-    - user_id：用户id嵌入
-    - avg_rating：用户历史平均打分
-    - genres：用户top3类别兴趣
-    - history：历史交互item加权和
-    - activity：用户活跃度
-- 物品塔
-    - item_id：物品id嵌入
-    - genres：物品类别嵌入和
-    - release_year：发布时间
-    - language：对白语言
-    - avg_rating：movielens平均评分
-    - imdb_avg_rating：imdb平均评分
-    - revenue：电影票房
-- 采样方式
-    - in-batch负采样 + 全集采样
-    - 困难负样本 (热门未交互物品, 交互低分物品)
-- 损失函数
-    - infoNCE
-    - BPR
-- 评测指标
-    - recal@50
+# 03. 召回模型训练：启动带纠偏的双塔模型训练
+python scripts/03_train_models.py
+
+# 04. 召回评测：评估 Recall@50 等核心指标 (正在开发中)
+python scripts/04_evaluate_e2e.py
+```
+
+## 技术文档索引
+- [技术方案与字段定义 (docs/design_spec.md)](docs/design_spec.md)
+- [指标评估报告 (待生成)](docs/evaluation_report.md)
+
+---
+2026.3.14 - 搜推实习项目准备
