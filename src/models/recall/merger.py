@@ -30,8 +30,8 @@ class RecallMerger:
         for channel, items in results_dict.items():
             channel_weight = weights.get(channel, 1.0)
             for i, item_id in enumerate(items):
-                # 简单的排名倒数分 (RRR)
-                rank_score = (1.0 / (i + 1)) * channel_weight
+                # RRF (Reciprocal Rank Fusion) with damping k=60 (Critical Fix #13)
+                rank_score = (1.0 / (i + 1 + 60)) * channel_weight
                 final_scores[item_id] += rank_score
         
         # 2. 排序并截断

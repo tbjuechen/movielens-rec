@@ -9,29 +9,26 @@ class FeatureEncoder:
         self.feature_store_dir = Path(feature_store_dir)
         self.feature_store_dir.mkdir(parents=True, exist_ok=True)
         
-        # 类别特征的词表映射 (Vocabularies): { 'user_id': {1: 1, 2: 2...}, 'genres': {'Action': 1, ...} }
+        # 类别特征的词表映射
         self.vocabularies = {}
         # 连续特征的归一化器
         self.scalers = {}
-        
-        # 记录词表大小，用于配置 Embedding 层
+        # 连续特征的中位数 (用于 transform 时填充 NaN)
+        self.medians = {}
+        # 记录词表大小
         self.vocab_sizes = {}
 
     def fit_categorical(self, series: pd.Series, feature_name: str, is_list=False):
-        """为类别特征构建词表，支持处理列表类型的特征 (如 genres)"""
+        """为类别特征构建词表"""
         print(f"Building vocabulary for {feature_name}...")
         unique_values = set()
-        
-        # 0 作为 OOV / Padding 的保留索引
         vocab = {"<PAD>": 0} 
         idx = 1
         
         if is_list:
             for item_list in series.dropna():
-                if isinstance(item_list, list):
+                if isinstance(item_list, (list, np.ndarray)):
                     unique_values.update(item_list)
-                elif isinstance(item_list, np.ndarray):
-                    unique_values.update(item_list.tolist())
         else:
             unique_values.update(series.dropna().unique())
             
@@ -44,7 +41,7 @@ class FeatureEncoder:
         print(f"Vocab size for {feature_name}: {self.vocab_sizes[feature_name]}")
 
     def transform_categorical(self, series: pd.Series, feature_name: str, is_list=False, max_len=None):
-        """将类别特征转换为对应的索引，如果是列表，进行 Padding"""
+        """将类别特征转换为索引"""
         vocab = self.vocabularies.get(feature_name, {"<PAD>": 0})
         
         def encode_item(val):
@@ -52,60 +49,57 @@ class FeatureEncoder:
 
         def process_element(x):
             if is_list:
-                # 处理列表：[ 'Action', 'Sci-Fi' ] -> [ 1, 5, 0, 0 ]
                 if not isinstance(x, (list, np.ndarray)):
                     items = []
                 else:
                     items = [encode_item(i) for i in x]
-                
                 if max_len:
-                    if len(items) >= max_len:
-                        return items[:max_len]
-                    else:
-                        return items + [0] * (max_len - len(items))
+                    return items[:max_len] + [0] * (max_len - len(items[:max_len]))
                 return items
             else:
-                # 处理单个标量
                 return encode_item(x)
 
         return series.apply(process_element)
 
-    def fit_continuous(self, df: pd.DataFrame, columns: list):
-        """为连续特征拟合 MinMaxScaler"""
-        print(f"Fitting scalers for {columns}...")
+    def fit_continuous(self, df: pd.DataFrame, columns: list, prefix=""):
+        """为连续特征拟合 Scaler，使用 prefix 防止 key 冲突"""
         for col in columns:
+            key = f"{prefix}_{col}" if prefix else col
+            print(f"Fitting scaler for {key}...")
             scaler = MinMaxScaler()
-            # 填充缺失值为中位数
-            values = df[col].fillna(df[col].median()).values.reshape(-1, 1)
+            median_val = df[col].median()
+            self.medians[key] = median_val
+            values = df[col].fillna(median_val).values.reshape(-1, 1)
             scaler.fit(values)
-            self.scalers[col] = scaler
+            self.scalers[key] = scaler
 
-    def transform_continuous(self, df: pd.DataFrame, columns: list):
+    def transform_continuous(self, df: pd.DataFrame, columns: list, prefix=""):
         """转换连续特征"""
         out_df = pd.DataFrame(index=df.index)
         for col in columns:
-            scaler = self.scalers[col]
-            values = df[col].fillna(df[col].median()).values.reshape(-1, 1)
+            key = f"{prefix}_{col}" if prefix else col
+            scaler = self.scalers[key]
+            median_val = self.medians.get(key, 0.0)
+            values = df[col].fillna(median_val).values.reshape(-1, 1)
             out_df[col] = scaler.transform(values).flatten()
         return out_df
 
     def save(self):
-        """保存字典和归一化器到磁盘"""
-        with open(self.feature_store_dir / "vocabularies.pkl", "wb") as f:
-            pickle.dump(self.vocabularies, f)
-        with open(self.feature_store_dir / "vocab_sizes.pkl", "wb") as f:
-            pickle.dump(self.vocab_sizes, f)
-        with open(self.feature_store_dir / "scalers.pkl", "wb") as f:
-            pickle.dump(self.scalers, f)
+        artifacts = {
+            'vocabularies': self.vocabularies,
+            'vocab_sizes': self.vocab_sizes,
+            'scalers': self.scalers,
+            'medians': self.medians
+        }
+        with open(self.feature_store_dir / "encoder_artifacts.pkl", "wb") as f:
+            pickle.dump(artifacts, f)
         print(f"Encoders saved to {self.feature_store_dir}")
 
     def load(self):
-        """从磁盘加载字典和归一化器"""
-        with open(self.feature_store_dir / "vocabularies.pkl", "rb") as f:
-            self.vocabularies = pickle.load(f)
-        with open(self.feature_store_dir / "vocab_sizes.pkl", "rb") as f:
-            self.vocab_sizes = pickle.load(f)
-        with open(self.feature_store_dir / "scalers.pkl", "rb") as f:
-            self.scalers = pickle.load(f)
+        with open(self.feature_store_dir / "encoder_artifacts.pkl", "rb") as f:
+            artifacts = pickle.load(f)
+        self.vocabularies = artifacts['vocabularies']
+        self.vocab_sizes = artifacts['vocab_sizes']
+        self.scalers = artifacts['scalers']
+        self.medians = artifacts.get('medians', {})
         print(f"Encoders loaded from {self.feature_store_dir}")
-

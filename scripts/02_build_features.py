@@ -33,10 +33,10 @@ def main():
     ]).dropna()
     encoder.fit_categorical(all_genres, 'genres')
     
-    # 2. Fit Continuous Scalers
+    # 2. Fit Continuous Scalers (Critical Fix #4: Prefix Isolation)
     print("Fitting scalers for numerical features...")
-    encoder.fit_continuous(user_profile, ['avg_rating', 'activity'])
-    encoder.fit_continuous(item_profile, ['release_year_orig', 'avg_rating', 'revenue', 'budget', 'vote_count_ml'])
+    encoder.fit_continuous(user_profile, ['avg_rating', 'activity'], prefix="user")
+    encoder.fit_continuous(item_profile, ['release_year_orig', 'avg_rating', 'revenue', 'budget', 'vote_count_ml'], prefix="item")
     
     # 3. Save to feature_store
     encoder.save()

@@ -5,55 +5,73 @@ import numpy as np
 
 class MovielensRecallDataset(Dataset):
     def __init__(self, interactions_df: pd.DataFrame, user_profile_df: pd.DataFrame, item_profile_df: pd.DataFrame):
-        self.interactions = interactions_df.reset_index(drop=True)
-        # 优化：不使用 to_dict，直接使用索引加速
-        self.user_profile = user_profile_df.set_index('userId')
-        self.item_profile = item_profile_df.set_index('movieId')
+        # 1. 预处理 Interactions 为 Numpy 提高读取速度
+        self.u_ids = interactions_df['userId'].values.astype(np.int32)
+        self.i_ids = interactions_df['movieId'].values.astype(np.int32)
+        
+        # 2. 预处理 Profiles 为快速索引数组 (Critical Fix #9)
+        # 我们假设输入已经是已经过编码的 ID (0 到 N-1)
+        # 获取最大编码 ID
+        max_u = user_profile_df['userId'].max()
+        max_i = item_profile_df['movieId'].max()
+        
+        # 创建固定长度的矩阵/数组存储特征，实现 O(1) 访问
+        self.user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
+        self.user_activity = np.zeros(max_u + 1, dtype=np.float32)
+        self.user_history = np.zeros((max_u + 1, 50), dtype=np.int32)
+        self.user_history_ts = np.zeros((max_u + 1, 50), dtype=np.float32)
+        self.user_top_genres = np.zeros((max_u + 1, 3), dtype=np.int32)
+        
+        # 填充数据
+        u_idx = user_profile_df['userId'].values
+        self.user_avg_rating[u_idx] = user_profile_df['avg_rating'].values
+        self.user_activity[u_idx] = user_profile_df['activity'].values
+        self.user_history[u_idx] = np.stack(user_profile_df['history'].values)
+        self.user_history_ts[u_idx] = np.stack(user_profile_df['history_ts_diff'].values)
+        self.user_top_genres[u_idx] = np.stack(user_profile_df['top_genres'].values)
+        
+        # Item Side
+        self.item_release_year = np.zeros(max_i + 1, dtype=np.float32)
+        self.item_avg_rating = np.zeros(max_i + 1, dtype=np.float32)
+        self.item_revenue = np.zeros(max_i + 1, dtype=np.float32)
+        self.item_genres = np.zeros((max_i + 1, 5), dtype=np.int32)
+        self.item_log_q = np.full(max_i + 1, np.log(1e-10), dtype=np.float32)
+        
+        i_idx = item_profile_df['movieId'].values
+        self.item_release_year[i_idx] = item_profile_df['release_year_val'].values
+        self.item_avg_rating[i_idx] = item_profile_df['avg_rating'].values
+        self.item_revenue[i_idx] = item_profile_df['revenue'].values
+        self.item_genres[i_idx] = np.stack(item_profile_df['tmdb_genres'].values)
+        self.item_log_q[i_idx] = item_profile_df['log_q'].values
 
     def __len__(self):
-        return len(self.interactions)
+        return len(self.u_ids)
 
     def __getitem__(self, idx):
-        row = self.interactions.iloc[idx]
-        user_id = int(row['userId'])
-        item_id = int(row['movieId'])
-        
-        # 直接从 DataFrame 索引中通过 .loc 提取
-        user_feat = self.user_profile.loc[user_id]
-        
-        # 优化：检查 item_id 是否在索引中，不在则返回默认全零特征
-        if item_id in self.item_profile.index:
-            item_feat = self.item_profile.loc[item_id]
-        else:
-            # Fallback for items missing from profile (cold start or filter issue)
-            item_feat = {
-                'release_year_val': 0.0,
-                'avg_rating': 0.0,
-                'revenue': 0.0,
-                'tmdb_genres': [0] * 5,
-                'log_q': np.log(1e-10) # 对应 Log-Q 默认极小值
-            }
+        uid = self.u_ids[idx]
+        iid = self.i_ids[idx]
         
         user_tensor_dict = {
-            'user_id': torch.tensor(user_id, dtype=torch.long),
-            'avg_rating': torch.tensor(user_feat['avg_rating'], dtype=torch.float32),
-            'activity': torch.tensor(user_feat['activity'], dtype=torch.float32),
-            'history': torch.tensor(user_feat['history'], dtype=torch.long),
-            'history_ts_diff': torch.tensor(user_feat['history_ts_diff'], dtype=torch.float32),
-            'top_genres': torch.tensor(user_feat['top_genres'], dtype=torch.long)
+            'user_id': torch.tensor(uid, dtype=torch.long),
+            'avg_rating': torch.tensor(self.user_avg_rating[uid], dtype=torch.float32),
+            'activity': torch.tensor(self.user_activity[uid], dtype=torch.float32),
+            'history': torch.tensor(self.user_history[uid], dtype=torch.long),
+            'history_ts_diff': torch.tensor(self.user_history_ts[uid], dtype=torch.float32),
+            'top_genres': torch.tensor(self.user_top_genres[uid], dtype=torch.long)
         }
         
         item_tensor_dict = {
-            'item_id': torch.tensor(item_id, dtype=torch.long),
-            'release_year': torch.tensor(item_feat['release_year_val'], dtype=torch.float32), # 对应 03 里的新列名
-            'avg_rating': torch.tensor(item_feat['avg_rating'], dtype=torch.float32),
-            'revenue': torch.tensor(item_feat['revenue'], dtype=torch.float32),
-            'tmdb_genres': torch.tensor(item_feat['tmdb_genres'], dtype=torch.long),
-            'log_q': torch.tensor(item_feat['log_q'], dtype=torch.float32)
+            'item_id': torch.tensor(iid, dtype=torch.long),
+            'release_year': torch.tensor(self.item_release_year[iid], dtype=torch.float32),
+            'avg_rating': torch.tensor(self.item_avg_rating[iid], dtype=torch.float32),
+            'revenue': torch.tensor(self.item_revenue[iid], dtype=torch.float32),
+            'tmdb_genres': torch.tensor(self.item_genres[iid], dtype=torch.long),
+            'log_q': torch.tensor(self.item_log_q[iid], dtype=torch.float32)
         }
         
         return user_tensor_dict, item_tensor_dict
 
 def create_dataloader(interactions, user_profile, item_profile, batch_size=1024, shuffle=True, num_workers=4):
     dataset = MovielensRecallDataset(interactions, user_profile, item_profile)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+    # 增加 persistent_workers 防止子进程内存反复初始化开销
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=(num_workers > 0))

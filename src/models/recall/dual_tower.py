@@ -101,9 +101,10 @@ class DualTowerModel(nn.Module):
         
         # 2. BPR Loss (Rank-based, no Log-Q needed)
         hard_scores = torch.matmul(user_emb, hard_neg_emb.T) # (B, Hard_Size)
-        # BPR compares raw similarity scores
+        # BPR compares raw similarity scores to avoid vanishing gradients from small tau
         # We want pos_score > hard_score
-        diff = (pos_scores / self.tau) - (hard_scores / self.tau)
+        diff = pos_scores.view(-1, 1) - hard_scores
         loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
+
         
         return loss_infonce + loss_bpr, loss_infonce, loss_bpr

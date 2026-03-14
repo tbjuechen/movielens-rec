@@ -4,27 +4,27 @@ from pathlib import Path
 from tqdm import tqdm
 import re
 import gc
+import json
 
 # Enable progress_apply for pandas
 tqdm.pandas()
 
 def process_all_data():
+    # Use paths from config logic (relative to root)
     raw_dir = Path("data/raw/ml-32m")
     processed_dir = Path("data/processed")
+    feature_store_dir = Path("data/feature_store")
     tmdb_file = processed_dir / "tmdb_features.parquet"
 
-    print("\n[Stage 1/4] Loading Raw CSVs (32M rows)...")
+    print("\n[Stage 1/5] Loading Raw CSVs (32M rows)...")
     movies = pd.read_csv(raw_dir / "movies.csv")
     links = pd.read_csv(raw_dir / "links.csv")
-    # Optimize types to save memory immediately
     ratings = pd.read_csv(raw_dir / "ratings.csv", 
                          dtype={'userId': np.int32, 'movieId': np.int32, 'rating': np.float32, 'timestamp': np.int64})
-    
-    print("[Stage 1/4] Loading TMDB features...")
     tmdb = pd.read_parquet(tmdb_file)
 
-    # 1. Item Profile Engineering
-    print("\n[Stage 2/4] Building Item Profile (Vectorized)...")
+    # 1. Item Profile Base
+    print("\n[Stage 2/5] Building Item Profile Base (Vectorized)...")
     movies['release_year_orig'] = movies['title'].str.extract(r'\((\d{4})\)').fillna(0).astype(int)
     
     def bin_year_vec(years):
@@ -36,8 +36,51 @@ def process_all_data():
     item_profile = movies.merge(links[['movieId', 'tmdbId']], on='movieId', how='left')
     item_profile = item_profile.merge(tmdb, left_on='tmdbId', right_on='tmdb_id', how='left')
     
-    print("Calculating item statistics from ratings...")
-    item_stats = ratings.groupby('movieId')['rating'].agg(['mean', 'count']).reset_index()
+    # Genre Alignment (Critical Fix #8)
+    def align_genres(genre_list):
+        if not isinstance(genre_list, (list, np.ndarray)): return []
+        mapping = {"Science Fiction": "Sci-Fi", "Action & Adventure": "Action"}
+        return [mapping.get(g, g) for g in genre_list]
+    item_profile['tmdb_genres'] = item_profile['tmdb_genres'].apply(align_genres)
+
+    # 2. Data Splitting (Chronological Anti-Leakage)
+    print("\n[Stage 3/5] Filtering and Splitting Data (User Timeline)...")
+    user_counts = ratings['userId'].value_counts()
+    valid_users = user_counts[user_counts >= 5].index
+    ratings = ratings[ratings['userId'].isin(valid_users)].copy()
+    ratings = ratings.sort_values(['userId', 'timestamp'], ascending=[True, True])
+    
+    # Leave-One-Out for Test and Val from Positive Interactions
+    pos_ratings = ratings[ratings['rating'] >= 3.0].copy()
+    print("Ranking positive interactions...")
+    pos_ratings['rank'] = pos_ratings.groupby('userId')['timestamp'].rank(method='first', ascending=False)
+    
+    test_data = pos_ratings[pos_ratings['rank'] == 1].drop(columns=['rank'])
+    val_data = pos_ratings[pos_ratings['rank'] == 2].drop(columns=['rank'])
+    
+    # Training Data: Remove specific val/test records AND any interactions after val_ts (Critical Fix #6)
+    val_ts_map = val_data.set_index('userId')['timestamp'].to_dict()
+    
+    def filter_train(row):
+        uid = row['userId']
+        if uid in val_ts_map and row['timestamp'] >= val_ts_map[uid]:
+            return False
+        return True
+    
+    print("Applying chronological filter to train set (Anti-Leakage)...")
+    # To speed up, we avoid per-row apply for 32M. We use vectorized comparison.
+    ratings = ratings.merge(val_data[['userId', 'timestamp']].rename(columns={'timestamp': 'val_ts'}), on='userId', how='left')
+    train_data = ratings[pd.isna(ratings['val_ts']) | (ratings['timestamp'] < ratings['val_ts'])].copy()
+    train_data = train_data.drop(columns=['val_ts'])
+    
+    train_data.to_parquet(processed_dir / "train_data.parquet", index=False)
+    val_data.to_parquet(processed_dir / "val_data.parquet", index=False)
+    test_data.to_parquet(processed_dir / "test_data.parquet", index=False)
+    print(f"Split complete. Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
+
+    # 3. Item Statistics (Strictly from Train Only - Critical Fix #5)
+    print("\n[Stage 4/5] Calculating Item Statistics (Train Only)...")
+    item_stats = train_data.groupby('movieId')['rating'].agg(['mean', 'count']).reset_index()
     item_stats.columns = ['movieId', 'avg_rating', 'vote_count_ml']
     item_profile = item_profile.merge(item_stats, on='movieId', how='left')
     
@@ -46,41 +89,13 @@ def process_all_data():
             item_profile[col] = np.log1p(item_profile[col].fillna(0))
     
     item_profile.to_parquet(processed_dir / "item_profile.parquet", index=False)
-    print(f"Item Profile saved ({len(item_profile)} items).")
+    print(f"Item Profile saved.")
     
-    del item_stats
+    del pos_ratings, item_stats
     gc.collect()
 
-    # 2. Data Splitting
-    print("\n[Stage 3/4] Filtering and Splitting Data (User Timeline)...")
-    user_counts = ratings['userId'].value_counts()
-    valid_users = user_counts[user_counts >= 5].index
-    ratings = ratings[ratings['userId'].isin(valid_users)].copy()
-    
-    print("Sorting 32M ratings by timestamp...")
-    ratings = ratings.sort_values(['userId', 'timestamp'], ascending=[True, True])
-    
-    # Take positive ratings for split (last 1 for test, second last for val)
-    pos_ratings = ratings[ratings['rating'] >= 3.0].copy()
-    print("Ranking positive interactions for Leave-One-Out split...")
-    pos_ratings['rank'] = pos_ratings.groupby('userId')['timestamp'].rank(method='first', ascending=False)
-    
-    test_data = pos_ratings[pos_ratings['rank'] == 1].drop(columns=['rank'])
-    val_data = pos_ratings[pos_ratings['rank'] == 2].drop(columns=['rank'])
-    
-    val_test_indices = pd.concat([test_data, val_data]).index
-    train_data = ratings.drop(val_test_indices)
-    
-    train_data.to_parquet(processed_dir / "train_data.parquet", index=False)
-    val_data.to_parquet(processed_dir / "val_data.parquet", index=False)
-    test_data.to_parquet(processed_dir / "test_data.parquet", index=False)
-    print(f"Split complete. Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
-    
-    del pos_ratings
-    gc.collect()
-
-    # 3. User Profile
-    print("\n[Stage 4/4] Building User Profile from Train Data...")
+    # 4. User Profile (From Train Data)
+    print("\n[Stage 5/5] Building User Profile from Train Data...")
     user_stats = train_data.groupby('userId').agg(
         avg_rating=('rating', 'mean'),
         activity_orig=('movieId', 'count')
@@ -101,11 +116,10 @@ def process_all_data():
     del train_with_genres, exploded_genres
     gc.collect()
 
-    print("Building User History Sequence (THIS WILL SHOW PROGRESS)...")
+    print("Building User History Sequence...")
     def get_history_with_time(group):
         latest_ts = group['timestamp'].max()
-        # 秒转小时
-        ts_diffs = (latest_ts - group['timestamp']) / 3600.0
+        ts_diffs = (latest_ts - group['timestamp']) / 3600.0 # hours
         return pd.Series({
             'history': group['movieId'].tolist()[-50:],
             'history_ts_diff': ts_diffs.tolist()[-50:]
@@ -115,26 +129,18 @@ def process_all_data():
     
     user_profile = user_stats.merge(user_genres, on='userId', how='left')
     user_profile = user_profile.merge(user_history, on='userId', how='left')
-    
     user_profile.to_parquet(processed_dir / "user_profile.parquet", index=False)
-    print(f"User Profile saved ({len(user_profile)} users).")
-
-    # 4. Building Inverted Index
-    print("\n[Stage 5/4] Building Inverted Index and Popularity List...")
-    item_genres = movies[['movieId', 'genres']].copy()
-    item_genres['genre_list'] = item_genres['genres'].str.split('|')
-    exploded_item_genres = item_genres.explode('genre_list')
-    genre_to_items = exploded_item_genres.groupby('genre_list')['movieId'].apply(list).to_dict()
     
+    # 5. Inverted Index Artifacts
+    print("Saving Hard Negative artifacts...")
+    genre_to_items = item_profile.explode('tmdb_genres').groupby('tmdb_genres')['movieId'].apply(list).to_dict()
     popularity_list = item_profile.sort_values('vote_count_ml', ascending=False)['movieId'].tolist()
     
-    import json
-    feature_store_dir = Path("data/feature_store")
     with open(feature_store_dir / "genre_to_items.json", "w") as f:
         json.dump(genre_to_items, f)
     with open(feature_store_dir / "popularity_list.json", "w") as f:
         json.dump(popularity_list, f)
-    print("All artifacts saved.")
+    print("Done.")
 
 if __name__ == "__main__":
     process_all_data()
