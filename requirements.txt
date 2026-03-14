@@ -1,7 +1,11 @@
 torch
 pandas
 numpy
+scipy
 scikit-learn
 tqdm
 pyarrow
+fastparquet
+faiss-cpu
 jupyterlab
+matplotlib
