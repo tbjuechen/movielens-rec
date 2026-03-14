@@ -57,13 +57,26 @@ df.to_parquet('data/processed/tmdb_features.parquet', index=False)"
 conda run -n movielens-rec python scripts/01_process_data.py
 ```
 
-#### Step 2: 启动双塔召回模型训练
-训练带 Log-Q 纠偏、混合 Loss (InfoNCE + BPR)、时间衰减加权的召回模型：
+#### Step 2: 特征工程与词表构建 (固化 Encoders)
+统计全局类别词表、拟合数值归一化器，并将元数据存入 feature_store，供后续多模型共享：
 ```bash
-conda run -n movielens-rec python scripts/03_train_models.py
+conda run -n movielens-rec python scripts/02_build_features.py
 ```
 
-#### Step 3: 召回指标评测 (待开发)
+#### Step 3: 启动召回模型训练
+训练带 Log-Q 纠偏、混合 Loss (InfoNCE + BPR)、时间衰减加权的神经网络模型，或计算协同过滤矩阵：
+```bash
+# 训练双塔模型 (最核心)
+conda run -n movielens-rec python scripts/03_train_models.py --model dual_tower
+
+# 计算 ItemCF 矩阵
+conda run -n movielens-rec python scripts/03_train_models.py --model item_cf
+
+# 计算 UserCF 矩阵
+conda run -n movielens-rec python scripts/03_train_models.py --model user_cf
+```
+
+#### Step 4: 召回指标评测 (待开发)
 基于训练好的权重生成全量物品向量库，在测试集上计算 Recall@50：
 ```bash
 conda run -n movielens-rec python scripts/04_evaluate_e2e.py
