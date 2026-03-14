@@ -26,7 +26,7 @@ training:
   inbatch_neg_size: 4096
   global_neg_size: 2048
   hard_neg_size: 512
-  num_workers: 16
+  num_workers: 32
 
 # 4. Feature Settings
 features:
