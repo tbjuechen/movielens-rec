@@ -52,31 +52,30 @@ def train_dual_tower():
     print("Calculating Log-Q (Sampling Probabilities) for Correction...")
     # Count occurrences of each movieId in training data
     item_counts = train_data['movieId'].value_counts()
-    # Map back to encoded indices
-    # We use a small smoothing factor to avoid log(0)
     total_count = len(train_data)
     
-    def get_log_q(row):
-        # We need the original movieId (unencoded) or we map our counts to the new indices
-        # Let's use the encoder's vocabulary to map correctly
-        orig_id = row.name # This is index if we're not careful. 
-        # Actually, simpler: map the counts directly to item_profile.
-        return np.log((item_counts.get(row['movieId_orig'], 0) / total_count) + 1e-10)
-
-    # Temporary store original ID to match counts
-    # item_profile['movieId'] is already encoded. We need to match with train_data's movieId.
-    # Let's map counts to encoded IDs.
+    # Vectorized mapping: Create an array indexed by encoded movieId
+    # Size: max_encoded_id + 1
+    max_id = encoder.vocab_sizes['movieId']
+    log_q_array = np.full(max_id + 1, np.log(1e-10), dtype=np.float32) # Default for unseen items
+    
+    # Map original movieId to encoded index using the vocabulary
     movie_vocab = encoder.vocabularies['movieId']
-    encoded_counts = {}
+    
+    # Build a lookup for counts keyed by encoded indices
+    encoded_ids = []
+    counts = []
     for orig_id, count in item_counts.items():
         if orig_id in movie_vocab:
-            encoded_counts[movie_vocab[orig_id]] = count
+            encoded_ids.append(movie_vocab[orig_id])
+            counts.append(count)
     
-    def calculate_item_log_q(encoded_id):
-        cnt = encoded_counts.get(encoded_id, 0)
-        return np.log((cnt / total_count) + 1e-10)
-
-    item_profile['log_q'] = item_profile['movieId'].apply(calculate_item_log_q)
+    # Batch update the log_q array
+    if encoded_ids:
+        log_q_array[encoded_ids] = np.log((np.array(counts) / total_count) + 1e-10)
+    
+    # Assign back to item_profile using vectorized indexing
+    item_profile['log_q'] = log_q_array[item_profile['movieId'].values]
 
     print("Preparing Global Item Features Lookup...")
     item_profile = item_profile.sort_values('movieId')
