@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 # Add src to path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config.settings import PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR
+from src.config.settings import PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR, LEARNING_RATE, EPOCHS
 from src.features.encoder import FeatureEncoder
 from src.data_pipeline.dataset import create_dataloader
 from src.models.recall.dual_tower import DualTowerModel
@@ -80,16 +80,22 @@ def train_dual_tower(batch_size=1024):
     }
 
     # Dataset 的特征字段需要与 Tower 的 forward 输入对齐
-    user_profile_dataset = user_profile.rename(columns={
+    # 只选取需要的列再 rename，避免与原始同名列冲突
+    user_profile_dataset = user_profile[
+        ['userId', 'userId_encoded', 'avg_rating_norm', 'activity_norm',
+         'history_encoded', 'history_ts_diff', 'top_genres_encoded']
+    ].rename(columns={
         'userId_encoded': 'user_id',
         'avg_rating_norm': 'avg_rating',
         'activity_norm': 'activity',
         'history_encoded': 'history',
-        'history_ts_diff': 'history_ts_diff',
         'top_genres_encoded': 'top_genres'
     })
     
-    item_profile_dataset = item_profile.rename(columns={
+    item_profile_dataset = item_profile[
+        ['movieId', 'movieId_encoded', 'release_year_norm', 'avg_rating_norm',
+         'revenue_norm', 'tmdb_genres_encoded']
+    ].rename(columns={
         'movieId_encoded': 'item_id',
         'release_year_norm': 'release_year_val',
         'avg_rating_norm': 'avg_rating',
@@ -103,7 +109,7 @@ def train_dual_tower(batch_size=1024):
     item_lookup = {k: v.to(device) for k, v in item_lookup.items() if v is not None}
     
     model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=64).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # 困难负样本池 (使用下标索引)
     pop_indices = [movie_id_to_idx[mid] for mid in popularity_list[:1000] if mid in movie_id_to_idx]
@@ -119,31 +125,32 @@ def train_dual_tower(batch_size=1024):
         return {k: item_lookup[k][indices] for k in item_lookup if k != 'log_q'}
 
     print("Starting Training (Fixing gradient flow and indexing)...")
-    for epoch in range(3):
+    for epoch in range(EPOCHS):
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
         for user_feat, item_feat in pbar:
             user_feat = {k: v.to(device) for k, v in user_feat.items()}
             item_feat = {k: v.to(device) for k, v in item_feat.items()}
             
-            # --- Prepare Negative Embeddings (Enable Gradients Critical Fix #2) ---
-            # Fetch features
+            optimizer.zero_grad()
+
+            # --- Prepare Negative Embeddings (with gradients) ---
             inbatch_feat = get_neg_feat_by_indices(buffer_indices)
             inbatch_log_q = item_lookup['log_q'][buffer_indices]
-            
-            global_idx = np.random.choice(np.arange(len(item_profile)), GLOBAL_NEG_SIZE, replace=False) # Fix #113: Unique sampling
+
+            global_idx = np.random.choice(np.arange(len(item_profile)), GLOBAL_NEG_SIZE, replace=False)
             global_feat = get_neg_feat_by_indices(global_idx)
             global_log_q = item_lookup['log_q'][global_idx]
-            
+
             hard_idx = np.random.choice(pop_indices, HARD_NEG_SIZE, replace=False)
             hard_feat = get_neg_feat_by_indices(hard_idx)
-            
-            # Compute embeddings WITH gradients
-            _, inbatch_neg_emb = model(None, inbatch_feat)
-            _, global_neg_emb = model(None, global_feat)
-            _, hard_neg_emb = model(None, hard_feat)
 
-            optimizer.zero_grad()
+            # Batch all negative forward passes into one for efficiency
+            all_neg_feat = {k: torch.cat([inbatch_feat[k], global_feat[k], hard_feat[k]], dim=0) for k in inbatch_feat}
+            _, all_neg_emb = model(None, all_neg_feat)
+            inbatch_neg_emb, global_neg_emb, hard_neg_emb = torch.split(
+                all_neg_emb, [len(buffer_indices), GLOBAL_NEG_SIZE, HARD_NEG_SIZE])
+
             loss, l_nce, l_bpr = model.compute_loss(
                 user_feat, item_feat, item_log_q=item_feat['log_q'],
                 inbatch_neg_emb=inbatch_neg_emb, inbatch_neg_log_q=inbatch_log_q,

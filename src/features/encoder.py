@@ -81,7 +81,7 @@ class FeatureEncoder:
             scaler = self.scalers[key]
             median_val = self.medians.get(key, 0.0)
             values = df[col].fillna(median_val).values.reshape(-1, 1)
-            out_df[col] = scaler.transform(values).flatten()
+            out_df[key] = scaler.transform(values).flatten()
         return out_df
 
     def save(self):

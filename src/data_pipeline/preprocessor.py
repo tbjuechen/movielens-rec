@@ -2,19 +2,19 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-import re
 import gc
 import json
 
-# Enable progress_apply for pandas
-tqdm.pandas()
+from src.config.settings import RAW_DATA_DIR, PROCESSED_DATA_DIR, FEATURE_STORE_DIR
 
 def process_all_data():
-    # Use paths from config logic (relative to root)
-    raw_dir = Path("data/raw/ml-32m")
-    processed_dir = Path("data/processed")
-    feature_store_dir = Path("data/feature_store")
+    raw_dir = RAW_DATA_DIR / "ml-32m"
+    processed_dir = PROCESSED_DATA_DIR
+    feature_store_dir = FEATURE_STORE_DIR
     tmdb_file = processed_dir / "tmdb_features.parquet"
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    feature_store_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n[Stage 1/5] Loading Raw CSVs (32M rows)...")
     movies = pd.read_csv(raw_dir / "movies.csv")
@@ -102,30 +102,30 @@ def process_all_data():
     ).reset_index()
     user_stats['activity'] = np.log1p(user_stats['activity_orig'])
     
-    print("Aggregating User Top Genres...")
+    print("Aggregating User Top Genres (Vectorized)...")
     train_with_genres = train_data.merge(movies[['movieId', 'genres']], on='movieId')
     train_with_genres['genre_list'] = train_with_genres['genres'].str.split('|')
     exploded_genres = train_with_genres.explode('genre_list')
-    
-    def get_top_genres(series):
-        return series.value_counts().head(3).index.tolist()
-    
-    user_genres = exploded_genres.groupby('userId')['genre_list'].progress_apply(get_top_genres).reset_index()
+
+    genre_counts = exploded_genres.groupby(['userId', 'genre_list']).size().reset_index(name='cnt')
+    genre_counts = genre_counts.sort_values(['userId', 'cnt'], ascending=[True, False])
+    user_genres = genre_counts.groupby('userId').head(3).groupby('userId')['genre_list'].apply(list).reset_index()
     user_genres.columns = ['userId', 'top_genres']
-    
-    del train_with_genres, exploded_genres
+
+    del train_with_genres, exploded_genres, genre_counts
     gc.collect()
 
-    print("Building User History Sequence...")
-    def get_history_with_time(group):
-        latest_ts = group['timestamp'].max()
-        ts_diffs = (latest_ts - group['timestamp']) / 3600.0 # hours
-        return pd.Series({
-            'history': group['movieId'].tolist()[-50:],
-            'history_ts_diff': ts_diffs.tolist()[-50:]
-        })
+    print("Building User History Sequence (Vectorized)...")
+    # train_data is already sorted by userId, timestamp
+    last_50 = train_data.groupby('userId').tail(50)
+    max_ts = last_50.groupby('userId')['timestamp'].transform('max')
+    last_50 = last_50.copy()
+    last_50['ts_diff'] = (max_ts - last_50['timestamp']) / 3600.0
 
-    user_history = train_data.groupby('userId').progress_apply(get_history_with_time).reset_index()
+    user_history = last_50.groupby('userId').agg(
+        history=('movieId', list),
+        history_ts_diff=('ts_diff', list)
+    ).reset_index()
     
     user_profile = user_stats.merge(user_genres, on='userId', how='left')
     user_profile = user_profile.merge(user_history, on='userId', how='left')
@@ -133,7 +133,7 @@ def process_all_data():
     
     # 5. Inverted Index Artifacts
     print("Saving Hard Negative artifacts...")
-    genre_to_items = item_profile.explode('tmdb_genres').groupby('tmdb_genres')['movieId'].apply(list).to_dict()
+    genre_to_items = item_profile.explode('tmdb_genres').dropna(subset=['tmdb_genres']).groupby('tmdb_genres')['movieId'].apply(list).to_dict()
     popularity_list = item_profile.sort_values('vote_count_ml', ascending=False)['movieId'].tolist()
     
     with open(feature_store_dir / "genre_to_items.json", "w") as f:

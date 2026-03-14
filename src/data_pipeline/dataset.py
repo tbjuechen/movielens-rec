@@ -9,26 +9,35 @@ class MovielensRecallDataset(Dataset):
         self.u_ids = interactions_df['userId'].values.astype(np.int32)
         self.i_ids = interactions_df['movieId'].values.astype(np.int32)
         
-        # 2. 预处理 Profiles 为快速索引数组 (Critical Fix #9)
-        # 我们假设输入已经是已经过编码的 ID (0 到 N-1)
-        # 获取最大编码 ID
+        # 2. 预处理 Profiles 为快速索引数组
+        # 使用原始 ID 索引特征数组, 同时维护 encoded ID 映射供 Embedding 层使用
         max_u = user_profile_df['userId'].max()
         max_i = item_profile_df['movieId'].max()
-        
+
         # 创建固定长度的矩阵/数组存储特征，实现 O(1) 访问
         self.user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
         self.user_activity = np.zeros(max_u + 1, dtype=np.float32)
         self.user_history = np.zeros((max_u + 1, 50), dtype=np.int32)
         self.user_history_ts = np.zeros((max_u + 1, 50), dtype=np.float32)
         self.user_top_genres = np.zeros((max_u + 1, 3), dtype=np.int32)
-        
+
         # 填充数据
         u_idx = user_profile_df['userId'].values
         self.user_avg_rating[u_idx] = user_profile_df['avg_rating'].values
         self.user_activity[u_idx] = user_profile_df['activity'].values
         self.user_history[u_idx] = np.stack(user_profile_df['history'].values)
-        self.user_history_ts[u_idx] = np.stack(user_profile_df['history_ts_diff'].values)
+        # Pad history_ts_diff to fixed length 50 (not encoded by categorical encoder)
+        ts_lists = user_profile_df['history_ts_diff'].values
+        padded_ts = np.zeros((len(ts_lists), 50), dtype=np.float32)
+        for i, ts in enumerate(ts_lists):
+            length = min(len(ts), 50)
+            padded_ts[i, :length] = ts[:length]
+        self.user_history_ts[u_idx] = padded_ts
         self.user_top_genres[u_idx] = np.stack(user_profile_df['top_genres'].values)
+
+        # Encoded ID mapping (for model embedding lookup)
+        self.user_encoded_id = np.zeros(max_u + 1, dtype=np.int32)
+        self.user_encoded_id[u_idx] = user_profile_df['user_id'].values
         
         # Item Side
         self.item_release_year = np.zeros(max_i + 1, dtype=np.float32)
@@ -44,6 +53,10 @@ class MovielensRecallDataset(Dataset):
         self.item_genres[i_idx] = np.stack(item_profile_df['tmdb_genres'].values)
         self.item_log_q[i_idx] = item_profile_df['log_q'].values
 
+        # Encoded ID mapping (for model embedding lookup)
+        self.item_encoded_id = np.zeros(max_i + 1, dtype=np.int32)
+        self.item_encoded_id[i_idx] = item_profile_df['item_id'].values
+
     def __len__(self):
         return len(self.u_ids)
 
@@ -52,7 +65,7 @@ class MovielensRecallDataset(Dataset):
         iid = self.i_ids[idx]
         
         user_tensor_dict = {
-            'user_id': torch.tensor(uid, dtype=torch.long),
+            'user_id': torch.tensor(self.user_encoded_id[uid], dtype=torch.long),
             'avg_rating': torch.tensor(self.user_avg_rating[uid], dtype=torch.float32),
             'activity': torch.tensor(self.user_activity[uid], dtype=torch.float32),
             'history': torch.tensor(self.user_history[uid], dtype=torch.long),
@@ -61,7 +74,7 @@ class MovielensRecallDataset(Dataset):
         }
         
         item_tensor_dict = {
-            'item_id': torch.tensor(iid, dtype=torch.long),
+            'item_id': torch.tensor(self.item_encoded_id[iid], dtype=torch.long),
             'release_year': torch.tensor(self.item_release_year[iid], dtype=torch.float32),
             'avg_rating': torch.tensor(self.item_avg_rating[iid], dtype=torch.float32),
             'revenue': torch.tensor(self.item_revenue[iid], dtype=torch.float32),

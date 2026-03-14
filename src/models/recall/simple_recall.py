@@ -4,9 +4,9 @@ from pathlib import Path
 
 class PopularityRecall:
     def __init__(self, item_profile_path: str):
-        self.item_profile = pd.read_parquet(item_profile_path)
+        item_profile = pd.read_parquet(item_profile_path)
         # 预先排好序
-        self.top_items = self.item_profile.sort_values('vote_count_ml', ascending=False)['movieId'].tolist()
+        self.top_items = item_profile.sort_values('vote_count_ml', ascending=False)['movieId'].tolist()
 
     def retrieve(self, k=100):
         return self.top_items[:k]
