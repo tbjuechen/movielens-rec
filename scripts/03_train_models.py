@@ -138,18 +138,19 @@ def train_dual_tower(batch_size=1024):
             inbatch_feat = get_neg_feat_by_indices(buffer_indices)
             inbatch_log_q = item_lookup['log_q'][buffer_indices]
 
-            global_idx = np.random.choice(np.arange(len(item_profile)), GLOBAL_NEG_SIZE, replace=False)
+            global_idx = np.random.choice(np.arange(len(item_profile)), min(GLOBAL_NEG_SIZE, len(item_profile)), replace=False)
             global_feat = get_neg_feat_by_indices(global_idx)
             global_log_q = item_lookup['log_q'][global_idx]
 
-            hard_idx = np.random.choice(pop_indices, HARD_NEG_SIZE, replace=False)
+            actual_hard_size = min(HARD_NEG_SIZE, len(pop_indices))
+            hard_idx = np.random.choice(pop_indices, actual_hard_size, replace=False)
             hard_feat = get_neg_feat_by_indices(hard_idx)
 
             # Batch all negative forward passes into one for efficiency
             all_neg_feat = {k: torch.cat([inbatch_feat[k], global_feat[k], hard_feat[k]], dim=0) for k in inbatch_feat}
             _, all_neg_emb = model(None, all_neg_feat)
             inbatch_neg_emb, global_neg_emb, hard_neg_emb = torch.split(
-                all_neg_emb, [len(buffer_indices), GLOBAL_NEG_SIZE, HARD_NEG_SIZE])
+                all_neg_emb, [len(buffer_indices), len(global_idx), len(hard_idx)])
 
             loss, l_nce, l_bpr = model.compute_loss(
                 user_feat, item_feat, item_log_q=item_feat['log_q'],
