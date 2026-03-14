@@ -20,6 +20,8 @@ venv.bak/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Logs
-logs/
-*.log
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
