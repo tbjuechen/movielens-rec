@@ -1,0 +1,34 @@
+# MovieLens Recommendation System Configuration Sample
+
+# 1. Path Settings
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  feature_store_dir: "data/feature_store"
+  model_weights_dir: "data/model_weights"
+
+# 2. Recall Hyperparameters
+recall:
+  top_k: 100
+  embedding_dim: 64
+  tau: 0.1
+  # Mixed Loss Weights
+  loss_infonce_weight: 1.0
+  loss_bpr_weight: 1.0
+
+# 3. Training Settings
+training:
+  batch_size: 1024
+  learning_rate: 0.001
+  epochs: 3
+  # Negative Sampling Sizes
+  inbatch_neg_size: 1024
+  global_neg_size: 512
+  hard_neg_size: 128
+
+# 4. Feature Settings
+features:
+  user_history_max_len: 50
+  user_top_genres_max_len: 3
+  item_genres_max_len: 5
+  time_decay_lambda: 0.001

@@ -12,8 +12,8 @@ __pycache__/
 *$py.class
 *.so
 
-# Environments
-.env
+# Configurations
+config.yaml
 .venv
 env/
 venv/
