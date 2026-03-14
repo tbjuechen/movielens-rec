@@ -83,7 +83,7 @@ def train_dual_tower(batch_size=1024):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # --- Fixed Size Buffers ---
-    INBATCH_NEG_SIZE = 1024
+    INBATCH_NEG_SIZE = min(1024, len(item_profile))
     GLOBAL_NEG_SIZE = 512
     HARD_NEG_SIZE = 128
     

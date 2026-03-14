@@ -45,28 +45,30 @@ class FeatureEncoder:
 
     def transform_categorical(self, series: pd.Series, feature_name: str, is_list=False, max_len=None):
         """将类别特征转换为对应的索引，如果是列表，进行 Padding"""
-        vocab = self.vocabularies[feature_name]
+        vocab = self.vocabularies.get(feature_name, {"<PAD>": 0})
         
-        def encode_single(val):
-            return vocab.get(val, 0) # 0 for OOV
-            
-        def encode_list(val_list):
-            if not isinstance(val_list, (list, np.ndarray)):
-                encoded = [0]
-            else:
-                encoded = [vocab.get(v, 0) for v in val_list]
-            
-            if max_len:
-                if len(encoded) >= max_len:
-                    return encoded[:max_len]
-                else:
-                    return encoded + [0] * (max_len - len(encoded))
-            return encoded
+        def encode_item(val):
+            return vocab.get(val, 0)
 
-        if is_list:
-            return series.apply(encode_list)
-        else:
-            return series.apply(encode_single)
+        def process_element(x):
+            if is_list:
+                # 处理列表：[ 'Action', 'Sci-Fi' ] -> [ 1, 5, 0, 0 ]
+                if not isinstance(x, (list, np.ndarray)):
+                    items = []
+                else:
+                    items = [encode_item(i) for i in x]
+                
+                if max_len:
+                    if len(items) >= max_len:
+                        return items[:max_len]
+                    else:
+                        return items + [0] * (max_len - len(items))
+                return items
+            else:
+                # 处理单个标量
+                return encode_item(x)
+
+        return series.apply(process_element)
 
     def fit_continuous(self, df: pd.DataFrame, columns: list):
         """为连续特征拟合 MinMaxScaler"""

@@ -23,20 +23,16 @@ def process_all_data():
 
     # 1. Item Profile Engineering
     print("Building Item Profile (Year extraction & Binning)...")
-    def extract_year(title):
-        match = re.search(r'\((\d{4})\)', title)
-        return int(match.group(1)) if match else 0
+    # 向量化提取年份：从 "(1995)" 提取 1995
+    movies['release_year_orig'] = movies['title'].str.extract(r'\((\d{4})\)').fillna(0).astype(int)
     
-    movies['release_year_orig'] = movies.progress_apply(lambda x: extract_year(x['title']), axis=1)
+    # Release Year Binning (Vectorized)
+    def bin_year_vec(years):
+        bins = [0, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020, 9999]
+        labels = ["Unknown", "<1950", "1950s", "1960s", "1970s", "1980s", "1990s", "2000s", "2010s", ">2020"]
+        return pd.cut(years, bins=bins, labels=labels, right=False)
     
-    # Release Year Binning
-    def bin_year(year):
-        if year == 0: return "Unknown"
-        if year < 1950: return "<1950"
-        if year >= 2020: return ">2020"
-        return f"{(year // 10) * 10}s"
-    
-    movies['release_year'] = movies.progress_apply(lambda x: bin_year(x['release_year_orig']), axis=1)
+    movies['release_year'] = bin_year_vec(movies['release_year_orig'])
     
     # Merge with links to get tmdbId
     item_profile = movies.merge(links[['movieId', 'tmdbId']], on='movieId', how='left')
@@ -110,11 +106,12 @@ def process_all_data():
     user_genres.columns = ['userId', 'top_genres']
     
     # User History Sequence (Latest 50 items)
-    # We also need the timestamp diff (Current - Item_TS) for weighting
+    print("Building User History Sequence (Time-based)...")
     def get_history_with_time(group):
+        group = group.sort_values('timestamp')
         latest_ts = group['timestamp'].max()
-        # Relative time in hours or days (to avoid huge numbers)
-        ts_diffs = (latest_ts - group['timestamp']) / 3600.0 # diff in hours
+        # 将秒转换为小时
+        ts_diffs = (latest_ts - group['timestamp']) / 3600.0
         return pd.Series({
             'history': group['movieId'].tolist()[-50:],
             'history_ts_diff': ts_diffs.tolist()[-50:]
