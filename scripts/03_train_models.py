@@ -117,37 +117,38 @@ def train_dual_tower(batch_size=BATCH_SIZE):
     model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU, time_decay_lambda=TIME_DECAY_LAMBDA).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # 困难负样本池 (使用下标索引)
+    # 困难负样本池 (使用下标索引, 预转为 GPU tensor)
     pop_indices = [movie_id_to_idx[mid] for mid in popularity_list[:1000] if mid in movie_id_to_idx]
+    pop_indices_t = torch.tensor(pop_indices, dtype=torch.long, device=device)
+    n_items = len(item_profile)
 
-    inbatch_neg_size = min(INBATCH_NEG_SIZE, len(item_profile))
+    inbatch_neg_size = min(INBATCH_NEG_SIZE, n_items)
 
-    # 初始 Buffer (位置下标)
-    buffer_indices = np.random.choice(np.arange(len(item_profile)), inbatch_neg_size, replace=False)
-    
+    # 初始 Buffer (位置下标, GPU tensor)
+    buffer_indices = torch.randperm(n_items, device=device)[:inbatch_neg_size]
+
     def get_neg_feat_by_indices(indices):
         return {k: item_lookup[k][indices] for k in item_lookup if k != 'log_q'}
 
-    print("Starting Training (Fixing gradient flow and indexing)...")
+    print("Starting Training...")
     for epoch in range(EPOCHS):
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
         for user_feat, item_feat in pbar:
-            user_feat = {k: v.to(device) for k, v in user_feat.items()}
-            item_feat = {k: v.to(device) for k, v in item_feat.items()}
-            
+            user_feat = {k: v.to(device, non_blocking=True) for k, v in user_feat.items()}
+            item_feat = {k: v.to(device, non_blocking=True) for k, v in item_feat.items()}
+
             optimizer.zero_grad()
 
-            # --- Prepare Negative Embeddings (with gradients) ---
+            # --- Negative sampling on GPU (avoid CPU↔GPU sync) ---
             inbatch_feat = get_neg_feat_by_indices(buffer_indices)
             inbatch_log_q = item_lookup['log_q'][buffer_indices]
 
-            global_idx = np.random.choice(np.arange(len(item_profile)), min(GLOBAL_NEG_SIZE, len(item_profile)), replace=False)
+            global_idx = torch.randint(n_items, (min(GLOBAL_NEG_SIZE, n_items),), device=device)
             global_feat = get_neg_feat_by_indices(global_idx)
             global_log_q = item_lookup['log_q'][global_idx]
 
-            actual_hard_size = min(HARD_NEG_SIZE, len(pop_indices))
-            hard_idx = np.random.choice(pop_indices, actual_hard_size, replace=False)
+            hard_idx = pop_indices_t[torch.randint(len(pop_indices_t), (min(HARD_NEG_SIZE, len(pop_indices_t)),), device=device)]
             hard_feat = get_neg_feat_by_indices(hard_idx)
 
             # Batch all negative forward passes into one for efficiency
@@ -165,16 +166,10 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             loss.backward()
             optimizer.step()
             
-            # Update Buffer with current batch items (Need to find their indices)
-            # Efficiently update buffer_indices using rolling mechanism
-            # item_feat['item_id'] is encoded ID, we need its positional index
-            current_ids_orig = item_feat['item_id'].cpu().numpy()
-            # We need original movieId to map to index. This requires dataset to return it or we re-map.
-            # Simplified: just keep previous indices and update with a few new random ones if needed, 
-            # or pass indices through dataset. For now, we rolling-update with random to ensure variety.
-            new_rand_indices = np.random.choice(np.arange(len(item_profile)), min(batch_size, inbatch_neg_size), replace=False)
-            buffer_indices = np.roll(buffer_indices, -len(new_rand_indices))
-            buffer_indices[-len(new_rand_indices):] = new_rand_indices
+            # Update Buffer: rolling replacement with random indices (all on GPU)
+            n_replace = min(batch_size, inbatch_neg_size)
+            new_rand_indices = torch.randint(n_items, (n_replace,), device=device)
+            buffer_indices = torch.cat([buffer_indices[n_replace:], new_rand_indices])
             
             pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_nce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}"})
 

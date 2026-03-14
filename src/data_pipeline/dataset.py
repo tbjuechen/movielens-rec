@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 
 from src.config.settings import (
-    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN, BATCH_SIZE
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN, BATCH_SIZE, NUM_WORKERS
 )
 
 class MovielensRecallDataset(Dataset):
@@ -88,7 +88,7 @@ class MovielensRecallDataset(Dataset):
         
         return user_tensor_dict, item_tensor_dict
 
-def create_dataloader(interactions, user_profile, item_profile, batch_size=BATCH_SIZE, shuffle=True, num_workers=4):
+def create_dataloader(interactions, user_profile, item_profile, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS):
     dataset = MovielensRecallDataset(interactions, user_profile, item_profile)
     # 增加 persistent_workers 防止子进程内存反复初始化开销
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=(num_workers > 0))
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=(num_workers > 0), pin_memory=True)

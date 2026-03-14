@@ -34,6 +34,7 @@ EPOCHS = config['training']['epochs']
 INBATCH_NEG_SIZE = config['training']['inbatch_neg_size']
 GLOBAL_NEG_SIZE = config['training']['global_neg_size']
 HARD_NEG_SIZE = config['training']['hard_neg_size']
+NUM_WORKERS = config['training'].get('num_workers', 4)
 
 # 5. Feature Settings
 USER_HISTORY_MAX_LEN = config['features']['user_history_max_len']

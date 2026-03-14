@@ -1,4 +1,5 @@
-# MovieLens Recommendation System Configuration Sample
+# MovieLens Recommendation System Configuration
+# Tuned for A100 GPU + 100 CPU cores
 
 # 1. Path Settings
 paths:
@@ -10,21 +11,22 @@ paths:
 # 2. Recall Hyperparameters
 recall:
   top_k: 100
-  embedding_dim: 64
-  tau: 0.1
+  embedding_dim: 128
+  tau: 0.07
   # Mixed Loss Weights
   loss_infonce_weight: 1.0
   loss_bpr_weight: 1.0
 
 # 3. Training Settings
 training:
-  batch_size: 1024
+  batch_size: 4096
   learning_rate: 0.001
-  epochs: 3
+  epochs: 5
   # Negative Sampling Sizes
-  inbatch_neg_size: 1024
-  global_neg_size: 512
-  hard_neg_size: 128
+  inbatch_neg_size: 4096
+  global_neg_size: 2048
+  hard_neg_size: 512
+  num_workers: 16
 
 # 4. Feature Settings
 features:
