@@ -108,19 +108,30 @@ class DualTowerModel(nn.Module):
 
     def compute_loss(self, user_features, item_features, item_log_q, 
                      simple_neg_features=None, simple_neg_log_q=None,
-                     hard_neg_features=None):
+                     hard_neg_features=None,
+                     cached_item_emb=None, cached_item_log_q=None):
         """
-        混合损失函数 (InfoNCE + BPR) + Log-Q 纠偏
+        混合损失函数 + 队列负采样支持
+        cached_item_emb: (Queue_Size, D)
+        cached_item_log_q: (Queue_Size,)
         """
         user_emb = self.user_tower(user_features) # (B, D)
         item_emb = self.item_tower(item_features) # (B, D)
         
-        # --- 1. InfoNCE Loss (Simple Negatives) ---
+        # --- 1. InfoNCE Loss (Expanded Negatives) ---
         pos_scores = torch.sum(user_emb * item_emb, dim=-1) # (B,)
         
+        # 基础相似度 (In-batch)
         logits = torch.matmul(user_emb, item_emb.T) # (B, B)
         logits = (logits / self.tau) - item_log_q.view(1, -1)
         
+        # 拼接 缓存负样本 (Queue Negatives)
+        if cached_item_emb is not None:
+            cache_logits = torch.matmul(user_emb, cached_item_emb.T) # (B, Q)
+            cache_logits = (cache_logits / self.tau) - cached_item_log_q.view(1, -1)
+            logits = torch.cat([logits, cache_logits], dim=1)
+
+        # 拼接 随机负样本 (Simple Negatives)
         if simple_neg_features is not None:
             simple_neg_emb = self.item_tower(simple_neg_features) # (M1, D)
             simple_logits = (torch.matmul(user_emb, simple_neg_emb.T) / self.tau)
