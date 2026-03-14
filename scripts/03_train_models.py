@@ -155,7 +155,7 @@ def train_dual_tower(batch_size=1024):
             loss, l_nce, l_bpr = model.compute_loss(
                 user_feat, item_feat, item_log_q=item_feat['log_q'],
                 inbatch_neg_emb=inbatch_neg_emb, inbatch_neg_log_q=inbatch_log_q,
-                global_neg_emb=global_neg_emb, global_neg_log_q=global_neg_log_q,
+                global_neg_emb=global_neg_emb, global_neg_log_q=global_log_q,
                 hard_neg_emb=hard_neg_emb
             )
             loss.backward()
