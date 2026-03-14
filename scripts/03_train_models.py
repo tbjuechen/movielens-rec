@@ -15,6 +15,16 @@ from src.features.encoder import FeatureEncoder
 from src.data_pipeline.dataset import create_dataloader
 from src.models.recall.dual_tower import DualTowerModel
 from src.models.recall.item_cf import ItemCFModel
+from src.models.recall.user_cf import UserCFModel
+
+def train_user_cf():
+    print("Loading data for UserCF...")
+    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
+    train_data = train_data[train_data['rating'] >= 3.0]
+
+    model = UserCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "user_sim_matrix.pkl")
+    model.fit(train_df=train_data)
+    print("UserCF training complete.")
 
 def train_item_cf():
     print("Loading data for ItemCF...")
@@ -159,10 +169,12 @@ def train_dual_tower():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train recall models.")
-    parser.add_argument("--model", type=str, default="dual_tower", choices=["dual_tower", "item_cf"])
+    parser.add_argument("--model", type=str, default="dual_tower", choices=["dual_tower", "item_cf", "user_cf"])
     args = parser.parse_args()
 
     if args.model == "dual_tower":
         train_dual_tower()
     elif args.model == "item_cf":
         train_item_cf()
+    elif args.model == "user_cf":
+        train_user_cf()
