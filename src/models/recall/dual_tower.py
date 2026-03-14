@@ -66,16 +66,17 @@ class ItemTower(nn.Module):
 class DualTowerModel(nn.Module):
     def __init__(self, vocab_sizes, embed_dim=64, tau=0.1,
                  inbatch_size=1024, global_size=512, hard_size=128,
-                 time_decay_lambda=0.001):
+                 time_decay_lambda=0.001, bpr_gamma=5.0,
+                 loss_infonce_weight=1.0, loss_bpr_weight=1.0):
         super().__init__()
         self.item_emb = nn.Embedding(vocab_sizes['movieId'] + 1, embed_dim, padding_idx=0)
         self.genre_emb = nn.Embedding(vocab_sizes['genres'] + 1, embed_dim, padding_idx=0)
         self.user_tower = UserTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim, time_decay_lambda)
         self.item_tower = ItemTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim)
         self.tau = tau
-        self.inbatch_size = inbatch_size
-        self.global_size = global_size
-        self.hard_size = hard_size
+        self.bpr_gamma = bpr_gamma
+        self.loss_infonce_weight = loss_infonce_weight
+        self.loss_bpr_weight = loss_bpr_weight
 
     def forward(self, user_features, item_features):
         u_emb = self.user_tower(user_features) if user_features is not None else None
@@ -102,11 +103,12 @@ class DualTowerModel(nn.Module):
         loss_infonce = F.cross_entropy(infonce_logits, labels)
         
         # 2. BPR Loss (Rank-based, no Log-Q needed)
-        # BPR uses raw similarity scores (no tau scaling) to avoid vanishing gradients.
-        # With tau=0.1, scaling would amplify diff by 10x, pushing sigmoid to extremes.
+        # bpr_gamma scales the diff into sigmoid's sensitive region.
+        # Without scaling, L2-normalized dot products are ~0.01, sigmoid stays at 0.5, loss stuck at ln(2).
+        # Too aggressive (1/tau=14x) causes vanishing gradients for large diffs.
         hard_scores = torch.matmul(user_emb, hard_neg_emb.T) # (B, Hard_Size)
-        diff = pos_scores.view(-1, 1) - hard_scores
+        diff = (pos_scores.view(-1, 1) - hard_scores) * self.bpr_gamma
         loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
 
-        
-        return loss_infonce + loss_bpr, loss_infonce, loss_bpr
+        total_loss = self.loss_infonce_weight * loss_infonce + self.loss_bpr_weight * loss_bpr
+        return total_loss, loss_infonce, loss_bpr

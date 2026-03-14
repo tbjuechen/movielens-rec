@@ -13,6 +13,7 @@ recall:
   top_k: 100
   embedding_dim: 128
   tau: 0.07
+  bpr_gamma: 5.0  # BPR-specific scaling factor for sigmoid input
   # Mixed Loss Weights
   loss_infonce_weight: 1.0
   loss_bpr_weight: 1.0

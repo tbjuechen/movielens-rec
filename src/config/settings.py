@@ -24,6 +24,9 @@ MODEL_WEIGHTS_DIR = BASE_DIR / config['paths']['model_weights_dir']
 RECALL_K = config['recall']['top_k']
 EMBEDDING_DIM = config['recall']['embedding_dim']
 TAU = config['recall']['tau']
+BPR_GAMMA = config['recall'].get('bpr_gamma', 5.0)
+LOSS_INFONCE_WEIGHT = config['recall'].get('loss_infonce_weight', 1.0)
+LOSS_BPR_WEIGHT = config['recall'].get('loss_bpr_weight', 1.0)
 
 # 4. Training Settings
 BATCH_SIZE = config['training']['batch_size']

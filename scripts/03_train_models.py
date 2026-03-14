@@ -12,7 +12,8 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
-    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA,
+    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA,
+    LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT,
     BATCH_SIZE, LEARNING_RATE, EPOCHS,
     INBATCH_NEG_SIZE, GLOBAL_NEG_SIZE, HARD_NEG_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
@@ -114,7 +115,11 @@ def train_dual_tower(batch_size=BATCH_SIZE):
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     item_lookup = {k: v.to(device) for k, v in item_lookup.items() if v is not None}
     
-    model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU, time_decay_lambda=TIME_DECAY_LAMBDA).to(device)
+    model = DualTowerModel(
+        vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU,
+        time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA,
+        loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # 困难负样本池 (使用下标索引, 预转为 GPU tensor)
