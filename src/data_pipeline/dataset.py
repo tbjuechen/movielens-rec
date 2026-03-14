@@ -42,6 +42,7 @@ class MovielensRecallDataset(Dataset):
             'avg_rating': torch.tensor(user_feat['avg_rating'], dtype=torch.float32),
             'activity': torch.tensor(user_feat['activity'], dtype=torch.float32),
             'history': torch.tensor(user_feat['history'], dtype=torch.long),      # list of ints
+            'history_ts_diff': torch.tensor(user_feat['history_ts_diff'], dtype=torch.float32),
             'top_genres': torch.tensor(user_feat['top_genres'], dtype=torch.long) # list of ints
         }
         

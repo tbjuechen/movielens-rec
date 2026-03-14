@@ -94,8 +94,17 @@ def process_all_data():
     user_genres.columns = ['userId', 'top_genres']
     
     # User History Sequence (Latest 50 items)
-    user_history = train_data.groupby('userId')['movieId'].apply(lambda x: x.tolist()[-50:]).reset_index()
-    user_history.columns = ['userId', 'history']
+    # We also need the timestamp diff (Current - Item_TS) for weighting
+    def get_history_with_time(group):
+        latest_ts = group['timestamp'].max()
+        # Relative time in hours or days (to avoid huge numbers)
+        ts_diffs = (latest_ts - group['timestamp']) / 3600.0 # diff in hours
+        return pd.Series({
+            'history': group['movieId'].tolist()[-50:],
+            'history_ts_diff': ts_diffs.tolist()[-50:]
+        })
+
+    user_history = train_data.groupby('userId').apply(get_history_with_time).reset_index()
     
     # Merge all user features
     user_profile = user_stats.merge(user_genres, on='userId', how='left')

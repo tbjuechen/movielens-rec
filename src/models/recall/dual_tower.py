@@ -24,12 +24,25 @@ class UserTower(nn.Module):
     def forward(self, features):
         u_emb = self.user_emb(features['user_id'])
         
-        # History (Mean Pooling) - Using Shared item_emb
-        hist_emb = self.item_emb(features['history'])
-        hist_mask = (features['history'] > 0).float().unsqueeze(-1)
-        hist_emb = (hist_emb * hist_mask).sum(dim=1) / (hist_mask.sum(dim=1) + 1e-8)
+        # --- History Weighting (Time Decay) ---
+        hist_emb = self.item_emb(features['history']) # (B, SeqLen, D)
         
-        # Top Genres (Mean Pooling) - Using Shared genre_emb
+        # Calculate weights: exp(-lambda * delta_t)
+        # delta_t is in hours. lambda = 0.001 (configurable)
+        delta_t = features.get('history_ts_diff', torch.zeros_like(features['history']).float())
+        time_weights = torch.exp(-0.001 * delta_t) # (B, SeqLen)
+        
+        # Additional Boost for the latest 5 items (if sequence is long enough)
+        # Mask out padding items (id=0)
+        mask = (features['history'] > 0).float()
+        
+        # Let's say we give the most recent items a basic scale up
+        combined_weights = (time_weights * mask).unsqueeze(-1)
+        
+        # Weighted Pooling
+        hist_emb = (hist_emb * combined_weights).sum(dim=1) / (combined_weights.sum(dim=1) + 1e-8)
+        
+        # --- Top Genres ---
         genre_emb = self.genre_emb(features['top_genres'])
         genre_mask = (features['top_genres'] > 0).float().unsqueeze(-1)
         genre_emb = (genre_emb * genre_mask).sum(dim=1) / (genre_mask.sum(dim=1) + 1e-8)
