@@ -4,12 +4,15 @@ from pathlib import Path
 from tqdm import tqdm
 import re
 
+# Enable progress_apply for pandas
+tqdm.pandas()
+
 def process_all_data():
     raw_dir = Path("data/raw/ml-32m")
     processed_dir = Path("data/processed")
     tmdb_file = processed_dir / "tmdb_features.parquet"
 
-    print("Loading MovieLens core files...")
+    print("Loading MovieLens core files (this may take ~40s)...")
     movies = pd.read_csv(raw_dir / "movies.csv")
     links = pd.read_csv(raw_dir / "links.csv")
     # Use float32 for rating to save memory
@@ -19,13 +22,21 @@ def process_all_data():
     tmdb = pd.read_parquet(tmdb_file)
 
     # 1. Item Profile Engineering
-    print("Building Item Profile...")
-    # Extract year from title: "Toy Story (1995)" -> 1995
+    print("Building Item Profile (Year extraction & Binning)...")
     def extract_year(title):
         match = re.search(r'\((\d{4})\)', title)
         return int(match.group(1)) if match else 0
     
-    movies['release_year'] = movies['title'].apply(extract_year)
+    movies['release_year_orig'] = movies.progress_apply(lambda x: extract_year(x['title']), axis=1)
+    
+    # Release Year Binning
+    def bin_year(year):
+        if year == 0: return "Unknown"
+        if year < 1950: return "<1950"
+        if year >= 2020: return ">2020"
+        return f"{(year // 10) * 10}s"
+    
+    movies['release_year'] = movies.progress_apply(lambda x: bin_year(x['release_year_orig']), axis=1)
     
     # Merge with links to get tmdbId
     item_profile = movies.merge(links[['movieId', 'tmdbId']], on='movieId', how='left')
@@ -33,12 +44,16 @@ def process_all_data():
     # Merge with TMDB features
     item_profile = item_profile.merge(tmdb, left_on='tmdbId', right_on='tmdb_id', how='left')
     
-    # Calculate item average rating from ALL ratings (global item popularity/quality)
+    # Item Stats from ratings
     item_stats = ratings.groupby('movieId')['rating'].agg(['mean', 'count']).reset_index()
     item_stats.columns = ['movieId', 'avg_rating', 'vote_count_ml']
     item_profile = item_profile.merge(item_stats, on='movieId', how='left')
     
-    # Finalize item_profile
+    # Log transformation for long-tail features
+    for col in ['revenue', 'budget', 'vote_count_ml', 'vote_count']:
+        if col in item_profile.columns:
+            item_profile[col] = np.log1p(item_profile[col].fillna(0))
+    
     item_profile.to_parquet(processed_dir / "item_profile.parquet", index=False)
     print(f"Item Profile saved. Shape: {item_profile.shape}")
 
@@ -78,8 +93,9 @@ def process_all_data():
     # User history and stats from train_data
     user_stats = train_data.groupby('userId').agg(
         avg_rating=('rating', 'mean'),
-        activity=('movieId', 'count')
+        activity_orig=('movieId', 'count')
     ).reset_index()
+    user_stats['activity'] = np.log1p(user_stats['activity_orig'])
     
     # User Top-3 Genres
     # Explode movies genres
@@ -104,7 +120,7 @@ def process_all_data():
             'history_ts_diff': ts_diffs.tolist()[-50:]
         })
 
-    user_history = train_data.groupby('userId').apply(get_history_with_time).reset_index()
+    user_history = train_data.groupby('userId').progress_apply(get_history_with_time).reset_index()
     
     # Merge all user features
     user_profile = user_stats.merge(user_genres, on='userId', how='left')
