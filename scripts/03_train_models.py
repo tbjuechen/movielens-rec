@@ -87,10 +87,15 @@ def train_dual_tower(batch_size=1024):
     GLOBAL_NEG_SIZE = 512
     HARD_NEG_SIZE = 128
     
-    # Initialize in-batch buffer with random items
+    # Initialize in-batch buffer with actual items from the library (Hot Start)
+    print("Pre-filling negative sample buffer...")
     buffer_indices = np.random.choice(np.arange(len(item_profile)), INBATCH_NEG_SIZE, replace=False)
     
-    print(f"Starting Training. Fixed Negs: {INBATCH_NEG_SIZE} in-batch pool, {GLOBAL_NEG_SIZE} global, {HARD_NEG_SIZE} hard.")
+    def get_neg_features(indices):
+        """Helper to fetch tensors for a list of indices"""
+        return {k: item_lookup[k][indices] for k in item_lookup if k != 'log_q'}
+
+    print(f"Starting Training. Fixed Negs: {INBATCH_NEG_SIZE} in-batch, {GLOBAL_NEG_SIZE} global, {HARD_NEG_SIZE} hard.")
     for epoch in range(3):
         model.train()
         total_loss = 0
@@ -99,30 +104,30 @@ def train_dual_tower(batch_size=1024):
             user_feat = {k: v.to(device) for k, v in user_feat.items()}
             item_feat = {k: v.to(device) for k, v in item_feat.items()}
             
-            # 1. Prepare Negative Embeddings (No-grad)
+            # 1. Prepare Negative Embeddings (No-grad Forward)
             with torch.no_grad():
-                # In-batch pool
-                inbatch_neg_feat = {k: item_lookup[k][buffer_indices] for k in item_lookup if k != 'log_q'}
-                inbatch_neg_log_q = item_lookup['log_q'][buffer_indices]
-                _, inbatch_neg_emb = model(None, inbatch_neg_feat)
+                # Fetch features and compute embeddings for all 3 types of negatives
+                inbatch_feat = get_neg_features(buffer_indices)
+                inbatch_log_q = item_lookup['log_q'][buffer_indices]
                 
-                # Global random
                 global_idx = np.random.choice(np.arange(len(item_profile)), GLOBAL_NEG_SIZE, replace=True)
-                global_neg_feat = {k: item_lookup[k][global_idx] for k in item_lookup if k != 'log_q'}
-                global_neg_log_q = item_lookup['log_q'][global_idx]
-                _, global_neg_emb = model(None, global_neg_feat)
+                global_feat = get_neg_features(global_idx)
+                global_log_q = item_lookup['log_q'][global_idx]
                 
-                # Hard popular
                 hard_idx = np.random.choice(encoded_pop_list, HARD_NEG_SIZE, replace=True)
-                hard_neg_feat = {k: item_lookup[k][hard_idx] for k in item_lookup if k != 'log_q'}
-                _, hard_neg_emb = model(None, hard_neg_feat)
+                hard_feat = get_neg_features(hard_idx)
+                
+                # We only need the item tower's output for negatives
+                _, inbatch_neg_emb = model(None, inbatch_feat)
+                _, global_neg_emb = model(None, global_feat)
+                _, hard_neg_emb = model(None, hard_feat)
 
-            # 2. Main Step
+            # 2. Optimization Step
             optimizer.zero_grad()
             loss, l_nce, l_bpr = model.compute_loss(
                 user_feat, item_feat, item_log_q=item_feat['log_q'],
-                inbatch_neg_emb=inbatch_neg_emb, inbatch_neg_log_q=inbatch_neg_log_q,
-                global_neg_emb=global_neg_emb, global_neg_log_q=global_neg_log_q,
+                inbatch_neg_emb=inbatch_neg_emb, inbatch_neg_log_q=inbatch_log_q,
+                global_neg_emb=global_neg_emb, global_neg_log_q=global_log_q,
                 hard_neg_emb=hard_neg_emb
             )
             loss.backward()
