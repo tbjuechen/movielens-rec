@@ -18,14 +18,21 @@ class MovielensRecallDataset(Dataset):
         user_id = int(row['userId'])
         item_id = int(row['movieId'])
         
-        # 直接从 DataFrame 索引中通过 .loc 提取，速度快且省内存
+        # 直接从 DataFrame 索引中通过 .loc 提取
         user_feat = self.user_profile.loc[user_id]
         
-        try:
+        # 优化：检查 item_id 是否在索引中，不在则返回默认全零特征
+        if item_id in self.item_profile.index:
             item_feat = self.item_profile.loc[item_id]
-        except KeyError:
-            # Fallback for items missing from profile
-            return self.__getitem__((idx + 1) % len(self.interactions))
+        else:
+            # Fallback for items missing from profile (cold start or filter issue)
+            item_feat = {
+                'release_year_val': 0.0,
+                'avg_rating': 0.0,
+                'revenue': 0.0,
+                'tmdb_genres': [0] * 5,
+                'log_q': np.log(1e-10) # 对应 Log-Q 默认极小值
+            }
         
         user_tensor_dict = {
             'user_id': torch.tensor(user_id, dtype=torch.long),

@@ -28,7 +28,8 @@ def process_all_data():
     
     # Release Year Binning (Vectorized)
     def bin_year_vec(years):
-        bins = [0, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020, 9999]
+        # 11 edges for 10 labels
+        bins = [-1, 1, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020, 9999]
         labels = ["Unknown", "<1950", "1950s", "1960s", "1970s", "1980s", "1990s", "2000s", "2010s", ">2020"]
         return pd.cut(years, bins=bins, labels=labels, right=False)
     
