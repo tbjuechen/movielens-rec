@@ -10,7 +10,13 @@ from tqdm import tqdm
 
 # Add src to path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config.settings import PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR, LEARNING_RATE, EPOCHS
+from src.config.settings import (
+    PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
+    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA,
+    BATCH_SIZE, LEARNING_RATE, EPOCHS,
+    INBATCH_NEG_SIZE, GLOBAL_NEG_SIZE, HARD_NEG_SIZE,
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
+)
 from src.features.encoder import FeatureEncoder
 from src.data_pipeline.dataset import create_dataloader
 from src.models.recall.dual_tower import DualTowerModel
@@ -19,11 +25,11 @@ def apply_encoding(user_profile, item_profile, encoder):
     print("Applying encoding to profiles...")
     # Categorical
     user_profile['userId_encoded'] = encoder.transform_categorical(user_profile['userId'], 'userId')
-    user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=3)
-    user_profile['history_encoded'] = encoder.transform_categorical(user_profile['history'], 'movieId', is_list=True, max_len=50)
+    user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=USER_TOP_GENRES_MAX_LEN)
+    user_profile['history_encoded'] = encoder.transform_categorical(user_profile['history'], 'movieId', is_list=True, max_len=USER_HISTORY_MAX_LEN)
 
     item_profile['movieId_encoded'] = encoder.transform_categorical(item_profile['movieId'], 'movieId')
-    item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=5)
+    item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=ITEM_GENRES_MAX_LEN)
     
     # Continuous with prefix isolation
     user_cont = encoder.transform_continuous(user_profile, ['avg_rating', 'activity'], prefix="user")
@@ -39,7 +45,7 @@ def apply_encoding(user_profile, item_profile, encoder):
     
     return user_profile, item_profile
 
-def train_dual_tower(batch_size=1024):
+def train_dual_tower(batch_size=BATCH_SIZE):
     print(f"Loading data (Batch Size: {batch_size})...")
     train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
@@ -108,18 +114,16 @@ def train_dual_tower(batch_size=1024):
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     item_lookup = {k: v.to(device) for k, v in item_lookup.items() if v is not None}
     
-    model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=64).to(device)
+    model = DualTowerModel(vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU, time_decay_lambda=TIME_DECAY_LAMBDA).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # 困难负样本池 (使用下标索引)
     pop_indices = [movie_id_to_idx[mid] for mid in popularity_list[:1000] if mid in movie_id_to_idx]
 
-    INBATCH_NEG_SIZE = min(1024, len(item_profile))
-    GLOBAL_NEG_SIZE = 512
-    HARD_NEG_SIZE = 128
-    
+    inbatch_neg_size = min(INBATCH_NEG_SIZE, len(item_profile))
+
     # 初始 Buffer (位置下标)
-    buffer_indices = np.random.choice(np.arange(len(item_profile)), INBATCH_NEG_SIZE, replace=False)
+    buffer_indices = np.random.choice(np.arange(len(item_profile)), inbatch_neg_size, replace=False)
     
     def get_neg_feat_by_indices(indices):
         return {k: item_lookup[k][indices] for k in item_lookup if k != 'log_q'}
@@ -168,7 +172,7 @@ def train_dual_tower(batch_size=1024):
             # We need original movieId to map to index. This requires dataset to return it or we re-map.
             # Simplified: just keep previous indices and update with a few new random ones if needed, 
             # or pass indices through dataset. For now, we rolling-update with random to ensure variety.
-            new_rand_indices = np.random.choice(np.arange(len(item_profile)), min(batch_size, INBATCH_NEG_SIZE), replace=False)
+            new_rand_indices = np.random.choice(np.arange(len(item_profile)), min(batch_size, inbatch_neg_size), replace=False)
             buffer_indices = np.roll(buffer_indices, -len(new_rand_indices))
             buffer_indices[-len(new_rand_indices):] = new_rand_indices
             
@@ -194,7 +198,7 @@ def train_user_cf():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="dual_tower")
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     args = parser.parse_args()
     if args.model == "dual_tower":
         train_dual_tower(batch_size=args.batch_size)

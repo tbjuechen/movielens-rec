@@ -3,6 +3,10 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 
+from src.config.settings import (
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN, BATCH_SIZE
+)
+
 class MovielensRecallDataset(Dataset):
     def __init__(self, interactions_df: pd.DataFrame, user_profile_df: pd.DataFrame, item_profile_df: pd.DataFrame):
         # 1. 预处理 Interactions 为 Numpy 提高读取速度
@@ -17,20 +21,20 @@ class MovielensRecallDataset(Dataset):
         # 创建固定长度的矩阵/数组存储特征，实现 O(1) 访问
         self.user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
         self.user_activity = np.zeros(max_u + 1, dtype=np.float32)
-        self.user_history = np.zeros((max_u + 1, 50), dtype=np.int32)
-        self.user_history_ts = np.zeros((max_u + 1, 50), dtype=np.float32)
-        self.user_top_genres = np.zeros((max_u + 1, 3), dtype=np.int32)
+        self.user_history = np.zeros((max_u + 1, USER_HISTORY_MAX_LEN), dtype=np.int32)
+        self.user_history_ts = np.zeros((max_u + 1, USER_HISTORY_MAX_LEN), dtype=np.float32)
+        self.user_top_genres = np.zeros((max_u + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int32)
 
         # 填充数据
         u_idx = user_profile_df['userId'].values
         self.user_avg_rating[u_idx] = user_profile_df['avg_rating'].values
         self.user_activity[u_idx] = user_profile_df['activity'].values
         self.user_history[u_idx] = np.stack(user_profile_df['history'].values)
-        # Pad history_ts_diff to fixed length 50 (not encoded by categorical encoder)
+        # Pad history_ts_diff to fixed length (not encoded by categorical encoder)
         ts_lists = user_profile_df['history_ts_diff'].values
-        padded_ts = np.zeros((len(ts_lists), 50), dtype=np.float32)
+        padded_ts = np.zeros((len(ts_lists), USER_HISTORY_MAX_LEN), dtype=np.float32)
         for i, ts in enumerate(ts_lists):
-            length = min(len(ts), 50)
+            length = min(len(ts), USER_HISTORY_MAX_LEN)
             padded_ts[i, :length] = ts[:length]
         self.user_history_ts[u_idx] = padded_ts
         self.user_top_genres[u_idx] = np.stack(user_profile_df['top_genres'].values)
@@ -43,7 +47,7 @@ class MovielensRecallDataset(Dataset):
         self.item_release_year = np.zeros(max_i + 1, dtype=np.float32)
         self.item_avg_rating = np.zeros(max_i + 1, dtype=np.float32)
         self.item_revenue = np.zeros(max_i + 1, dtype=np.float32)
-        self.item_genres = np.zeros((max_i + 1, 5), dtype=np.int32)
+        self.item_genres = np.zeros((max_i + 1, ITEM_GENRES_MAX_LEN), dtype=np.int32)
         self.item_log_q = np.full(max_i + 1, np.log(1e-10), dtype=np.float32)
         
         i_idx = item_profile_df['movieId'].values
@@ -84,7 +88,7 @@ class MovielensRecallDataset(Dataset):
         
         return user_tensor_dict, item_tensor_dict
 
-def create_dataloader(interactions, user_profile, item_profile, batch_size=1024, shuffle=True, num_workers=4):
+def create_dataloader(interactions, user_profile, item_profile, batch_size=BATCH_SIZE, shuffle=True, num_workers=4):
     dataset = MovielensRecallDataset(interactions, user_profile, item_profile)
     # 增加 persistent_workers 防止子进程内存反复初始化开销
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=(num_workers > 0))

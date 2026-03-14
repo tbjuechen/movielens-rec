@@ -3,16 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class UserTower(nn.Module):
-    def __init__(self, vocab_sizes, item_emb, genre_emb, embed_dim=64):
+    def __init__(self, vocab_sizes, item_emb, genre_emb, embed_dim=64, time_decay_lambda=0.001):
         super().__init__()
         self.user_emb = nn.Embedding(vocab_sizes['userId'] + 1, embed_dim, padding_idx=0)
         self.item_emb = item_emb
         self.genre_emb = genre_emb
+        self.time_decay_lambda = time_decay_lambda
         self.continuous_dnn = nn.Linear(2, embed_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(4 * embed_dim, 128),
+            nn.Linear(4 * embed_dim, 2 * embed_dim),
             nn.ReLU(),
-            nn.Linear(128, embed_dim)
+            nn.Linear(2 * embed_dim, embed_dim)
         )
 
     def forward(self, features):
@@ -22,7 +23,7 @@ class UserTower(nn.Module):
         hist_mask = (features['history'] > 0).float().unsqueeze(-1)
         # Use history_ts_diff for weighting
         delta_t = features.get('history_ts_diff', torch.zeros_like(features['history']).float())
-        time_weights = torch.exp(-0.001 * delta_t) 
+        time_weights = torch.exp(-self.time_decay_lambda * delta_t)
         combined_weights = (time_weights * hist_mask.squeeze(-1)).unsqueeze(-1)
         hist_emb = (hist_emb * combined_weights).sum(dim=1) / (combined_weights.sum(dim=1) + 1e-8)
         
@@ -44,9 +45,9 @@ class ItemTower(nn.Module):
         self.genre_emb = genre_emb
         self.continuous_dnn = nn.Linear(3, embed_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(3 * embed_dim, 128),
+            nn.Linear(3 * embed_dim, 2 * embed_dim),
             nn.ReLU(),
-            nn.Linear(128, embed_dim)
+            nn.Linear(2 * embed_dim, embed_dim)
         )
 
     def forward(self, features):
@@ -63,12 +64,13 @@ class ItemTower(nn.Module):
         return F.normalize(out, p=2, dim=1)
 
 class DualTowerModel(nn.Module):
-    def __init__(self, vocab_sizes, embed_dim=64, tau=0.1, 
-                 inbatch_size=1024, global_size=512, hard_size=128):
+    def __init__(self, vocab_sizes, embed_dim=64, tau=0.1,
+                 inbatch_size=1024, global_size=512, hard_size=128,
+                 time_decay_lambda=0.001):
         super().__init__()
         self.item_emb = nn.Embedding(vocab_sizes['movieId'] + 1, embed_dim, padding_idx=0)
         self.genre_emb = nn.Embedding(vocab_sizes['genres'] + 1, embed_dim, padding_idx=0)
-        self.user_tower = UserTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim)
+        self.user_tower = UserTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim, time_decay_lambda)
         self.item_tower = ItemTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim)
         self.tau = tau
         self.inbatch_size = inbatch_size
