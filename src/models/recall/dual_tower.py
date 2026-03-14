@@ -5,18 +5,12 @@ import torch.nn.functional as F
 class UserTower(nn.Module):
     def __init__(self, vocab_sizes, item_emb, genre_emb, embed_dim=64):
         super().__init__()
-        # Shared Embeddings
         self.user_emb = nn.Embedding(vocab_sizes['userId'] + 1, embed_dim, padding_idx=0)
-        self.item_emb = item_emb   # Shared with ItemTower (History)
-        self.genre_emb = genre_emb # Shared with ItemTower (Top Genres)
-        
-        # DNN for continuous features (avg_rating, activity)
+        self.item_emb = item_emb
+        self.genre_emb = genre_emb
         self.continuous_dnn = nn.Linear(2, embed_dim)
-        
-        # Combine: user_id(1) + history_pool(1) + genres_pool(1) + continuous(1) = 4 * D
-        input_dim = 4 * embed_dim
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(4 * embed_dim, 128),
             nn.ReLU(),
             nn.Linear(128, embed_dim)
         )
@@ -24,30 +18,18 @@ class UserTower(nn.Module):
     def forward(self, features):
         u_emb = self.user_emb(features['user_id'])
         
-        # --- History Weighting (Time Decay) ---
-        hist_emb = self.item_emb(features['history']) # (B, SeqLen, D)
-        
-        # Calculate weights: exp(-lambda * delta_t)
-        # delta_t is in hours. lambda = 0.001 (configurable)
+        hist_emb = self.item_emb(features['history'])
+        hist_mask = (features['history'] > 0).float().unsqueeze(-1)
+        # Use history_ts_diff for weighting
         delta_t = features.get('history_ts_diff', torch.zeros_like(features['history']).float())
-        time_weights = torch.exp(-0.001 * delta_t) # (B, SeqLen)
-        
-        # Additional Boost for the latest 5 items (if sequence is long enough)
-        # Mask out padding items (id=0)
-        mask = (features['history'] > 0).float()
-        
-        # Let's say we give the most recent items a basic scale up
-        combined_weights = (time_weights * mask).unsqueeze(-1)
-        
-        # Weighted Pooling
+        time_weights = torch.exp(-0.001 * delta_t) 
+        combined_weights = (time_weights * hist_mask.squeeze(-1)).unsqueeze(-1)
         hist_emb = (hist_emb * combined_weights).sum(dim=1) / (combined_weights.sum(dim=1) + 1e-8)
         
-        # --- Top Genres ---
         genre_emb = self.genre_emb(features['top_genres'])
         genre_mask = (features['top_genres'] > 0).float().unsqueeze(-1)
         genre_emb = (genre_emb * genre_mask).sum(dim=1) / (genre_mask.sum(dim=1) + 1e-8)
         
-        # Continuous
         cont_feats = torch.stack([features['avg_rating'], features['activity']], dim=1)
         cont_emb = F.relu(self.continuous_dnn(cont_feats))
         
@@ -58,30 +40,21 @@ class UserTower(nn.Module):
 class ItemTower(nn.Module):
     def __init__(self, vocab_sizes, item_emb, genre_emb, embed_dim=64):
         super().__init__()
-        # Shared Embeddings
-        self.item_emb = item_emb   # Shared with UserTower (Self ID)
-        self.genre_emb = genre_emb # Shared with UserTower (Item Genres)
-        
-        # Continuous (release_year, avg_rating, revenue)
+        self.item_emb = item_emb
+        self.genre_emb = genre_emb
         self.continuous_dnn = nn.Linear(3, embed_dim)
-        
-        # Combine: item_id(1) + genres_pool(1) + continuous(1) = 3 * D
-        input_dim = 3 * embed_dim
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(3 * embed_dim, 128),
             nn.ReLU(),
             nn.Linear(128, embed_dim)
         )
 
     def forward(self, features):
         i_emb = self.item_emb(features['item_id'])
-        
-        # Genres (Mean Pooling) - Using Shared genre_emb
         genre_emb = self.genre_emb(features['tmdb_genres'])
         genre_mask = (features['tmdb_genres'] > 0).float().unsqueeze(-1)
         genre_emb = (genre_emb * genre_mask).sum(dim=1) / (genre_mask.sum(dim=1) + 1e-8)
         
-        # Continuous
         cont_feats = torch.stack([features['release_year'], features['avg_rating'], features['revenue']], dim=1)
         cont_emb = F.relu(self.continuous_dnn(cont_feats))
         
@@ -92,64 +65,51 @@ class ItemTower(nn.Module):
 class DualTowerModel(nn.Module):
     def __init__(self, vocab_sizes, embed_dim=64, tau=0.1):
         super().__init__()
-        # Create Global Shared Embedding Layers
         self.item_emb = nn.Embedding(vocab_sizes['movieId'] + 1, embed_dim, padding_idx=0)
         self.genre_emb = nn.Embedding(vocab_sizes['genres'] + 1, embed_dim, padding_idx=0)
-        
-        # Initialize Towers with shared layers
         self.user_tower = UserTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim)
         self.item_tower = ItemTower(vocab_sizes, self.item_emb, self.genre_emb, embed_dim)
         self.tau = tau
 
     def forward(self, user_features, item_features):
-        user_emb = self.user_tower(user_features)
-        item_emb = self.item_tower(item_features)
-        return user_emb, item_emb
+        return self.user_tower(user_features), self.item_tower(item_features)
 
     def compute_loss(self, user_features, item_features, item_log_q, 
-                     simple_neg_features=None, simple_neg_log_q=None,
-                     hard_neg_features=None,
-                     cached_item_emb=None, cached_item_log_q=None):
+                     inbatch_neg_emb, inbatch_neg_log_q,
+                     global_neg_emb, global_neg_log_q,
+                     hard_neg_emb):
         """
-        混合损失函数 + 队列负采样支持
-        cached_item_emb: (Queue_Size, D)
-        cached_item_log_q: (Queue_Size,)
+        计算损失：固定负样本规模
+        inbatch_neg_emb: (1024, D)
+        global_neg_emb: (512, D)
+        hard_neg_emb: (128, D)
         """
         user_emb = self.user_tower(user_features) # (B, D)
         item_emb = self.item_tower(item_features) # (B, D)
         
-        # --- 1. InfoNCE Loss (Expanded Negatives) ---
-        pos_scores = torch.sum(user_emb * item_emb, dim=-1) # (B,)
+        # 1. 正样本得分
+        pos_logits = torch.sum(user_emb * item_emb, dim=-1, keepdim=True) # (B, 1)
+        pos_logits = (pos_logits / self.tau) - item_log_q.view(-1, 1)
         
-        # 基础相似度 (In-batch)
-        logits = torch.matmul(user_emb, item_emb.T) # (B, B)
-        logits = (logits / self.tau) - item_log_q.view(1, -1)
+        # 2. In-batch 风格负样本得分 (1024个)
+        inbatch_logits = torch.matmul(user_emb, inbatch_neg_emb.T) # (B, 1024)
+        inbatch_logits = (inbatch_logits / self.tau) - inbatch_neg_log_q.view(1, -1)
         
-        # 拼接 缓存负样本 (Queue Negatives)
-        if cached_item_emb is not None:
-            cache_logits = torch.matmul(user_emb, cached_item_emb.T) # (B, Q)
-            cache_logits = (cache_logits / self.tau) - cached_item_log_q.view(1, -1)
-            logits = torch.cat([logits, cache_logits], dim=1)
-
-        # 拼接 随机负样本 (Simple Negatives)
-        if simple_neg_features is not None:
-            simple_neg_emb = self.item_tower(simple_neg_features) # (M1, D)
-            simple_logits = (torch.matmul(user_emb, simple_neg_emb.T) / self.tau)
-            if simple_neg_log_q is not None:
-                simple_logits = simple_logits - simple_neg_log_q.view(1, -1)
-            logits = torch.cat([logits, simple_logits], dim=1)
-            
-        batch_size = user_emb.size(0)
-        labels = torch.arange(batch_size, device=user_emb.device)
-        loss_infonce = F.cross_entropy(logits, labels)
+        # 3. 全局随机负样本得分 (512个)
+        global_logits = torch.matmul(user_emb, global_neg_emb.T) # (B, 512)
+        global_logits = (global_logits / self.tau) - global_neg_log_q.view(1, -1)
         
-        # --- 2. BPR Loss (Hard Negatives) ---
-        loss_bpr = torch.tensor(0.0, device=user_emb.device)
-        if hard_neg_features is not None:
-            hard_neg_emb = self.item_tower(hard_neg_features) # (M2, D)
-            hard_scores = torch.matmul(user_emb, hard_neg_emb.T) / self.tau
-            scaled_pos_scores = pos_scores / self.tau
-            diff = scaled_pos_scores.view(-1, 1) - hard_scores
-            loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
-            
+        # 组装 InfoNCE Logits
+        infonce_logits = torch.cat([pos_logits, inbatch_logits, global_logits], dim=1) # (B, 1+1024+512)
+        
+        # Target 是第 0 列
+        labels = torch.zeros(user_emb.size(0), dtype=torch.long, device=user_emb.device)
+        loss_infonce = F.cross_entropy(infonce_logits, labels)
+        
+        # 4. BPR 损失 (针对 128 个困难负样本)
+        hard_logits = torch.matmul(user_emb, hard_neg_emb.T) # (B, 128)
+        # BPR: -log(sigmoid(pos - hard))
+        diff = (pos_logits + item_log_q.view(-1, 1)) - hard_logits # 移除 logq 纠偏进行纯排序对比
+        loss_bpr = -torch.log(torch.sigmoid(diff / self.tau) + 1e-8).mean()
+        
         return loss_infonce + loss_bpr, loss_infonce, loss_bpr
