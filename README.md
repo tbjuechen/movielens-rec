@@ -36,21 +36,37 @@ pip install -r requirements.txt
 1. 下载 [MovieLens-32M](https://grouplens.org/datasets/movielens/) 并解压到 `data/raw/ml-32m`。
 2. 将 TMDB 的 JSON 缓存放置在 `data/raw/tmdb_cache`。
 
-### 3. 运行流水线
+### 3. 一键执行流水线 (Commands)
 按顺序执行以下脚本完成端到端流程：
 
+#### Step 0: 聚合 TMDB 缓存数据 (加速 IO)
+将 8 万个小 JSON 文件合并为高效的 Parquet 格式：
 ```bash
-# 01. 数据预处理：清洗、特征提取、数据集 Leave-One-Out 切分
-python src/data_pipeline/preprocessor.py
+conda run -n movielens-rec python -c "
+import os, json, pandas as pd; from tqdm import tqdm; \
+tmdb_dir = 'data/raw/tmdb_cache/'; \
+files = [f for f in os.listdir(tmdb_dir) if f.endswith('.json')]; \
+data_list = [json.load(open(os.path.join(tmdb_dir, f))) for f in tqdm(files)]; \
+df = pd.DataFrame([{ 'tmdb_id': d.get('id'), 'imdb_id': d.get('imdb_id'), 'original_language': d.get('original_language'), 'budget': d.get('budget', 0), 'revenue': d.get('revenue', 0), 'runtime': d.get('runtime', 0), 'vote_average': d.get('vote_average', 0.0), 'vote_count': d.get('vote_count', 0), 'tmdb_genres': [g['name'] for g in d.get('genres', [])] } for d in data_list]); \
+df.to_parquet('data/processed/tmdb_features.parquet', index=False)"
+```
 
-# 02. 特征构建：生成特征词表、归一化器 (可选，训练脚本内包含)
-python scripts/02_build_features.py
+#### Step 1: 数据清洗与特征预处理 (生成宽表)
+执行 MovieLens 与 TMDB 数据合并、特征 Log 变换、年份分箱、数据集 Leave-One-Out 切分：
+```bash
+conda run -n movielens-rec python src/data_pipeline/preprocessor.py
+```
 
-# 03. 召回模型训练：启动带纠偏的双塔模型训练
-python scripts/03_train_models.py
+#### Step 2: 启动双塔召回模型训练
+训练带 Log-Q 纠偏、混合 Loss (InfoNCE + BPR)、时间衰减加权的召回模型：
+```bash
+conda run -n movielens-rec python scripts/03_train_models.py
+```
 
-# 04. 召回评测：评估 Recall@50 等核心指标 (正在开发中)
-python scripts/04_evaluate_e2e.py
+#### Step 3: 召回指标评测 (待开发)
+基于训练好的权重生成全量物品向量库，在测试集上计算 Recall@50：
+```bash
+conda run -n movielens-rec python scripts/04_evaluate_e2e.py
 ```
 
 ## 技术文档索引
