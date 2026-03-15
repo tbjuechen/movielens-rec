@@ -29,6 +29,11 @@ training:
   hard_neg_size: 512
   num_workers: 32
 
+# 5. CF Settings
+cf:
+  top_k: 50
+  cf_workers: 32
+
 # 4. Feature Settings
 features:
   user_history_max_len: 50

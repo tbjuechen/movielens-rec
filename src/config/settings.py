@@ -44,3 +44,7 @@ USER_HISTORY_MAX_LEN = config['features']['user_history_max_len']
 USER_TOP_GENRES_MAX_LEN = config['features']['user_top_genres_max_len']
 ITEM_GENRES_MAX_LEN = config['features']['item_genres_max_len']
 TIME_DECAY_LAMBDA = config['features']['time_decay_lambda']
+
+# 6. CF Settings
+CF_TOP_K = config.get('cf', {}).get('top_k', 50)
+CF_WORKERS = config.get('cf', {}).get('cf_workers', 32)
