@@ -10,9 +10,12 @@ class UserTower(nn.Module):
         self.genre_emb = genre_emb
         self.time_decay_lambda = time_decay_lambda
         self.continuous_dnn = nn.Linear(2, embed_dim)
+        
         self.mlp = nn.Sequential(
             nn.Linear(4 * embed_dim, 2 * embed_dim),
+            nn.LayerNorm(2 * embed_dim), # Better for embeddings than BN
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(2 * embed_dim, embed_dim)
         )
 
@@ -21,9 +24,8 @@ class UserTower(nn.Module):
         
         hist_emb = self.item_emb(features['history'])
         hist_mask = (features['history'] > 0).float().unsqueeze(-1)
-        # Use history_ts_diff for weighting
         delta_t = features.get('history_ts_diff', torch.zeros_like(features['history']).float())
-        time_weights = torch.exp(-self.time_decay_lambda * delta_t)
+        time_weights = torch.exp(-self.time_decay_lambda * delta_t) 
         combined_weights = (time_weights * hist_mask.squeeze(-1)).unsqueeze(-1)
         hist_emb = (hist_emb * combined_weights).sum(dim=1) / (combined_weights.sum(dim=1) + 1e-8)
         
@@ -44,9 +46,12 @@ class ItemTower(nn.Module):
         self.item_emb = item_emb
         self.genre_emb = genre_emb
         self.continuous_dnn = nn.Linear(3, embed_dim)
+        
         self.mlp = nn.Sequential(
             nn.Linear(3 * embed_dim, 2 * embed_dim),
+            nn.LayerNorm(2 * embed_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(2 * embed_dim, embed_dim)
         )
 
@@ -86,29 +91,35 @@ class DualTowerModel(nn.Module):
     def compute_loss(self, user_features, item_features, item_log_q, 
                      inbatch_neg_emb, inbatch_neg_log_q,
                      global_neg_emb, global_neg_log_q,
-                     hard_neg_emb):
+                     hard_neg_emb,
+                     collision_mask=None):
+        """
+        collision_mask: (B, Total_Neg_Size) 为 True 的地方表示该负样本是用户看过的，需要屏蔽
+        """
         user_emb = self.user_tower(user_features) # (B, D)
         item_emb = self.item_tower(item_features) # (B, D)
         
-        # 1. InfoNCE Logits (with Log-Q correction)
+        # 1. InfoNCE Logits
         pos_scores = torch.sum(user_emb * item_emb, dim=-1, keepdim=True) # (B, 1)
-        # 正样本也需要纠偏
         pos_logits = (pos_scores / self.tau) - item_log_q.view(-1, 1)
         
         inbatch_logits = (torch.matmul(user_emb, inbatch_neg_emb.T) / self.tau) - inbatch_neg_log_q.view(1, -1)
         global_logits = (torch.matmul(user_emb, global_neg_emb.T) / self.tau) - global_neg_log_q.view(1, -1)
         
-        infonce_logits = torch.cat([pos_logits, inbatch_logits, global_logits], dim=1)
+        neg_logits = torch.cat([inbatch_logits, global_logits], dim=1) # (B, N_neg)
+        
+        # Apply Collision Mask (Critical Fix #16)
+        if collision_mask is not None:
+            neg_logits = neg_logits.masked_fill(collision_mask, -1e9)
+            
+        infonce_logits = torch.cat([pos_logits, neg_logits], dim=1)
         labels = torch.zeros(user_emb.size(0), dtype=torch.long, device=user_emb.device)
         loss_infonce = F.cross_entropy(infonce_logits, labels)
         
-        # 2. BPR Loss (Rank-based, no Log-Q needed)
-        # bpr_gamma scales the diff into sigmoid's sensitive region.
-        # Without scaling, L2-normalized dot products are ~0.01, sigmoid stays at 0.5, loss stuck at ln(2).
-        # Too aggressive (1/tau=14x) causes vanishing gradients for large diffs.
+        # 2. BPR Loss
         hard_scores = torch.matmul(user_emb, hard_neg_emb.T) # (B, Hard_Size)
         diff = (pos_scores.view(-1, 1) - hard_scores) * self.bpr_gamma
         loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
-
+        
         total_loss = self.loss_infonce_weight * loss_infonce + self.loss_bpr_weight * loss_bpr
         return total_loss, loss_infonce, loss_bpr
