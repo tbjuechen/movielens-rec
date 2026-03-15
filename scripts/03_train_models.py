@@ -22,6 +22,8 @@ from src.config.settings import (
 from src.features.encoder import FeatureEncoder
 from src.data_pipeline.dataset import create_dataloader
 from src.models.recall.dual_tower import DualTowerModel
+from src.models.recall.item_cf import ItemCFModel
+from src.models.recall.user_cf import UserCFModel
 
 def apply_encoding(user_profile, item_profile, encoder):
     print("Applying encoding to profiles...")
@@ -45,7 +47,7 @@ def apply_encoding(user_profile, item_profile, encoder):
     return user_profile, item_profile
 
 def train_dual_tower(batch_size=BATCH_SIZE):
-    print(f"Loading data (Batch Size: {batch_size})...")
+    print(f"=== Training Dual-Tower Model (Batch: {batch_size}, Epochs: {EPOCHS}) ===")
     train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
     item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
@@ -96,7 +98,6 @@ def train_dual_tower(batch_size=BATCH_SIZE):
     ).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    # Cosine Annealing (Critical Fix #LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader) * EPOCHS, eta_min=1e-6)
 
     pop_indices = [movie_id_to_idx[mid] for mid in popularity_list[:5000] if mid in movie_id_to_idx]
@@ -107,7 +108,7 @@ def train_dual_tower(batch_size=BATCH_SIZE):
     def get_neg_feat_by_indices(indices):
         return {k: item_lookup[k][indices] for k in item_lookup if k != 'log_q'}
 
-    print("Starting Training (with False Negative Masking & LR Scheduler)...")
+    print("Starting Training...")
     for epoch in range(EPOCHS):
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
@@ -116,36 +117,27 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             item_feat = {k: v.to(device, non_blocking=True) for k, v in item_feat.items()}
             optimizer.zero_grad()
 
-            # 1. Negative Sampling
             inbatch_log_q = item_lookup['log_q'][buffer_indices]
             global_idx = torch.randint(n_items, (GLOBAL_NEG_SIZE,), device=device)
             global_log_q = item_lookup['log_q'][global_idx]
             hard_idx = pop_indices_t[torch.randint(len(pop_indices_t), (HARD_NEG_SIZE,), device=device)]
             
-            # --- Collision Masking ---
-            # InfoNCE negatives
             all_neg_indices = torch.cat([buffer_indices, global_idx])
-            all_neg_ids = item_lookup['item_id'][all_neg_indices] # (N_neg,)
-            user_hist_ids = user_feat['history'] # (B, H)
+            all_neg_ids = item_lookup['item_id'][all_neg_indices]
+            user_hist_ids = user_feat['history']
+            hard_neg_ids = item_lookup['item_id'][hard_idx]
 
-            # BPR hard negatives
-            hard_neg_ids = item_lookup['item_id'][hard_idx] # (Hard_Size,)
-
-            # Collision check: (B, N, 1) == (B, 1, H) -> any -> (B, N)
             infonce_collision = (all_neg_ids.unsqueeze(0).unsqueeze(-1) == user_hist_ids.unsqueeze(1)).any(dim=-1)
             bpr_collision = (hard_neg_ids.unsqueeze(0).unsqueeze(-1) == user_hist_ids.unsqueeze(1)).any(dim=-1)
             
-            # 2. Forward Negatives
             neg_feat = get_neg_feat_by_indices(all_neg_indices)
             hard_feat = get_neg_feat_by_indices(hard_idx)
-            
             total_neg_feat = {k: torch.cat([neg_feat[k], hard_feat[k]]) for k in neg_feat}
             _, total_neg_emb = model(None, total_neg_feat)
             
             neg_emb, hard_neg_emb = torch.split(total_neg_emb, [len(all_neg_indices), HARD_NEG_SIZE])
             inbatch_neg_emb, global_neg_emb = torch.split(neg_emb, [len(buffer_indices), GLOBAL_NEG_SIZE])
 
-            # 3. Compute Loss
             loss, l_nce, l_bpr = model.compute_loss(
                 user_feat, item_feat, item_log_q=item_feat['log_q'],
                 inbatch_neg_emb=inbatch_neg_emb, inbatch_neg_log_q=inbatch_log_q,
@@ -159,21 +151,37 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             optimizer.step()
             scheduler.step()
             
-            # 4. Update Buffer
             new_indices = torch.randint(n_items, (min(batch_size, INBATCH_NEG_SIZE),), device=device)
             buffer_indices = torch.cat([buffer_indices[len(new_indices):], new_indices])
-            
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_nce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
 
     Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth")
-    print("Training finished.")
+    print("Dual-Tower training finished.")
+
+def train_item_cf():
+    print("=== Training ItemCF (Sparse Matrix) ===")
+    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
+    model = ItemCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "item_sim_matrix.pkl")
+    model.fit(train_df=train_data[train_data['rating'] >= 3.0])
+    print("ItemCF training finished.")
+
+def train_user_cf():
+    print("=== Training UserCF (Sparse Matrix) ===")
+    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
+    model = UserCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "user_sim_matrix.pkl")
+    model.fit(train_df=train_data[train_data['rating'] >= 3.0])
+    print("UserCF training finished.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="dual_tower")
+    parser.add_argument("--model", type=str, required=True, choices=["dual_tower", "item_cf", "user_cf", "all"])
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     args = parser.parse_args()
-    if args.model == "dual_tower":
+    
+    if args.model == "dual_tower" or args.model == "all":
         train_dual_tower(batch_size=args.batch_size)
-    # ItemCF/UserCF remains unchanged in src...
+    if args.model == "item_cf" or args.model == "all":
+        train_item_cf()
+    if args.model == "user_cf" or args.model == "all":
+        train_user_cf()
