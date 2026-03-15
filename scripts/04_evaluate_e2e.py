@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from collections import defaultdict
 import pandas as pd
 import numpy as np
 import torch
@@ -50,6 +51,11 @@ def pad_ts_diff(ts_list, max_len):
 def evaluate(test_mode=False):
     print("=== Starting End-to-End Evaluation ===")
 
+    CHANNEL_K = 200       # 每个通道召回的候选数
+    MERGE_K = 500         # 融合后保留的候选数
+    CHANNEL_EVAL_KS = [50, 100, 200]   # 单通道评测的 K 值
+    FINAL_EVAL_KS = [100, 200, 500]    # 融合后评测的 K 值
+
     # 1. Load Data
     val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
@@ -97,7 +103,7 @@ def evaluate(test_mode=False):
         genre_to_items_path=Path(FEATURE_STORE_DIR) / "genre_to_items.json",
         item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet"
     )
-    merger = RecallMerger(top_k=RECALL_K)
+    merger = RecallMerger(top_k=MERGE_K)
 
     # 3. Build FAISS Index
     idx_to_movie_id = []
@@ -130,11 +136,7 @@ def evaluate(test_mode=False):
 
     # 5. Evaluate
     print(f"Evaluating {len(eval_users)} users...")
-    metrics = {
-        'Recall@50_Final': [], 'NDCG@50_Final': [],
-        'Recall@50_DualTower': [], 'Recall@50_ItemCF': [],
-        'Recall@50_UserCF': [], 'Recall@50_Genre': [], 'Recall@50_Pop': []
-    }
+    metrics = defaultdict(list)
 
     for uid in tqdm(eval_users, desc="Evaluating"):
         if uid not in user_profile_indexed.index:
@@ -157,35 +159,41 @@ def evaluate(test_mode=False):
             with torch.no_grad():
                 u_emb, _ = model(user_tensor, None)
                 u_emb = u_emb.cpu().numpy().astype('float32')
-            _, I = index.search(u_emb, RECALL_K)
+            _, I = index.search(u_emb, CHANNEL_K)
             channels['dual_tower'] = [int(idx_to_movie_id[i]) for i in I[0]]
-            metrics['Recall@50_DualTower'].append(recall_at_k(actual_items, channels['dual_tower'], k=50))
+            for ek in CHANNEL_EVAL_KS:
+                metrics[f'Recall@{ek}_DualTower'].append(recall_at_k(actual_items, channels['dual_tower'], k=ek))
 
         # ItemCF
         if item_cf_ready:
             history_orig = user_row.get('history')
-            channels['item_cf'] = item_cf.retrieve(list(history_orig), k=RECALL_K) if history_orig is not None else []
-            metrics['Recall@50_ItemCF'].append(recall_at_k(actual_items, channels['item_cf'], k=50))
+            channels['item_cf'] = item_cf.retrieve(list(history_orig), k=CHANNEL_K) if history_orig is not None else []
+            for ek in CHANNEL_EVAL_KS:
+                metrics[f'Recall@{ek}_ItemCF'].append(recall_at_k(actual_items, channels['item_cf'], k=ek))
 
         # UserCF
         if user_cf_ready:
-            channels['user_cf'] = user_cf.retrieve(uid, k=RECALL_K)
-            metrics['Recall@50_UserCF'].append(recall_at_k(actual_items, channels['user_cf'], k=50))
+            channels['user_cf'] = user_cf.retrieve(uid, k=CHANNEL_K)
+            for ek in CHANNEL_EVAL_KS:
+                metrics[f'Recall@{ek}_UserCF'].append(recall_at_k(actual_items, channels['user_cf'], k=ek))
 
         # Pop
-        channels['popularity'] = pop_recall.retrieve(k=RECALL_K)
-        metrics['Recall@50_Pop'].append(recall_at_k(actual_items, channels['popularity'], k=50))
+        channels['popularity'] = pop_recall.retrieve(k=CHANNEL_K)
+        for ek in CHANNEL_EVAL_KS:
+            metrics[f'Recall@{ek}_Pop'].append(recall_at_k(actual_items, channels['popularity'], k=ek))
 
         # Genre
         top_genres = user_row.get('top_genres')
         if isinstance(top_genres, (list, np.ndarray)):
-            channels['genre'] = genre_recall.retrieve(list(top_genres), k=RECALL_K)
-            metrics['Recall@50_Genre'].append(recall_at_k(actual_items, channels['genre'], k=50))
+            channels['genre'] = genre_recall.retrieve(list(top_genres), k=CHANNEL_K)
+            for ek in CHANNEL_EVAL_KS:
+                metrics[f'Recall@{ek}_Genre'].append(recall_at_k(actual_items, channels['genre'], k=ek))
 
         # Merge
         merged = merger.merge(channels)
-        metrics['Recall@50_Final'].append(recall_at_k(actual_items, merged, k=50))
-        metrics['NDCG@50_Final'].append(ndcg_at_k(actual_items, merged, k=50))
+        for ek in FINAL_EVAL_KS:
+            metrics[f'Recall@{ek}_Final'].append(recall_at_k(actual_items, merged, k=ek))
+            metrics[f'NDCG@{ek}_Final'].append(ndcg_at_k(actual_items, merged, k=ek))
 
     # 6. Report
     print("\n=== Multi-Channel Metrics Report ===")
