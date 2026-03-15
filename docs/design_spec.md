@@ -98,3 +98,38 @@ movielens_recsys/
     - BPR
 - 评测指标
     - recal@50
+
+## 四、排序模型 (Ranking)
+
+### 4.1 模型选择
+- **精排模型**: MLP (Multilayer Perceptron) 或 DeepFM。
+- **目标**: 预估用户对电影的点击率 (CTR) 或 评分 (Regression to Rating)。
+- **输入**: 召回阶段输出的候选集 (通常为 Top 500)。
+
+### 4.2 特征工程 (Ranking Features)
+- **用户侧**: userId, age, gender, occupation, zip_code (基础画像) + 实时活跃度。
+- **物品侧**: movieId, genres, release_year, tmdb_score, revenue, popularity。
+- **交叉侧 (Cross Features)**:
+    - 用户与电影类别的偏好匹配度 (User-Genre Match)。
+    - 用户历史点击过的电影与当前候选电影的相似度。
+    - 统计特征: 该电影在过去 7 天的点击量/曝光量。
+
+### 4.3 训练与评估
+- **损失函数**: Binary Cross Entropy (BCE) 用于点击预估，或 MSE 用于评分回归。
+- **离线指标**: AUC (Area Under Curve), LogLoss, RMSE。
+
+## 五、链路总控与评估 (Pipeline & Evaluation)
+
+### 5.1 全链路流程 (E2E Flow)
+1. **多路召回**: 并行执行双塔、CF、热门、标签召回，获取原始候选池。
+2. **召回融合 (Merge)**: 对各路结果进行去重，并按照预设权重或分数进行初步截断（如保留 Top 500）。
+3. **特征补全 (Fetch)**: 从 `feature_store` 中拉取精排所需的稠密/稀疏特征。
+4. **精排 (Rank)**: 使用排序模型对候选集进行打分并重排。
+5. **重排 (Rerank)**: 增加打散策略 (Diversity)、过滤已看物品。
+6. **最终输出**: 返回 Top 10/20 结果。
+
+### 5.2 核心指标 (Online-like Metrics)
+- **Recall@K (K=50, 100)**: 衡量召回覆盖率。
+- **NDCG@K (K=10)**: 衡量推荐列表的排序准确性。
+- **HitRate@K**: 衡量 Top-K 中是否包含用户真实交互过的物品。
+- **实时性能**: 端到端推理延迟 (Latency) 控制在 200ms 以内。
