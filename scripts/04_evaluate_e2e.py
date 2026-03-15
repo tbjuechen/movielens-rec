@@ -190,7 +190,16 @@ def evaluate(test_mode=False):
             for ek in CHANNEL_EVAL_KS:
                 metrics[f'Recall@{ek}_Genre'].append(recall_at_k(actual_items, channels['genre'], k=ek))
 
-        # Merge with optimized weights
+        # 5.1 Filter Watched Items (Critical Optimization)
+        # Get set of original movieIds the user has already seen
+        watched_set = set(user_row['history']) if isinstance(user_row['history'], (list, np.ndarray)) else set()
+        
+        for name in list(channels.keys()):
+            # Filter out watched items from each channel's candidates
+            filtered_list = [iid for iid in channels[name] if iid not in watched_set]
+            channels[name] = filtered_list[:CHANNEL_K]
+
+        # 5.2 Merge with optimized weights
         merged = merger.merge(channels, weights=MERGER_WEIGHTS)
         for ek in FINAL_EVAL_KS:
             metrics[f'Recall@{ek}_Final'].append(recall_at_k(actual_items, merged, k=ek))
