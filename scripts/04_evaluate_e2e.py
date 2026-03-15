@@ -11,8 +11,9 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
-    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA,
-    LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, RECALL_K,
+    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA, BPR_MARGIN,
+    LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
+    RECALL_K,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS
 )
@@ -73,8 +74,9 @@ def evaluate(test_mode=False):
     # 2. Load Models
     model = DualTowerModel(
         vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU,
-        time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA,
-        loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT
+        time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA, bpr_margin=BPR_MARGIN,
+        loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT,
+        logit_scale_max=LOGIT_SCALE_MAX, cont_bucket_size=CONT_BUCKET_SIZE
     ).to(device)
     model_path = Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth"
     dual_tower_ready = False

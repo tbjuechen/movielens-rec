@@ -14,6 +14,9 @@ recall:
   embedding_dim: 128
   tau: 0.07
   bpr_gamma: 5.0  # BPR-specific scaling factor for sigmoid input
+  bpr_margin: 0.1  # BPR margin: forces pos-neg gap before scoring correct
+  logit_scale_max: 100.0  # Clamp for learnable tau (min tau = 1/max)
+  cont_bucket_size: 20  # Number of bins for continuous feature discretization
   # Mixed Loss Weights
   loss_infonce_weight: 1.0
   loss_bpr_weight: 1.0

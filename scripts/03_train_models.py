@@ -13,8 +13,8 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
-    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA,
-    LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT,
+    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA, BPR_MARGIN,
+    LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
     BATCH_SIZE, LEARNING_RATE, EPOCHS,
     INBATCH_NEG_SIZE, GLOBAL_NEG_SIZE, HARD_NEG_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
@@ -90,11 +90,28 @@ def train_dual_tower(batch_size=BATCH_SIZE):
     dataloader = create_dataloader(train_pos, user_profile_dataset, item_profile_dataset, batch_size=batch_size)
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     item_lookup = {k: v.to(device) for k, v in item_lookup.items()}
-    
+
+    # Compute quantile bucket boundaries from training profiles
+    def _quantile_bounds(values, n_buckets):
+        quantiles = np.linspace(0, 1, n_buckets + 1)[1:-1]
+        return np.quantile(values[~np.isnan(values)], quantiles).astype(np.float32)
+
+    user_bucket_bounds = {
+        'avg_rating': _quantile_bounds(user_profile['avg_rating_norm'].values, CONT_BUCKET_SIZE),
+        'activity': _quantile_bounds(user_profile['activity_norm'].values, CONT_BUCKET_SIZE),
+    }
+    item_bucket_bounds = {
+        'release_year': _quantile_bounds(item_profile['release_year_norm'].values, CONT_BUCKET_SIZE),
+        'avg_rating': _quantile_bounds(item_profile['avg_rating_norm'].values, CONT_BUCKET_SIZE),
+        'revenue': _quantile_bounds(item_profile['revenue_norm'].values, CONT_BUCKET_SIZE),
+    }
+
     model = DualTowerModel(
         vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU,
-        time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA,
-        loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT
+        time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA, bpr_margin=BPR_MARGIN,
+        loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT,
+        logit_scale_max=LOGIT_SCALE_MAX, cont_bucket_size=CONT_BUCKET_SIZE,
+        user_bucket_boundaries=user_bucket_bounds, item_bucket_boundaries=item_bucket_bounds
     ).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -153,7 +170,8 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             
             new_indices = torch.randint(n_items, (min(batch_size, INBATCH_NEG_SIZE),), device=device)
             buffer_indices = torch.cat([buffer_indices[len(new_indices):], new_indices])
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_nce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
+            tau_eff = 1.0 / model.logit_scale.exp().clamp(max=model.logit_scale_max).item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_nce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}", 'tau': f"{tau_eff:.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
 
     Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth")

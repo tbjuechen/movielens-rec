@@ -25,6 +25,9 @@ RECALL_K = config['recall']['top_k']
 EMBEDDING_DIM = config['recall']['embedding_dim']
 TAU = config['recall']['tau']
 BPR_GAMMA = config['recall'].get('bpr_gamma', 5.0)
+BPR_MARGIN = config['recall'].get('bpr_margin', 0.1)
+LOGIT_SCALE_MAX = config['recall'].get('logit_scale_max', 100.0)
+CONT_BUCKET_SIZE = config['recall'].get('cont_bucket_size', 20)
 LOSS_INFONCE_WEIGHT = config['recall'].get('loss_infonce_weight', 1.0)
 LOSS_BPR_WEIGHT = config['recall'].get('loss_bpr_weight', 1.0)
 
