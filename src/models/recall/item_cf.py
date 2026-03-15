@@ -5,42 +5,41 @@ from scipy.sparse import csr_matrix
 from pathlib import Path
 from tqdm import tqdm
 from multiprocessing import Pool
-import functools
 
 from src.config.settings import CF_TOP_K, CF_WORKERS
 
-# Module-level shared state for worker processes (inherited via fork COW)
+# Module-level shared state, inherited by fork workers via COW
 _shared = {}
 
-def _init_worker(matrix, mapping, k):
-    _shared['matrix'] = matrix
-    _shared['mapping'] = mapping
-    _shared['top_k'] = k
-
-def _process_chunk(chunk_indices):
-    matrix = _shared['matrix']
-    idx_to_item = _shared['mapping']
+def _compute_item_chunk(chunk_indices):
+    """Each worker: R_T[chunk] @ R → normalize → top-K. No full I×I matrix needed."""
+    ui_t = _shared['ui_matrix_t']
+    ui = _shared['ui_matrix']
+    counts = _shared['counts']
+    mapping = _shared['mapping']
     top_k = _shared['top_k']
-    local_sim = {}
-    for i in chunk_indices:
-        row = matrix.getrow(i)
-        indices = row.indices
-        scores = row.data
 
-        mask = indices != i
-        indices = indices[mask]
-        scores = scores[mask]
+    chunk_co = ui_t[chunk_indices].dot(ui).tocsr()
 
-        if len(scores) == 0:
+    result = {}
+    for li, gi in enumerate(chunk_indices):
+        row = chunk_co.getrow(li)
+        idx, data = row.indices, row.data
+
+        mask = idx != gi
+        idx, data = idx[mask], data[mask]
+        if len(data) == 0:
             continue
 
-        if len(scores) > top_k:
-            top_idx = np.argpartition(scores, -top_k)[-top_k:]
-            indices = indices[top_idx]
-            scores = scores[top_idx]
+        norm = np.sqrt(counts[gi] * counts[idx])
+        scores = data / (norm + 1e-8)
 
-        local_sim[idx_to_item[i]] = {idx_to_item[idx]: float(s) for idx, s in zip(indices, scores)}
-    return local_sim
+        if len(scores) > top_k:
+            top = np.argpartition(scores, -top_k)[-top_k:]
+            idx, scores = idx[top], scores[top]
+
+        result[mapping[gi]] = {mapping[j]: float(s) for j, s in zip(idx, scores)}
+    return result
 
 class ItemCFModel:
     def __init__(self, sim_save_path: str):
@@ -48,9 +47,8 @@ class ItemCFModel:
         self.item_sim_matrix = {}
 
     def fit(self, train_df: pd.DataFrame, top_k=CF_TOP_K, num_workers=CF_WORKERS):
-        print(f"ItemCF: Encoding IDs (Workers: {num_workers})...")
-        # Deduplicate interactions
         train_df = train_df.drop_duplicates(subset=['userId', 'movieId'])
+        print(f"ItemCF: Building matrix ({len(train_df)} interactions, {num_workers} workers)...")
 
         user_ids = train_df['userId'].unique()
         item_ids = train_df['movieId'].unique()
@@ -61,28 +59,26 @@ class ItemCFModel:
         u_idx = train_df['userId'].map(user_to_idx).values
         i_idx = train_df['movieId'].map(item_to_idx).values
 
-        print("ItemCF: Building User-Item sparse matrix...")
         ui_matrix = csr_matrix((np.ones(len(train_df)), (u_idx, i_idx)), shape=(len(user_ids), len(item_ids)))
+        ui_matrix_t = ui_matrix.T.tocsr()
+        item_counts = np.array(ui_matrix.sum(axis=0)).flatten()
 
-        print("ItemCF: Matrix Multiplication (R^T * R)...")
-        co_matrix = ui_matrix.T.dot(ui_matrix)
+        # Set up shared state before forking
+        _shared['ui_matrix'] = ui_matrix
+        _shared['ui_matrix_t'] = ui_matrix_t
+        _shared['counts'] = item_counts
+        _shared['mapping'] = idx_to_item
+        _shared['top_k'] = top_k
 
-        print("ItemCF: Normalizing...")
-        item_counts = np.array(co_matrix.diagonal()).flatten()
-        co_matrix = co_matrix.tocoo()
-        norm = np.sqrt(item_counts[co_matrix.row] * item_counts[co_matrix.col])
-        sim_data = co_matrix.data / (norm + 1e-8)
-        refined_matrix = csr_matrix((sim_data, (co_matrix.row, co_matrix.col)), shape=co_matrix.shape)
-
-        print(f"ItemCF: Parallel pruning to Top-{top_k}...")
+        print(f"ItemCF: Parallel matmul + prune (Top-{top_k})...")
         chunks = np.array_split(np.arange(len(item_ids)), num_workers)
-
-        with Pool(num_workers, initializer=_init_worker, initargs=(refined_matrix, idx_to_item, top_k)) as pool:
-            results = list(tqdm(pool.imap(_process_chunk, chunks), total=len(chunks), desc="Pruning"))
+        with Pool(num_workers) as pool:
+            results = list(tqdm(pool.imap(_compute_item_chunk, chunks), total=len(chunks), desc="ItemCF chunks"))
 
         self.item_sim_matrix = {}
         for res in results:
             self.item_sim_matrix.update(res)
+        _shared.clear()
 
         self.save()
 
