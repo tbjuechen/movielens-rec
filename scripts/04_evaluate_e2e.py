@@ -13,7 +13,8 @@ from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
     EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA,
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, RECALL_K,
-    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
+    MERGER_WEIGHTS
 )
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
@@ -189,8 +190,8 @@ def evaluate(test_mode=False):
             for ek in CHANNEL_EVAL_KS:
                 metrics[f'Recall@{ek}_Genre'].append(recall_at_k(actual_items, channels['genre'], k=ek))
 
-        # Merge
-        merged = merger.merge(channels)
+        # Merge with optimized weights
+        merged = merger.merge(channels, weights=MERGER_WEIGHTS)
         for ek in FINAL_EVAL_KS:
             metrics[f'Recall@{ek}_Final'].append(recall_at_k(actual_items, merged, k=ek))
             metrics[f'NDCG@{ek}_Final'].append(ndcg_at_k(actual_items, merged, k=ek))

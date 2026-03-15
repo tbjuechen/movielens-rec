@@ -34,6 +34,14 @@ cf:
   top_k: 50
   cf_workers: 32
 
+# 6. Merger Weights (Tuned for Recall maximization)
+merger_weights:
+  dual_tower: 0.5
+  item_cf: 0.8
+  user_cf: 1.0
+  popularity: 0.01
+  genre: 0.05
+
 # 4. Feature Settings
 features:
   user_history_max_len: 50

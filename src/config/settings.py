@@ -48,3 +48,12 @@ TIME_DECAY_LAMBDA = config['features']['time_decay_lambda']
 # 6. CF Settings
 CF_TOP_K = config.get('cf', {}).get('top_k', 50)
 CF_WORKERS = config.get('cf', {}).get('cf_workers', 32)
+
+# 7. Merger Weights
+MERGER_WEIGHTS = config.get('merger_weights', {
+    'dual_tower': 1.0,
+    'item_cf': 1.0,
+    'user_cf': 1.0,
+    'popularity': 1.0,
+    'genre': 1.0
+})
