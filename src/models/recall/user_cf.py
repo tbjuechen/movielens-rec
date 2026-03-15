@@ -4,6 +4,27 @@ import pickle
 from scipy.sparse import csr_matrix
 from pathlib import Path
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+import functools
+
+def _process_user_chunk(chunk_indices, sparse_matrix, idx_to_user, top_k):
+    local_sim_matrix = {}
+    for i in chunk_indices:
+        row = sparse_matrix.getrow(i)
+        indices = row.indices
+        scores = row.data
+        mask = indices != i
+        indices = indices[mask]
+        scores = scores[mask]
+        if len(scores) == 0:
+            continue
+        if len(scores) > top_k:
+            top_idx = np.argpartition(scores, -top_k)[-top_k:]
+            indices = indices[top_idx]
+            scores = scores[top_idx]
+        orig_user_i = idx_to_user[i]
+        local_sim_matrix[orig_user_i] = {idx_to_user[idx]: float(score) for idx, score in zip(indices, scores)}
+    return local_sim_matrix
 
 class UserCFModel:
     def __init__(self, sim_save_path: str):
@@ -11,86 +32,66 @@ class UserCFModel:
         self.user_sim_matrix = {}
         self.user_item_dict = {}
 
-    def fit(self, train_df: pd.DataFrame, top_k=50):
+    def fit(self, train_df: pd.DataFrame, top_k=50, num_workers=None):
         """
-        使用稀疏矩阵加速计算 UserCF 相似度。
+        多核并行计算 UserCF 相似度。
         """
-        print("UserCF: Encoding IDs for sparse matrix...")
+        if num_workers is None:
+            num_workers = max(1, cpu_count() - 2)
+
+        print(f"UserCF: Encoding IDs (Workers: {num_workers})...")
         user_ids = train_df['userId'].unique()
         item_ids = train_df['movieId'].unique()
-        
         user_to_idx = {uid: i for i, uid in enumerate(user_ids)}
         item_to_idx = {iid: i for i, iid in enumerate(item_ids)}
         idx_to_user = {i: uid for uid, i in user_to_idx.items()}
         
-        # 记录用户看过的物品，用于召回时去重
         self.user_item_dict = train_df.groupby('userId')['movieId'].apply(list).to_dict()
-        
         u_idx = train_df['userId'].map(user_to_idx).values
         i_idx = train_df['movieId'].map(item_to_idx).values
         
-        # 1. 构建 User-Item 稀疏矩阵
-        print("UserCF: Building User-Item sparse matrix...")
-        ui_matrix = csr_matrix((np.ones(len(train_df)), (u_idx, i_idx)), 
-                                shape=(len(user_ids), len(item_ids)))
+        print("UserCF: Building sparse matrix...")
+        ui_matrix = csr_matrix((np.ones(len(train_df)), (u_idx, i_idx)), shape=(len(user_ids), len(item_ids)))
         
-        # 2. 计算用户相似度矩阵 S = R * R^T
-        print("UserCF: Calculating user similarity matrix (Matrix Multiplication)...")
-        # 这是计算用户两两之间共同看过多少物品
+        print("UserCF: Matrix Multiplication (R * R^T)...")
         uu_matrix = ui_matrix.dot(ui_matrix.T)
         
-        # 3. 余弦归一化
-        print("UserCF: Normalizing similarity scores...")
+        print("UserCF: Normalizing...")
         user_counts = np.array(uu_matrix.diagonal()).flatten()
         uu_matrix = uu_matrix.tocoo()
         row_idx = uu_matrix.row
         col_idx = uu_matrix.col
-        sim_data = uu_matrix.data
-        
         norm = np.sqrt(user_counts[row_idx] * user_counts[col_idx])
-        sim_data = sim_data / (norm + 1e-8)
-        
-        # 4. 构建字典并截断
-        print(f"UserCF: Pruning to Top-{top_k} per user...")
-        final_sim_matrix = {}
+        sim_data = uu_matrix.data / (norm + 1e-8)
         refined_matrix = csr_matrix((sim_data, (row_idx, col_idx)), shape=uu_matrix.shape)
         
-        for i in tqdm(range(len(user_ids)), desc="Building User Map"):
-            row = refined_matrix.getrow(i)
-            indices = row.indices
-            scores = row.data
+        # --- 并行处理 Top-K 截断 ---
+        print(f"UserCF: Parallel pruning to Top-{top_k}...")
+        indices = np.arange(len(user_ids))
+        chunks = np.array_split(indices, num_workers)
+        
+        process_func = functools.partial(_process_user_chunk, sparse_matrix=refined_matrix, idx_to_user=idx_to_user, top_k=top_k)
+        
+        with Pool(num_workers) as pool:
+            results = list(tqdm(pool.imap(process_func, chunks), total=len(chunks), desc="Pruning User Chunks"))
             
-            mask = indices != i
-            indices = indices[mask]
-            scores = scores[mask]
+        print("UserCF: Merging results...")
+        self.user_sim_matrix = {}
+        for res in results:
+            self.user_sim_matrix.update(res)
             
-            if len(scores) == 0:
-                continue
-                
-            if len(scores) > top_k:
-                top_idx = np.argpartition(scores, -top_k)[-top_k:]
-                indices = indices[top_idx]
-                scores = scores[top_idx]
-            
-            orig_user_i = idx_to_user[i]
-            final_sim_matrix[orig_user_i] = {idx_to_user[idx]: float(score) for idx, score in zip(indices, scores)}
-            
-        self.user_sim_matrix = final_sim_matrix
         self.save()
 
     def retrieve(self, user_id: int, k=50):
         if user_id not in self.user_sim_matrix:
             return []
-            
         rank = {}
         interacted_items = set(self.user_item_dict.get(user_id, []))
-        
         for v, sim in self.user_sim_matrix[user_id].items():
             for item in self.user_item_dict.get(v, []):
                 if item in interacted_items:
                     continue
                 rank[item] = rank.get(item, 0) + sim
-                
         sorted_res = sorted(rank.items(), key=lambda x: x[1], reverse=True)[:k]
         return [res[0] for res in sorted_res]
 
@@ -99,7 +100,7 @@ class UserCFModel:
         with open(self.sim_save_path, "wb") as f:
             data = {'matrix': self.user_sim_matrix, 'user_item': self.user_item_dict}
             pickle.dump(data, f)
-        print(f"High-performance UserCF saved to {self.sim_save_path}")
+        print(f"Parallel UserCF saved to {self.sim_save_path}")
 
     def load(self):
         with open(self.sim_save_path, "rb") as f:
