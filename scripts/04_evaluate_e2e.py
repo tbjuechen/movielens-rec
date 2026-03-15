@@ -12,7 +12,7 @@ from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
     EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA,
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, RECALL_K,
-    USER_HISTORY_MAX_LEN
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
 )
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
@@ -25,11 +25,11 @@ from src.evaluation.metrics import recall_at_k, ndcg_at_k
 def apply_encoding(user_profile, item_profile, encoder):
     """Reuse the encoding logic from training."""
     user_profile['userId_encoded'] = encoder.transform_categorical(user_profile['userId'], 'userId')
-    user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=3)
+    user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=USER_TOP_GENRES_MAX_LEN)
     user_profile['history_encoded'] = encoder.transform_categorical(user_profile['history'], 'movieId', is_list=True, max_len=USER_HISTORY_MAX_LEN)
 
     item_profile['movieId_encoded'] = encoder.transform_categorical(item_profile['movieId'], 'movieId')
-    item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=5)
+    item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=ITEM_GENRES_MAX_LEN)
     
     user_cont = encoder.transform_continuous(user_profile, ['avg_rating', 'activity'], prefix="user")
     user_profile['avg_rating_norm'] = user_cont['user_avg_rating']
@@ -81,14 +81,16 @@ def evaluate(test_mode=False):
     try:
         item_cf.load()
         item_cf_ready = True
-    except: print("Warning: ItemCF matrix not found.")
+    except FileNotFoundError:
+        print("Warning: ItemCF matrix not found.")
 
     user_cf = UserCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "user_sim_matrix.pkl")
     user_cf_ready = False
     try:
         user_cf.load()
         user_cf_ready = True
-    except: print("Warning: UserCF matrix not found.")
+    except FileNotFoundError:
+        print("Warning: UserCF matrix not found.")
 
     pop_recall = PopularityRecall(item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
     genre_recall = GenreRecall(
@@ -129,9 +131,9 @@ def evaluate(test_mode=False):
     # 5. Evaluate
     print(f"Evaluating {len(eval_users)} users...")
     metrics = {
-        'Recall@50_Final': [], 'NDCG@50_Final': [], 
+        'Recall@50_Final': [], 'NDCG@50_Final': [],
         'Recall@50_DualTower': [], 'Recall@50_ItemCF': [],
-        'Recall@50_UserCF': [], 'Recall@50_Pop': []
+        'Recall@50_UserCF': [], 'Recall@50_Genre': [], 'Recall@50_Pop': []
     }
 
     for uid in tqdm(eval_users, desc="Evaluating"):
@@ -173,6 +175,12 @@ def evaluate(test_mode=False):
         # Pop
         channels['popularity'] = pop_recall.retrieve(k=RECALL_K)
         metrics['Recall@50_Pop'].append(recall_at_k(actual_items, channels['popularity'], k=50))
+
+        # Genre
+        top_genres = user_row.get('top_genres')
+        if isinstance(top_genres, (list, np.ndarray)):
+            channels['genre'] = genre_recall.retrieve(list(top_genres), k=RECALL_K)
+            metrics['Recall@50_Genre'].append(recall_at_k(actual_items, channels['genre'], k=50))
 
         # Merge
         merged = merger.merge(channels)

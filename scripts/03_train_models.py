@@ -153,7 +153,7 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             
             new_indices = torch.randint(n_items, (min(batch_size, INBATCH_NEG_SIZE),), device=device)
             buffer_indices = torch.cat([buffer_indices[len(new_indices):], new_indices])
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_nce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
 
     Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth")
