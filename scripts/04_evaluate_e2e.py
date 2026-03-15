@@ -52,7 +52,8 @@ def pad_ts_diff(ts_list, max_len):
 def evaluate(test_mode=False):
     print("=== Starting End-to-End Evaluation ===")
 
-    CHANNEL_K = 200       # 每个通道召回的候选数
+    CHANNEL_K = 200       # 过滤后每个通道保留的候选数
+    RAW_CHANNEL_K = 300   # 过滤前多召回一些，留出余量
     MERGE_K = 500         # 融合后保留的候选数
     CHANNEL_EVAL_KS = [50, 100, 200]   # 单通道评测的 K 值
     FINAL_EVAL_KS = [100, 200, 500]    # 融合后评测的 K 值
@@ -160,46 +161,39 @@ def evaluate(test_mode=False):
             with torch.no_grad():
                 u_emb, _ = model(user_tensor, None)
                 u_emb = u_emb.cpu().numpy().astype('float32')
-            _, I = index.search(u_emb, CHANNEL_K)
+            _, I = index.search(u_emb, RAW_CHANNEL_K)
             channels['dual_tower'] = [int(idx_to_movie_id[i]) for i in I[0]]
-            for ek in CHANNEL_EVAL_KS:
-                metrics[f'Recall@{ek}_DualTower'].append(recall_at_k(actual_items, channels['dual_tower'], k=ek))
 
         # ItemCF
         if item_cf_ready:
             history_orig = user_row.get('history')
-            channels['item_cf'] = item_cf.retrieve(list(history_orig), k=CHANNEL_K) if history_orig is not None else []
-            for ek in CHANNEL_EVAL_KS:
-                metrics[f'Recall@{ek}_ItemCF'].append(recall_at_k(actual_items, channels['item_cf'], k=ek))
+            channels['item_cf'] = item_cf.retrieve(list(history_orig), k=RAW_CHANNEL_K) if history_orig is not None else []
 
         # UserCF
         if user_cf_ready:
-            channels['user_cf'] = user_cf.retrieve(uid, k=CHANNEL_K)
-            for ek in CHANNEL_EVAL_KS:
-                metrics[f'Recall@{ek}_UserCF'].append(recall_at_k(actual_items, channels['user_cf'], k=ek))
+            channels['user_cf'] = user_cf.retrieve(uid, k=RAW_CHANNEL_K)
 
         # Pop
-        channels['popularity'] = pop_recall.retrieve(k=CHANNEL_K)
-        for ek in CHANNEL_EVAL_KS:
-            metrics[f'Recall@{ek}_Pop'].append(recall_at_k(actual_items, channels['popularity'], k=ek))
+        channels['popularity'] = pop_recall.retrieve(k=RAW_CHANNEL_K)
 
         # Genre
         top_genres = user_row.get('top_genres')
         if isinstance(top_genres, (list, np.ndarray)):
-            channels['genre'] = genre_recall.retrieve(list(top_genres), k=CHANNEL_K)
-            for ek in CHANNEL_EVAL_KS:
-                metrics[f'Recall@{ek}_Genre'].append(recall_at_k(actual_items, channels['genre'], k=ek))
+            channels['genre'] = genre_recall.retrieve(list(top_genres), k=RAW_CHANNEL_K)
 
-        # 5.1 Filter Watched Items (Critical Optimization)
-        # Get set of original movieIds the user has already seen
+        # Filter watched items (unified for all metrics)
         watched_set = set(user_row['history']) if isinstance(user_row['history'], (list, np.ndarray)) else set()
-        
         for name in list(channels.keys()):
-            # Filter out watched items from each channel's candidates
-            filtered_list = [iid for iid in channels[name] if iid not in watched_set]
-            channels[name] = filtered_list[:CHANNEL_K]
+            channels[name] = [iid for iid in channels[name] if iid not in watched_set][:CHANNEL_K]
 
-        # 5.2 Merge with optimized weights
+        # Per-channel metrics
+        channel_metric_names = {'dual_tower': 'DualTower', 'item_cf': 'ItemCF', 'user_cf': 'UserCF', 'popularity': 'Pop', 'genre': 'Genre'}
+        for ch, label in channel_metric_names.items():
+            if ch in channels:
+                for ek in CHANNEL_EVAL_KS:
+                    metrics[f'Recall@{ek}_{label}'].append(recall_at_k(actual_items, channels[ch], k=ek))
+
+        # Merge
         merged = merger.merge(channels, weights=MERGER_WEIGHTS)
         for ek in FINAL_EVAL_KS:
             metrics[f'Recall@{ek}_Final'].append(recall_at_k(actual_items, merged, k=ek))
