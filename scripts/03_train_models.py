@@ -16,7 +16,8 @@ from src.config.settings import (
     EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA,
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT,
     BATCH_SIZE, LEARNING_RATE, EPOCHS,
-    INBATCH_NEG_SIZE, GLOBAL_NEG_SIZE, HARD_NEG_SIZE
+    INBATCH_NEG_SIZE, GLOBAL_NEG_SIZE, HARD_NEG_SIZE,
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
 )
 from src.features.encoder import FeatureEncoder
 from src.data_pipeline.dataset import create_dataloader
@@ -25,11 +26,11 @@ from src.models.recall.dual_tower import DualTowerModel
 def apply_encoding(user_profile, item_profile, encoder):
     print("Applying encoding to profiles...")
     user_profile['userId_encoded'] = encoder.transform_categorical(user_profile['userId'], 'userId')
-    user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=3)
-    user_profile['history_encoded'] = encoder.transform_categorical(user_profile['history'], 'movieId', is_list=True, max_len=50)
+    user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=USER_TOP_GENRES_MAX_LEN)
+    user_profile['history_encoded'] = encoder.transform_categorical(user_profile['history'], 'movieId', is_list=True, max_len=USER_HISTORY_MAX_LEN)
 
     item_profile['movieId_encoded'] = encoder.transform_categorical(item_profile['movieId'], 'movieId')
-    item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=5)
+    item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=ITEM_GENRES_MAX_LEN)
     
     user_cont = encoder.transform_continuous(user_profile, ['avg_rating', 'activity'], prefix="user")
     user_profile['avg_rating_norm'] = user_cont['user_avg_rating']
@@ -121,15 +122,18 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             global_log_q = item_lookup['log_q'][global_idx]
             hard_idx = pop_indices_t[torch.randint(len(pop_indices_t), (HARD_NEG_SIZE,), device=device)]
             
-            # --- Collision Masking (Critical Fix #16) ---
-            # neg_ids = [buffer_indices, global_idx] (Total_Neg_Size)
-            # user_history = (B, 50)
+            # --- Collision Masking ---
+            # InfoNCE negatives
             all_neg_indices = torch.cat([buffer_indices, global_idx])
             all_neg_ids = item_lookup['item_id'][all_neg_indices] # (N_neg,)
-            user_hist_ids = user_feat['history'] # (B, 50)
-            
-            # Check collisions: (B, 1, 50) == (1, N_neg, 1) -> (B, N_neg)
-            collision_mask = (user_hist_ids.unsqueeze(1) == all_neg_ids.view(1, -1, 1)).any(dim=-1)
+            user_hist_ids = user_feat['history'] # (B, H)
+
+            # BPR hard negatives
+            hard_neg_ids = item_lookup['item_id'][hard_idx] # (Hard_Size,)
+
+            # Collision check: (B, N, 1) == (B, 1, H) -> any -> (B, N)
+            infonce_collision = (all_neg_ids.unsqueeze(0).unsqueeze(-1) == user_hist_ids.unsqueeze(1)).any(dim=-1)
+            bpr_collision = (hard_neg_ids.unsqueeze(0).unsqueeze(-1) == user_hist_ids.unsqueeze(1)).any(dim=-1)
             
             # 2. Forward Negatives
             neg_feat = get_neg_feat_by_indices(all_neg_indices)
@@ -147,7 +151,8 @@ def train_dual_tower(batch_size=BATCH_SIZE):
                 inbatch_neg_emb=inbatch_neg_emb, inbatch_neg_log_q=inbatch_log_q,
                 global_neg_emb=global_neg_emb, global_neg_log_q=global_log_q,
                 hard_neg_emb=hard_neg_emb,
-                collision_mask=collision_mask
+                collision_mask=infonce_collision,
+                bpr_collision_mask=bpr_collision
             )
             
             loss.backward()

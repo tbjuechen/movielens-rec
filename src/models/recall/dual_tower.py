@@ -88,13 +88,15 @@ class DualTowerModel(nn.Module):
         i_emb = self.item_tower(item_features) if item_features is not None else None
         return u_emb, i_emb
 
-    def compute_loss(self, user_features, item_features, item_log_q, 
+    def compute_loss(self, user_features, item_features, item_log_q,
                      inbatch_neg_emb, inbatch_neg_log_q,
                      global_neg_emb, global_neg_log_q,
                      hard_neg_emb,
-                     collision_mask=None):
+                     collision_mask=None,
+                     bpr_collision_mask=None):
         """
-        collision_mask: (B, Total_Neg_Size) 为 True 的地方表示该负样本是用户看过的，需要屏蔽
+        collision_mask: (B, N_neg) InfoNCE 假负样本屏蔽
+        bpr_collision_mask: (B, Hard_Size) BPR 假负样本屏蔽
         """
         user_emb = self.user_tower(user_features) # (B, D)
         item_emb = self.item_tower(item_features) # (B, D)
@@ -119,6 +121,9 @@ class DualTowerModel(nn.Module):
         # 2. BPR Loss
         hard_scores = torch.matmul(user_emb, hard_neg_emb.T) # (B, Hard_Size)
         diff = (pos_scores.view(-1, 1) - hard_scores) * self.bpr_gamma
+        # Mask out false negatives: zero out diff so sigmoid(0)=0.5, no gradient signal
+        if bpr_collision_mask is not None:
+            diff = diff.masked_fill(bpr_collision_mask, 0.0)
         loss_bpr = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
         
         total_loss = self.loss_infonce_weight * loss_infonce + self.loss_bpr_weight * loss_bpr
