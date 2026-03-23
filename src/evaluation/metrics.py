@@ -32,6 +32,30 @@ def ndcg_at_k(actual, predicted, k=50):
             return 1.0 / np.log2(i + 2)
     return 0.0
 
+def hitrate_at_k(actual, predicted, k=10):
+    """
+    HitRate@K: 1 if any actual item appears in top-K, else 0.
+    For leave-one-out evaluation (single target item).
+    """
+    if not isinstance(actual, list):
+        actual = [actual]
+    predicted_k = predicted[:k]
+    return 1.0 if set(actual) & set(predicted_k) else 0.0
+
+def mrr(actual, predicted, k=None):
+    """
+    Mean Reciprocal Rank: 1/rank of the first relevant item.
+    If k is given, only consider top-K predictions.
+    """
+    if not isinstance(actual, list):
+        actual = [actual]
+    actual_set = set(actual)
+    candidates = predicted[:k] if k else predicted
+    for i, p in enumerate(candidates):
+        if p in actual_set:
+            return 1.0 / (i + 1)
+    return 0.0
+
 def auc_score(actual, scores):
     """
     Simplified AUC for ranking.

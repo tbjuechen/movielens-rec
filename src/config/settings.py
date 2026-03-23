@@ -52,7 +52,30 @@ TIME_DECAY_LAMBDA = config['features']['time_decay_lambda']
 CF_TOP_K = config.get('cf', {}).get('top_k', 50)
 CF_WORKERS = config.get('cf', {}).get('cf_workers', 32)
 
-# 7. Merger Weights
+# 7. Ranking Model Settings
+_ranking = config.get('ranking', {})
+RANK_EMBED_DIM = _ranking.get('embed_dim', 16)
+RANK_CONT_BUCKET_SIZE = _ranking.get('cont_bucket_size', 20)
+RANK_PRETRAINED_EMB_DIM = _ranking.get('pretrained_emb_dim', 128)
+RANK_CROSS_LAYERS = _ranking.get('cross_layers', 3)
+RANK_DEEP_DIMS = _ranking.get('deep_dims', [256, 128])
+RANK_DROPOUT = _ranking.get('dropout', 0.1)
+RANK_NUM_EXPERTS = _ranking.get('num_experts', 4)
+RANK_EXPERT_DIM = _ranking.get('expert_dim', 128)
+RANK_TOWER_DIMS = _ranking.get('tower_dims', [64, 32])
+RANK_BATCH_SIZE = _ranking.get('batch_size', 4096)
+RANK_LEARNING_RATE = _ranking.get('learning_rate', 0.001)
+RANK_EPOCHS = _ranking.get('epochs', 10)
+RANK_NEG_SAMPLE_RATIO = _ranking.get('neg_sample_ratio', 3)
+RANK_NUM_WORKERS = _ranking.get('num_workers', 8)
+RANK_CTR_BCE_WEIGHT = _ranking.get('ctr_bce_weight', 1.0)
+RANK_CTR_BPR_WEIGHT = _ranking.get('ctr_bpr_weight', 0.3)
+RANK_RATING_MSE_WEIGHT = _ranking.get('rating_mse_weight', 0.5)
+RANK_CTR_ALPHA = _ranking.get('ctr_alpha', 1.0)
+RANK_RATING_BETA = _ranking.get('rating_beta', 0.5)
+RANK_EVAL_KS = _ranking.get('eval_ks', [10, 20, 50])
+
+# 8. Merger Weights
 MERGER_WEIGHTS = config.get('merger_weights', {
     'dual_tower': 1.0,
     'item_cf': 1.0,
