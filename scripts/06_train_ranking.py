@@ -150,8 +150,9 @@ def main():
                 pCTR, pRating, ctr_label, rating_label, has_rating
             )
 
-            # Compute task weights
-            task_weights = torch.softmax(log_task_weights, dim=0) * 2
+            # Compute task weights (clamp to min 0.2 to prevent any task from being ignored)
+            task_weights_raw = torch.softmax(log_task_weights, dim=0) * 2
+            task_weights = task_weights_raw.clamp(min=0.2)
 
             # --- GradNorm: compute BEFORE model update (graph still intact) ---
             G_ctr = torch.norm(task_weights[0] * torch.autograd.grad(
