@@ -16,8 +16,9 @@ from src.config.settings import (
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS,
-    RANK_EMBED_DIM, RANK_CONT_BUCKET_SIZE, RANK_PRETRAINED_EMB_DIM,
-    RANK_CROSS_LAYERS, RANK_DEEP_DIMS, RANK_DROPOUT,
+    RANK_ID_EMBED_DIM, RANK_GENRE_EMBED_DIM, RANK_CONT_EMBED_DIM,
+    RANK_CONT_BUCKET_SIZE, RANK_PRETRAINED_EMB_DIM,
+    RANK_CROSS_LAYERS, RANK_DROPOUT,
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_CTR_ALPHA, RANK_RATING_BETA, RANK_EVAL_KS,
 )
@@ -143,11 +144,12 @@ def evaluate(test_mode=False):
     # 5. Load ranking model
     ranking_model = RankingModel(
         vocab_sizes=encoder.vocab_sizes,
-        embed_dim=RANK_EMBED_DIM,
+        id_embed_dim=RANK_ID_EMBED_DIM,
+        genre_embed_dim=RANK_GENRE_EMBED_DIM,
+        cont_embed_dim=RANK_CONT_EMBED_DIM,
         cont_bucket_size=RANK_CONT_BUCKET_SIZE,
         pretrained_emb_dim=RANK_PRETRAINED_EMB_DIM,
         cross_layers=RANK_CROSS_LAYERS,
-        deep_dims=RANK_DEEP_DIMS,
         dropout=RANK_DROPOUT,
         num_experts=RANK_NUM_EXPERTS,
         expert_dim=RANK_EXPERT_DIM,

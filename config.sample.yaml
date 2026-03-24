@@ -47,12 +47,14 @@ merger_weights:
 
 # 4. Ranking Model Settings
 ranking:
-  embed_dim: 16
+  # Mixed embedding dimensions (D = 6 * N^0.25, clamped to power of 2)
+  id_embed_dim: 64           # user_id, item_id (high cardinality ~330K/87K)
+  genre_embed_dim: 8         # genre features (low cardinality ~20)
+  cont_embed_dim: 8          # bucketized continuous features (20 bins)
   cont_bucket_size: 20
-  pretrained_emb_dim: 128
+  pretrained_emb_dim: 128    # dual-tower embeddings (direct concat, no projection)
   # DCNv2
   cross_layers: 3
-  deep_dims: [256, 128]
   dropout: 0.1
   # MMoE
   num_experts: 4

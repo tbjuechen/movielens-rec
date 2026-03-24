@@ -14,35 +14,39 @@ def _quantile_bounds(values, n_buckets):
 
 
 class EmbeddingLayer(nn.Module):
-    """Transforms 14 feature fields into fixed-dim embeddings.
+    """Transforms 14 feature fields into mixed-dimension embeddings.
 
-    Sparse features → Embedding lookup
-    Continuous features → quantile bucketization → Embedding
-    Pre-trained dense → Linear projection
+    ID features (user/item) → 64d embedding
+    Genre features → 8d embedding (masked mean pooling)
+    Continuous features → quantile bucketization → 8d embedding
+    Pre-trained dense → 128d direct pass-through (no projection)
     """
 
-    def __init__(self, vocab_sizes, embed_dim, cont_bucket_size,
-                 pretrained_emb_dim, bucket_boundaries=None):
+    def __init__(self, vocab_sizes, id_embed_dim=64, genre_embed_dim=8,
+                 cont_embed_dim=8, cont_bucket_size=20,
+                 pretrained_emb_dim=128, bucket_boundaries=None):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.pretrained_emb_dim = pretrained_emb_dim
 
-        # 1-2. Sparse ID embeddings
-        self.user_emb = nn.Embedding(vocab_sizes['userId'] + 1, embed_dim, padding_idx=0)
-        self.item_emb = nn.Embedding(vocab_sizes['movieId'] + 1, embed_dim, padding_idx=0)
-        self.genre_emb = nn.Embedding(vocab_sizes['genres'] + 1, embed_dim, padding_idx=0)
+        # 1-2. Sparse ID embeddings (64d)
+        self.user_emb = nn.Embedding(vocab_sizes['userId'] + 1, id_embed_dim, padding_idx=0)
+        self.item_emb = nn.Embedding(vocab_sizes['movieId'] + 1, id_embed_dim, padding_idx=0)
 
-        # 5-11. Continuous bucket embeddings
+        # 3-4. Genre embeddings (8d)
+        self.genre_emb = nn.Embedding(vocab_sizes['genres'] + 1, genre_embed_dim, padding_idx=0)
+
+        # 5-11. Continuous bucket embeddings (8d)
         cont_features = [
             'user_avg_rating', 'user_activity',
             'item_release_year', 'item_avg_rating', 'item_revenue',
             'item_budget', 'item_vote_count',
         ]
         self.bucket_embs = nn.ModuleDict({
-            name: nn.Embedding(cont_bucket_size, embed_dim)
+            name: nn.Embedding(cont_bucket_size, cont_embed_dim)
             for name in cont_features
         })
-        # recall_sim_score also gets bucketized
-        self.bucket_embs['recall_sim_score'] = nn.Embedding(cont_bucket_size, embed_dim)
+        # 14. recall_sim_score also gets bucketized (8d)
+        self.bucket_embs['recall_sim_score'] = nn.Embedding(cont_bucket_size, cont_embed_dim)
 
         # Register bucket boundaries as buffers
         default_bounds = torch.linspace(0, 1, cont_bucket_size + 1)[1:-1]
@@ -55,26 +59,26 @@ class EmbeddingLayer(nn.Module):
             else:
                 self.register_buffer(f'{name}_bounds', default_bounds.clone())
 
-        # 12-13. Pre-trained embedding projections
-        self.user_emb_proj = nn.Linear(pretrained_emb_dim, embed_dim)
-        self.item_emb_proj = nn.Linear(pretrained_emb_dim, embed_dim)
+        # Output dim: 2*id + 2*genre + 8*cont + 2*pretrained
+        self.output_dim = (2 * id_embed_dim + 2 * genre_embed_dim
+                           + 8 * cont_embed_dim + 2 * pretrained_emb_dim)
 
     def forward(self, features):
-        """Returns (B, num_fields * embed_dim) concatenated embedding vector."""
+        """Returns (B, output_dim) concatenated embedding vector."""
         embs = []
 
-        # 1-2. Sparse IDs
+        # 1-2. Sparse IDs (64d each)
         embs.append(self.user_emb(features['user_id']))
         embs.append(self.item_emb(features['item_id']))
 
-        # 3-4. Genre pooling (masked mean)
+        # 3-4. Genre pooling — masked mean (8d each)
         for key in ('user_top_genres', 'item_genres'):
             g_emb = self.genre_emb(features[key])
             mask = (features[key] > 0).float().unsqueeze(-1)
             pooled = (g_emb * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
             embs.append(pooled)
 
-        # 5-11. Continuous features (bucketized)
+        # 5-11. Continuous features — bucketized (8d each)
         cont_keys = [
             'user_avg_rating', 'user_activity',
             'item_release_year', 'item_avg_rating', 'item_revenue',
@@ -85,42 +89,39 @@ class EmbeddingLayer(nn.Module):
             bucket_idx = torch.bucketize(features[name], bounds)
             embs.append(self.bucket_embs[name](bucket_idx))
 
-        # 12-13. Pre-trained embedding projections
-        embs.append(self.user_emb_proj(features['user_emb_pretrained']))
-        embs.append(self.item_emb_proj(features['item_emb_pretrained']))
+        # 12-13. Pre-trained embeddings — direct pass-through (128d each)
+        embs.append(features['user_emb_pretrained'])
+        embs.append(features['item_emb_pretrained'])
 
-        # 14. Recall similarity score (bucketized)
+        # 14. Recall similarity score — bucketized (8d)
         sim_score = (features['user_emb_pretrained'] * features['item_emb_pretrained']).sum(dim=-1)
-        sim_score = sim_score / features['user_emb_pretrained'].shape[-1]
+        sim_score = sim_score / self.pretrained_emb_dim
         bounds = getattr(self, 'recall_sim_score_bounds')
         sim_bucket = torch.bucketize(sim_score, bounds)
         embs.append(self.bucket_embs['recall_sim_score'](sim_bucket))
 
-        return torch.cat(embs, dim=-1)  # (B, 14 * embed_dim)
+        return torch.cat(embs, dim=-1)  # (B, output_dim)
 
 
 class RankingModel(nn.Module):
     """DCNv2 + MMoE ranking model with dual objectives (pCTR + pRating)."""
 
-    NUM_FIELDS = 14
-
-    def __init__(self, vocab_sizes, embed_dim=16, cont_bucket_size=20,
+    def __init__(self, vocab_sizes, id_embed_dim=64, genre_embed_dim=8,
+                 cont_embed_dim=8, cont_bucket_size=20,
                  pretrained_emb_dim=128, cross_layers=3,
-                 deep_dims=None, dropout=0.1,
+                 dropout=0.1,
                  num_experts=4, expert_dim=128,
                  tower_dims=None, bucket_boundaries=None):
         super().__init__()
-        if deep_dims is None:
-            deep_dims = [256, 128]
         if tower_dims is None:
             tower_dims = [64, 32]
 
-        input_dim = self.NUM_FIELDS * embed_dim
-
         self.embedding_layer = EmbeddingLayer(
-            vocab_sizes, embed_dim, cont_bucket_size,
-            pretrained_emb_dim, bucket_boundaries
+            vocab_sizes, id_embed_dim, genre_embed_dim, cont_embed_dim,
+            cont_bucket_size, pretrained_emb_dim, bucket_boundaries
         )
+        input_dim = self.embedding_layer.output_dim
+
         self.cross_net = CrossNetV2(input_dim, cross_layers)
         self.mmoe = MMoE(input_dim, num_experts, expert_dim, num_tasks=2)
 
@@ -129,8 +130,8 @@ class RankingModel(nn.Module):
         self.rating_tower = TaskTower(tower_input_dim, tower_dims, use_sigmoid=False)
 
     def forward(self, features):
-        emb = self.embedding_layer(features)       # (B, 14*d)
-        cross_out = self.cross_net(emb)             # (B, 14*d)
+        emb = self.embedding_layer(features)       # (B, input_dim)
+        cross_out = self.cross_net(emb)             # (B, input_dim)
         ctr_expert, rat_expert = self.mmoe(emb)     # (B, expert_dim) each
 
         pCTR = self.ctr_tower(torch.cat([cross_out, ctr_expert], dim=-1))
