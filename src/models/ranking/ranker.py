@@ -14,19 +14,17 @@ def _quantile_bounds(values, n_buckets):
 
 
 class EmbeddingLayer(nn.Module):
-    """Transforms 14 feature fields into mixed-dimension embeddings.
+    """Transforms 11 feature fields into mixed-dimension embeddings.
 
     ID features (user/item) → 64d embedding
     Genre features → 8d embedding (masked mean pooling)
     Continuous features → quantile bucketization → 8d embedding
-    Pre-trained dense → 128d direct pass-through (no projection)
     """
 
     def __init__(self, vocab_sizes, id_embed_dim=64, genre_embed_dim=8,
                  cont_embed_dim=8, cont_bucket_size=20,
-                 pretrained_emb_dim=128, bucket_boundaries=None):
+                 bucket_boundaries=None):
         super().__init__()
-        self.pretrained_emb_dim = pretrained_emb_dim
 
         # 1-2. Sparse ID embeddings (64d)
         self.user_emb = nn.Embedding(vocab_sizes['userId'] + 1, id_embed_dim, padding_idx=0)
@@ -45,12 +43,10 @@ class EmbeddingLayer(nn.Module):
             name: nn.Embedding(cont_bucket_size, cont_embed_dim)
             for name in cont_features
         })
-        # 14. recall_sim_score also gets bucketized (8d)
-        self.bucket_embs['recall_sim_score'] = nn.Embedding(cont_bucket_size, cont_embed_dim)
 
         # Register bucket boundaries as buffers
         default_bounds = torch.linspace(0, 1, cont_bucket_size + 1)[1:-1]
-        for name in cont_features + ['recall_sim_score']:
+        for name in cont_features:
             if bucket_boundaries and name in bucket_boundaries:
                 self.register_buffer(
                     f'{name}_bounds',
@@ -59,9 +55,8 @@ class EmbeddingLayer(nn.Module):
             else:
                 self.register_buffer(f'{name}_bounds', default_bounds.clone())
 
-        # Output dim: 2*id + 2*genre + 8*cont + 2*pretrained
-        self.output_dim = (2 * id_embed_dim + 2 * genre_embed_dim
-                           + 8 * cont_embed_dim + 2 * pretrained_emb_dim)
+        # Output dim: 2*id + 2*genre + 7*cont
+        self.output_dim = 2 * id_embed_dim + 2 * genre_embed_dim + 7 * cont_embed_dim
 
     def forward(self, features):
         """Returns (B, output_dim) concatenated embedding vector."""
@@ -89,17 +84,6 @@ class EmbeddingLayer(nn.Module):
             bucket_idx = torch.bucketize(features[name], bounds)
             embs.append(self.bucket_embs[name](bucket_idx))
 
-        # 12-13. Pre-trained embeddings — direct pass-through (128d each)
-        embs.append(features['user_emb_pretrained'])
-        embs.append(features['item_emb_pretrained'])
-
-        # 14. Recall similarity score — bucketized (8d)
-        sim_score = (features['user_emb_pretrained'] * features['item_emb_pretrained']).sum(dim=-1)
-        sim_score = sim_score / self.pretrained_emb_dim
-        bounds = getattr(self, 'recall_sim_score_bounds')
-        sim_bucket = torch.bucketize(sim_score, bounds)
-        embs.append(self.bucket_embs['recall_sim_score'](sim_bucket))
-
         return torch.cat(embs, dim=-1)  # (B, output_dim)
 
 
@@ -108,8 +92,7 @@ class RankingModel(nn.Module):
 
     def __init__(self, vocab_sizes, id_embed_dim=64, genre_embed_dim=8,
                  cont_embed_dim=8, cont_bucket_size=20,
-                 pretrained_emb_dim=128, cross_layers=3,
-                 dropout=0.1,
+                 cross_layers=3, dropout=0.1,
                  num_experts=4, expert_dim=128,
                  tower_dims=None, bucket_boundaries=None):
         super().__init__()
@@ -118,7 +101,7 @@ class RankingModel(nn.Module):
 
         self.embedding_layer = EmbeddingLayer(
             vocab_sizes, id_embed_dim, genre_embed_dim, cont_embed_dim,
-            cont_bucket_size, pretrained_emb_dim, bucket_boundaries
+            cont_bucket_size, bucket_boundaries
         )
         input_dim = self.embedding_layer.output_dim
 

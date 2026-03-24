@@ -52,7 +52,6 @@ ranking:
   genre_embed_dim: 8         # genre features (low cardinality ~20)
   cont_embed_dim: 8          # bucketized continuous features (20 bins)
   cont_bucket_size: 20
-  pretrained_emb_dim: 128    # dual-tower embeddings (direct concat, no projection)
   # DCNv2
   cross_layers: 3
   dropout: 0.1

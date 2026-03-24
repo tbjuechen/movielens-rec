@@ -17,7 +17,7 @@ from src.config.settings import (
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS,
     RANK_ID_EMBED_DIM, RANK_GENRE_EMBED_DIM, RANK_CONT_EMBED_DIM,
-    RANK_CONT_BUCKET_SIZE, RANK_PRETRAINED_EMB_DIM,
+    RANK_CONT_BUCKET_SIZE,
     RANK_CROSS_LAYERS, RANK_DROPOUT,
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_CTR_ALPHA, RANK_RATING_BETA, RANK_EVAL_KS,
@@ -79,11 +79,7 @@ def evaluate(test_mode=False):
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Device: {device}")
 
-    # 2. Load pretrained embeddings
-    pt_user_emb = np.load(Path(FEATURE_STORE_DIR) / "pretrained_user_emb.npy")
-    pt_item_emb = np.load(Path(FEATURE_STORE_DIR) / "pretrained_item_emb.npy")
-
-    # 3. Load recall models (same as 04_evaluate_e2e.py)
+    # 2. Load recall models (same as 04_evaluate_e2e.py)
     dt_model = DualTowerModel(
         vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU,
         time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA, bpr_margin=BPR_MARGIN,
@@ -148,7 +144,6 @@ def evaluate(test_mode=False):
         genre_embed_dim=RANK_GENRE_EMBED_DIM,
         cont_embed_dim=RANK_CONT_EMBED_DIM,
         cont_bucket_size=RANK_CONT_BUCKET_SIZE,
-        pretrained_emb_dim=RANK_PRETRAINED_EMB_DIM,
         cross_layers=RANK_CROSS_LAYERS,
         dropout=RANK_DROPOUT,
         num_experts=RANK_NUM_EXPERTS,
@@ -265,8 +260,6 @@ def evaluate(test_mode=False):
             'item_revenue': torch.from_numpy(item_revenue[cand_arr]).float().to(device),
             'item_budget': torch.from_numpy(item_budget[cand_arr]).float().to(device),
             'item_vote_count': torch.from_numpy(item_vote_count[cand_arr]).float().to(device),
-            'user_emb_pretrained': torch.from_numpy(np.tile(pt_user_emb[uid], (n_cand, 1))).to(device),
-            'item_emb_pretrained': torch.from_numpy(pt_item_emb[cand_arr]).to(device),
         }
 
         with torch.no_grad():

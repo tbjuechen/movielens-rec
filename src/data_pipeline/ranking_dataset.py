@@ -14,15 +14,12 @@ class RankingDataset(Dataset):
     Features are looked up via pre-allocated numpy arrays indexed by raw IDs.
     """
 
-    def __init__(self, samples, user_profile_df, item_profile_df,
-                 pretrained_user_emb, pretrained_item_emb):
+    def __init__(self, samples, user_profile_df, item_profile_df):
         """
         Args:
             samples: ndarray of shape (N, 5) — [userId, movieId, ctr_label, rating_norm, has_rating]
             user_profile_df: DataFrame with encoded user features
             item_profile_df: DataFrame with encoded item features
-            pretrained_user_emb: ndarray (max_uid+1, emb_dim)
-            pretrained_item_emb: ndarray (max_iid+1, emb_dim)
         """
         self.samples = samples.astype(np.float32)
         self.n = len(samples)
@@ -82,10 +79,6 @@ class RankingDataset(Dataset):
         self.item_genres = torch.from_numpy(item_genres)
         self.item_encoded_id = torch.from_numpy(item_encoded_id)
 
-        # --- Pre-trained embeddings ---
-        self.pt_user_emb = torch.from_numpy(pretrained_user_emb.astype(np.float32))
-        self.pt_item_emb = torch.from_numpy(pretrained_item_emb.astype(np.float32))
-
     def __len__(self):
         return self.n
 
@@ -107,9 +100,6 @@ class RankingDataset(Dataset):
             'item_revenue': self.item_revenue[iid],
             'item_budget': self.item_budget[iid],
             'item_vote_count': self.item_vote_count[iid],
-            # Pre-trained dense
-            'user_emb_pretrained': self.pt_user_emb[uid],
-            'item_emb_pretrained': self.pt_item_emb[iid],
             # Labels (pre-converted tensors, zero-copy index)
             'ctr_label': self.ctr_labels[idx],
             'rating_label': self.rating_labels[idx],
