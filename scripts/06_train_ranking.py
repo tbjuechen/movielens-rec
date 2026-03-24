@@ -19,7 +19,7 @@ from src.config.settings import (
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_BATCH_SIZE, RANK_LEARNING_RATE, RANK_EPOCHS,
     RANK_NEG_SAMPLE_RATIO, RANK_NUM_WORKERS,
-    RANK_CTR_BCE_WEIGHT, RANK_CTR_BPR_WEIGHT, RANK_RATING_MSE_WEIGHT,
+    RANK_GRADNORM_ALPHA,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
@@ -130,7 +130,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # 7. Training loop
+    # 7. Training loop with GradNorm
     optimizer = optim.Adam(model.parameters(), lr=RANK_LEARNING_RATE)
     scheduler = OneCycleLR(
         optimizer,
@@ -142,10 +142,16 @@ def main():
         final_div_factor=100,    # end_lr = max_lr / 1000
     )
 
+    # GradNorm: learnable task weights
+    log_task_weights = torch.zeros(2, requires_grad=True, device=device)
+    weight_optimizer = optim.Adam([log_task_weights], lr=0.01)
+    initial_losses = None
+    shared_layer = model.cross_net.linears[-1].weight  # shared layer for grad norm
+
     best_loss = float('inf')
     for epoch in range(RANK_EPOCHS):
         model.train()
-        epoch_losses = {'total': [], 'bce': [], 'bpr': [], 'mse': []}
+        epoch_losses = {'total': [], 'bce': [], 'mse': [], 'w_ctr': [], 'w_mse': []}
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{RANK_EPOCHS}")
 
         for batch in pbar:
@@ -155,35 +161,67 @@ def main():
             rating_label = batch['rating_label'].to(device, non_blocking=True)
             has_rating = batch['has_rating'].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            # Forward
             pCTR, pRating = model(features)
-            total, l_bce, l_bpr, l_mse = model.compute_loss(
-                pCTR, pRating, ctr_label, rating_label, has_rating,
-                RANK_CTR_BCE_WEIGHT, RANK_CTR_BPR_WEIGHT, RANK_RATING_MSE_WEIGHT
+            loss_bce, loss_mse = model.compute_loss(
+                pCTR, pRating, ctr_label, rating_label, has_rating
             )
-            total.backward()
+
+            # Weighted total loss
+            task_weights = torch.softmax(log_task_weights, dim=0) * 2
+            total_loss = task_weights[0] * loss_bce + task_weights[1] * loss_mse
+
+            # Update model parameters
+            optimizer.zero_grad()
+            total_loss.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
 
-            epoch_losses['total'].append(total.item())
-            epoch_losses['bce'].append(l_bce.item())
-            epoch_losses['bpr'].append(l_bpr.item())
-            epoch_losses['mse'].append(l_mse.item())
+            # GradNorm: update task weights
+            G_ctr = torch.norm(task_weights[0] * torch.autograd.grad(
+                loss_bce, shared_layer, retain_graph=True, create_graph=True)[0])
+            G_mse = torch.norm(task_weights[1] * torch.autograd.grad(
+                loss_mse, shared_layer, create_graph=True)[0])
+            G_avg = (G_ctr + G_mse) / 2
+
+            with torch.no_grad():
+                if initial_losses is None:
+                    initial_losses = [loss_bce.item(), loss_mse.item()]
+                r_ctr = loss_bce.item() / max(initial_losses[0], 1e-8)
+                r_mse = loss_mse.item() / max(initial_losses[1], 1e-8)
+                r_avg = (r_ctr + r_mse) / 2
+                target_ctr = G_avg * (r_ctr / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
+                target_mse = G_avg * (r_mse / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
+
+            gradnorm_loss = torch.abs(G_ctr - target_ctr) + torch.abs(G_mse - target_mse)
+            weight_optimizer.zero_grad()
+            gradnorm_loss.backward()
+            weight_optimizer.step()
+
+            w_ctr = task_weights[0].item()
+            w_mse = task_weights[1].item()
+            epoch_losses['total'].append(total_loss.item())
+            epoch_losses['bce'].append(loss_bce.item())
+            epoch_losses['mse'].append(loss_mse.item())
+            epoch_losses['w_ctr'].append(w_ctr)
+            epoch_losses['w_mse'].append(w_mse)
 
             pbar.set_postfix({
-                'loss': f"{total.item():.4f}",
-                'BCE': f"{l_bce.item():.4f}",
-                'BPR': f"{l_bpr.item():.4f}",
-                'MSE': f"{l_mse.item():.4f}",
+                'loss': f"{total_loss.item():.4f}",
+                'BCE': f"{loss_bce.item():.4f}",
+                'MSE': f"{loss_mse.item():.4f}",
+                'w_ctr': f"{w_ctr:.2f}",
+                'w_mse': f"{w_mse:.2f}",
                 'LR': f"{scheduler.get_last_lr()[0]:.6f}",
             })
 
         avg_loss = np.mean(epoch_losses['total'])
         print(f"Epoch {epoch + 1} avg: loss={avg_loss:.4f} "
               f"BCE={np.mean(epoch_losses['bce']):.4f} "
-              f"BPR={np.mean(epoch_losses['bpr']):.4f} "
-              f"MSE={np.mean(epoch_losses['mse']):.4f}")
+              f"MSE={np.mean(epoch_losses['mse']):.4f} "
+              f"w_ctr={np.mean(epoch_losses['w_ctr']):.2f} "
+              f"w_mse={np.mean(epoch_losses['w_mse']):.2f}")
 
         if avg_loss < best_loss:
             best_loss = avg_loss

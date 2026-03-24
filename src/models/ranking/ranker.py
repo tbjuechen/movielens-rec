@@ -138,33 +138,14 @@ class RankingModel(nn.Module):
         pRating = self.rating_tower(torch.cat([cross_out, rat_expert], dim=-1))
         return pCTR, pRating
 
-    def compute_loss(self, pCTR, pRating, ctr_label, rating_label, has_rating,
-                     ctr_bce_weight=1.0, ctr_bpr_weight=0.3, rating_mse_weight=0.5):
+    def compute_loss(self, pCTR, pRating, ctr_label, rating_label, has_rating):
+        """Returns individual task losses (no weighting — handled by GradNorm externally)."""
         # 1. BCE for CTR
         loss_bce = F.binary_cross_entropy(pCTR, ctr_label, reduction='mean')
 
-        # 2. BPR auxiliary: batch-hard pairwise ranking
-        # Each positive pairs with the hardest negative (highest-scored neg in batch)
-        loss_bpr = torch.tensor(0.0, device=pCTR.device)
-        pos_mask = ctr_label > 0.5
-        neg_mask = ~pos_mask
-        if pos_mask.any() and neg_mask.any():
-            pos_scores = pCTR[pos_mask]
-            neg_scores = pCTR[neg_mask]
-            # Sort negatives descending → hardest first
-            hard_neg_sorted = neg_scores.sort(descending=True).values
-            n_pos = len(pos_scores)
-            n_neg = len(hard_neg_sorted)
-            # Repeat hard negatives if fewer than positives
-            if n_neg < n_pos:
-                repeats = (n_pos + n_neg - 1) // n_neg
-                hard_neg_sorted = hard_neg_sorted.repeat(repeats)
-            loss_bpr = -F.logsigmoid(pos_scores - hard_neg_sorted[:n_pos]).mean()
-
-        # 3. MSE for Rating (masked: only on interacted items with real ratings)
+        # 2. MSE for Rating (masked: only on interacted items with real ratings)
         loss_mse = torch.tensor(0.0, device=pRating.device)
         if has_rating.any():
             loss_mse = F.mse_loss(pRating[has_rating], rating_label[has_rating])
 
-        total = ctr_bce_weight * loss_bce + ctr_bpr_weight * loss_bpr + rating_mse_weight * loss_mse
-        return total, loss_bce, loss_bpr, loss_mse
+        return loss_bce, loss_mse
