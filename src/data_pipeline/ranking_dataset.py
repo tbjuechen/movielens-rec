@@ -109,7 +109,7 @@ class RankingDataset(Dataset):
             # Labels
             'ctr_label': torch.tensor(ctr_label, dtype=torch.float32),
             'rating_label': torch.tensor(rating_label, dtype=torch.float32),
-            'has_rating': torch.tensor(has_rating, dtype=torch.bool),
+            'has_rating': torch.tensor(has_rating > 0.5, dtype=torch.bool),
         }
 
 

@@ -50,28 +50,34 @@ def main():
     print("=== Training Ranking Model (DCNv2 + MMoE) ===")
 
     # 1. Load data
+    print("[1/7] Loading data...")
     train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
     item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
+    print(f"  train={len(train_data):,}, users={len(user_profile):,}, items={len(item_profile):,}")
 
+    print("[2/7] Encoding features...")
     encoder = FeatureEncoder(FEATURE_STORE_DIR)
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
 
     # 2. Load pretrained embeddings
+    print("[3/7] Loading pretrained embeddings...")
     pt_user_emb = np.load(Path(FEATURE_STORE_DIR) / "pretrained_user_emb.npy")
     pt_item_emb = np.load(Path(FEATURE_STORE_DIR) / "pretrained_item_emb.npy")
-    print(f"Pretrained embeddings: user {pt_user_emb.shape}, item {pt_item_emb.shape}")
+    print(f"  user {pt_user_emb.shape}, item {pt_item_emb.shape}")
 
     # 3. Build training samples
+    print("[4/7] Building training samples...")
     all_item_ids = item_profile['movieId'].values
     samples = build_ranking_samples(train_data, all_item_ids,
                                     neg_sample_ratio=RANK_NEG_SAMPLE_RATIO, seed=42)
     n_pos = int((samples[:, 2] > 0.5).sum())
     n_neg = len(samples) - n_pos
-    print(f"Training samples: {len(samples)} (pos={n_pos}, neg={n_neg})")
+    print(f"  total={len(samples):,} (pos={n_pos:,}, neg={n_neg:,})")
 
     # 4. Compute quantile bucket boundaries from training profiles
+    print("[5/7] Computing bucket boundaries...")
     bucket_boundaries = {
         'user_avg_rating': _quantile_bounds(user_profile['avg_rating_norm'].values, RANK_CONT_BUCKET_SIZE),
         'user_activity': _quantile_bounds(user_profile['activity_norm'].values, RANK_CONT_BUCKET_SIZE),
@@ -89,13 +95,11 @@ def main():
     n_sample = min(100000, len(valid_users) * 10)
     sample_uids = rng.choice(valid_users, n_sample)
     sample_iids = rng.choice(valid_items, n_sample)
-    sim_scores = np.array([
-        np.dot(pt_user_emb[u], pt_item_emb[i]) / RANK_PRETRAINED_EMB_DIM
-        for u, i in zip(sample_uids, sample_iids)
-    ], dtype=np.float32)
+    sim_scores = (pt_user_emb[sample_uids] * pt_item_emb[sample_iids]).sum(axis=1) / RANK_PRETRAINED_EMB_DIM
     bucket_boundaries['recall_sim_score'] = _quantile_bounds(sim_scores, RANK_CONT_BUCKET_SIZE)
 
     # 5. Create dataset & dataloader
+    print("[6/7] Creating dataset & dataloader...")
     dataset = RankingDataset(samples, user_profile, item_profile, pt_user_emb, pt_item_emb)
     dataloader = DataLoader(
         dataset, batch_size=RANK_BATCH_SIZE, shuffle=True,
@@ -104,6 +108,7 @@ def main():
     )
 
     # 6. Build model
+    print("[7/7] Building model...")
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Device: {device}")
 
