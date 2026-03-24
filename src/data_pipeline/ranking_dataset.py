@@ -27,6 +27,13 @@ class RankingDataset(Dataset):
         self.samples = samples.astype(np.float32)
         self.n = len(samples)
 
+        # --- Pre-convert labels to tensors (avoid per-sample torch.tensor overhead) ---
+        self.sample_uids = samples[:, 0].astype(np.int64)
+        self.sample_iids = samples[:, 1].astype(np.int64)
+        self.ctr_labels = torch.from_numpy(samples[:, 2].astype(np.float32))
+        self.rating_labels = torch.from_numpy(samples[:, 3].astype(np.float32))
+        self.has_ratings = torch.from_numpy((samples[:, 4] > 0.5).astype(np.bool_))
+
         max_u = int(user_profile_df['userId'].max())
         max_i = int(item_profile_df['movieId'].max())
 
@@ -83,11 +90,8 @@ class RankingDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        uid = int(self.samples[idx, 0])
-        iid = int(self.samples[idx, 1])
-        ctr_label = self.samples[idx, 2]
-        rating_label = self.samples[idx, 3]
-        has_rating = self.samples[idx, 4]
+        uid = self.sample_uids[idx]
+        iid = self.sample_iids[idx]
 
         return {
             # Sparse
@@ -106,10 +110,10 @@ class RankingDataset(Dataset):
             # Pre-trained dense
             'user_emb_pretrained': self.pt_user_emb[uid],
             'item_emb_pretrained': self.pt_item_emb[iid],
-            # Labels
-            'ctr_label': torch.tensor(ctr_label, dtype=torch.float32),
-            'rating_label': torch.tensor(rating_label, dtype=torch.float32),
-            'has_rating': torch.tensor(has_rating > 0.5, dtype=torch.bool),
+            # Labels (pre-converted tensors, zero-copy index)
+            'ctr_label': self.ctr_labels[idx],
+            'rating_label': self.rating_labels[idx],
+            'has_rating': self.has_ratings[idx],
         }
 
 

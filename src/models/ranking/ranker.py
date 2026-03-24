@@ -143,17 +143,23 @@ class RankingModel(nn.Module):
         # 1. BCE for CTR
         loss_bce = F.binary_cross_entropy(pCTR, ctr_label, reduction='mean')
 
-        # 2. BPR auxiliary: within-batch pairwise ranking
+        # 2. BPR auxiliary: batch-hard pairwise ranking
+        # Each positive pairs with the hardest negative (highest-scored neg in batch)
         loss_bpr = torch.tensor(0.0, device=pCTR.device)
         pos_mask = ctr_label > 0.5
         neg_mask = ~pos_mask
         if pos_mask.any() and neg_mask.any():
             pos_scores = pCTR[pos_mask]
             neg_scores = pCTR[neg_mask]
-            n_pairs = min(len(pos_scores), len(neg_scores))
-            # Shuffle negatives for random pairing
-            perm = torch.randperm(len(neg_scores), device=pCTR.device)[:n_pairs]
-            loss_bpr = -F.logsigmoid(pos_scores[:n_pairs] - neg_scores[perm]).mean()
+            # Sort negatives descending → hardest first
+            hard_neg_sorted = neg_scores.sort(descending=True).values
+            n_pos = len(pos_scores)
+            n_neg = len(hard_neg_sorted)
+            # Repeat hard negatives if fewer than positives
+            if n_neg < n_pos:
+                repeats = (n_pos + n_neg - 1) // n_neg
+                hard_neg_sorted = hard_neg_sorted.repeat(repeats)
+            loss_bpr = -F.logsigmoid(pos_scores - hard_neg_sorted[:n_pos]).mean()
 
         # 3. MSE for Rating (masked: only on interacted items with real ratings)
         loss_mse = torch.tensor(0.0, device=pRating.device)

@@ -69,7 +69,7 @@ ranking:
   num_workers: 8
   # Loss Weights
   ctr_bce_weight: 1.0
-  ctr_bpr_weight: 0.3
+  ctr_bpr_weight: 1.0
   rating_mse_weight: 0.5
   # Multi-Objective Scoring
   ctr_alpha: 1.0

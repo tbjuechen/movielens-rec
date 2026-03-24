@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -132,7 +132,15 @@ def main():
 
     # 7. Training loop
     optimizer = optim.Adam(model.parameters(), lr=RANK_LEARNING_RATE)
-    scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader) * RANK_EPOCHS, eta_min=1e-6)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=RANK_LEARNING_RATE,
+        total_steps=len(dataloader) * RANK_EPOCHS,
+        pct_start=0.1,          # 10% warmup
+        anneal_strategy='cos',
+        div_factor=10,           # start_lr = max_lr / 10
+        final_div_factor=100,    # end_lr = max_lr / 1000
+    )
 
     best_loss = float('inf')
     for epoch in range(RANK_EPOCHS):
