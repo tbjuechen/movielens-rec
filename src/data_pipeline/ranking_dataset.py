@@ -133,21 +133,15 @@ def build_ranking_samples(train_data, all_item_ids, neg_sample_ratio=3, seed=42)
     neg_explicit['rating_norm'] = neg_explicit['rating'] / 5.0
     neg_explicit['has_rating'] = 1.0
 
-    # Implicit negative samples: random uninteracted items
-    user_interacted = train_data.groupby('userId')['movieId'].apply(set).to_dict()
+    # Implicit negative samples: vectorized random sampling
+    # Collision rate ≈ avg_interactions/n_items ≈ 160/87K ≈ 0.2%, negligible for training
     all_items_arr = np.array(all_item_ids)
     n_implicit = int(len(pos) * neg_sample_ratio)
+    print(f"Sampling {n_implicit:,} implicit negatives (vectorized)...")
 
     implicit_users = rng.choice(pos['userId'].values, size=n_implicit, replace=True)
-    implicit_items = np.empty(n_implicit, dtype=np.int64)
-
-    for i, uid in enumerate(implicit_users):
-        interacted = user_interacted.get(uid, set())
-        while True:
-            candidate = rng.choice(all_items_arr)
-            if candidate not in interacted:
-                implicit_items[i] = candidate
-                break
+    implicit_items = rng.choice(all_items_arr, size=n_implicit)
+    print(f"Implicit negative sampling done.")
 
     neg_implicit = np.column_stack([
         implicit_users,
