@@ -167,22 +167,14 @@ def main():
                 pCTR, pRating, ctr_label, rating_label, has_rating
             )
 
-            # Weighted total loss
+            # Compute task weights
             task_weights = torch.softmax(log_task_weights, dim=0) * 2
-            total_loss = task_weights[0] * loss_bce + task_weights[1] * loss_mse
 
-            # Update model parameters
-            optimizer.zero_grad()
-            total_loss.backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-
-            # GradNorm: update task weights
+            # --- GradNorm: compute BEFORE model update (graph still intact) ---
             G_ctr = torch.norm(task_weights[0] * torch.autograd.grad(
                 loss_bce, shared_layer, retain_graph=True, create_graph=True)[0])
             G_mse = torch.norm(task_weights[1] * torch.autograd.grad(
-                loss_mse, shared_layer, create_graph=True)[0])
+                loss_mse, shared_layer, retain_graph=True, create_graph=True)[0])
             G_avg = (G_ctr + G_mse) / 2
 
             with torch.no_grad():
@@ -196,8 +188,16 @@ def main():
 
             gradnorm_loss = torch.abs(G_ctr - target_ctr) + torch.abs(G_mse - target_mse)
             weight_optimizer.zero_grad()
-            gradnorm_loss.backward()
+            gradnorm_loss.backward(retain_graph=True)
             weight_optimizer.step()
+
+            # --- Model update (use detached weights to avoid double grad) ---
+            total_loss = task_weights[0].detach() * loss_bce + task_weights[1].detach() * loss_mse
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
 
             w_ctr = task_weights[0].item()
             w_mse = task_weights[1].item()
