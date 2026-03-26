@@ -155,12 +155,14 @@ def main():
 
             do_gradnorm = (global_step % GRADNORM_INTERVAL == 0)
 
-            # Forward (AMP autocast)
+            # Forward (AMP autocast for model only; loss in fp32)
             with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
                 pCTR, pRating = model(features)
-                loss_bce, loss_mse = model.compute_loss(
-                    pCTR, pRating, ctr_label, rating_label, has_rating
-                )
+            # BCE is unsafe under autocast — compute loss in fp32
+            pCTR, pRating = pCTR.float(), pRating.float()
+            loss_bce, loss_mse = model.compute_loss(
+                pCTR, pRating, ctr_label, rating_label, has_rating
+            )
 
             # --- GradNorm: only every N steps (expensive due to retain_graph) ---
             if do_gradnorm:
