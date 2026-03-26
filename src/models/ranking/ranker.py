@@ -113,7 +113,7 @@ class RankingModel(nn.Module):
         self.mmoe = MMoE(input_dim, num_experts, expert_dim, num_tasks=2)
 
         tower_input_dim = input_dim + expert_dim  # cross_out + expert_out
-        self.ctr_tower = TaskTower(tower_input_dim, tower_dims, use_sigmoid=True)
+        self.ctr_tower = TaskTower(tower_input_dim, tower_dims, use_sigmoid=False)
         self.rating_tower = TaskTower(tower_input_dim, tower_dims, use_sigmoid=False)
 
     def forward(self, features):
@@ -121,14 +121,14 @@ class RankingModel(nn.Module):
         cross_out = self.cross_net(emb)             # (B, input_dim)
         ctr_expert, rat_expert = self.mmoe(emb)     # (B, expert_dim) each
 
-        pCTR = self.ctr_tower(torch.cat([cross_out, ctr_expert], dim=-1))
+        ctr_logit = self.ctr_tower(torch.cat([cross_out, ctr_expert], dim=-1))
         pRating = self.rating_tower(torch.cat([cross_out, rat_expert], dim=-1))
-        return pCTR, pRating
+        return ctr_logit, pRating
 
-    def compute_loss(self, pCTR, pRating, ctr_label, rating_label, has_rating):
+    def compute_loss(self, ctr_logit, pRating, ctr_label, rating_label, has_rating):
         """Returns individual task losses (no weighting — handled by GradNorm externally)."""
-        # 1. BCE for CTR
-        loss_bce = F.binary_cross_entropy(pCTR, ctr_label, reduction='mean')
+        # 1. BCE with logits for CTR (AMP-safe, numerically stable)
+        loss_bce = F.binary_cross_entropy_with_logits(ctr_logit, ctr_label, reduction='mean')
 
         # 2. MSE for Rating (masked: only on interacted items with real ratings)
         loss_mse = torch.tensor(0.0, device=pRating.device)

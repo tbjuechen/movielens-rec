@@ -263,7 +263,8 @@ def evaluate(test_mode=False):
         }
 
         with torch.no_grad():
-            pCTR, pRating = ranking_model(rank_features)
+            ctr_logit, pRating = ranking_model(rank_features)
+            pCTR = torch.sigmoid(ctr_logit)
             # Final score: pCTR^alpha * pRating^beta (clamp pRating to positive)
             pRating_clamped = pRating.clamp(min=0.01)
             final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
