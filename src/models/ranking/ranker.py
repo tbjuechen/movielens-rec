@@ -7,10 +7,14 @@ from src.models.ranking.modules import CrossNetV2, MMoE, TaskTower
 
 
 def _quantile_bounds(values, n_buckets):
-    """Compute quantile boundaries for continuous feature bucketization."""
+    """Compute quantile boundaries for continuous feature bucketization.
+
+    Always returns exactly (n_buckets - 1) boundaries to ensure consistent
+    buffer shapes across features and between training/evaluation.
+    """
     q = np.linspace(0, 1, n_buckets + 1)[1:-1]
     bounds = np.quantile(values[~np.isnan(values)], q)
-    return np.unique(bounds).astype(np.float32)
+    return bounds.astype(np.float32)
 
 
 class EmbeddingLayer(nn.Module):

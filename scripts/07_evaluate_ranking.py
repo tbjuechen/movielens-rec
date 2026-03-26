@@ -154,7 +154,7 @@ def evaluate(test_mode=False):
     if not ranking_path.exists():
         print(f"ERROR: {ranking_path} not found. Train the ranking model first.")
         return
-    ranking_model.load_state_dict(torch.load(ranking_path, map_location=device))
+    ranking_model.load_state_dict(torch.load(ranking_path, map_location=device, weights_only=True))
     ranking_model.eval()
     print("Loaded ranking model.")
 
