@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import optim
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -115,15 +115,7 @@ def main():
 
     # 7. Training loop with GradNorm
     optimizer = optim.Adam(model.parameters(), lr=RANK_LEARNING_RATE)
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=RANK_LEARNING_RATE,
-        total_steps=len(dataloader) * RANK_EPOCHS,
-        pct_start=0.1,          # 10% warmup
-        anneal_strategy='cos',
-        div_factor=10,           # start_lr = max_lr / 10
-        final_div_factor=100,    # end_lr = max_lr / 1000
-    )
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, min_lr=1e-6)
 
     # GradNorm: learnable task weights
     log_task_weights = torch.zeros(2, requires_grad=True, device=device)
@@ -132,10 +124,14 @@ def main():
     shared_layer = model.cross_net.linears[-1].weight  # shared layer for grad norm
 
     best_loss = float('inf')
-    for epoch in range(RANK_EPOCHS):
+    patience = 3
+    no_improve = 0
+    epoch = 0
+    while True:
+        epoch += 1
         model.train()
         epoch_losses = {'total': [], 'bce': [], 'mse': [], 'w_ctr': [], 'w_mse': []}
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{RANK_EPOCHS}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
             features = {k: v.to(device, non_blocking=True) for k, v in batch.items()
@@ -181,7 +177,6 @@ def main():
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()
 
             w_ctr = task_weights[0].item()
             w_mse = task_weights[1].item()
@@ -197,11 +192,12 @@ def main():
                 'MSE': f"{loss_mse.item():.4f}",
                 'w_ctr': f"{w_ctr:.2f}",
                 'w_mse': f"{w_mse:.2f}",
-                'LR': f"{scheduler.get_last_lr()[0]:.6f}",
+                'LR': f"{optimizer.param_groups[0]['lr']:.6f}",
             })
 
         avg_loss = np.mean(epoch_losses['total'])
-        print(f"Epoch {epoch + 1} avg: loss={avg_loss:.4f} "
+        scheduler.step(avg_loss)
+        print(f"Epoch {epoch} avg: loss={avg_loss:.4f} "
               f"BCE={np.mean(epoch_losses['bce']):.4f} "
               f"MSE={np.mean(epoch_losses['mse']):.4f} "
               f"w_ctr={np.mean(epoch_losses['w_ctr']):.2f} "
@@ -209,9 +205,16 @@ def main():
 
         if avg_loss < best_loss:
             best_loss = avg_loss
+            no_improve = 0
             Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
             print(f"  -> Saved best model (loss={best_loss:.4f})")
+        else:
+            no_improve += 1
+            print(f"  -> No improvement ({no_improve}/{patience})")
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
     print("Ranking model training finished.")
 
