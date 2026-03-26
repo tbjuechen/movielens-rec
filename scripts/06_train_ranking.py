@@ -7,6 +7,7 @@ import torch
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -87,8 +88,8 @@ def main():
     dataset = RankingDataset(samples, user_profile, item_profile)
     dataloader = DataLoader(
         dataset, batch_size=RANK_BATCH_SIZE, shuffle=True,
-        num_workers=RANK_NUM_WORKERS, persistent_workers=(RANK_NUM_WORKERS > 0),
-        pin_memory=True, prefetch_factor=4 if RANK_NUM_WORKERS > 0 else None,
+        num_workers=0,  # collate_fn does vectorized batch lookup; workers add IPC overhead
+        collate_fn=dataset.collate_fn, pin_memory=True,
     )
 
     # 6. Build model
@@ -113,20 +114,28 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # 7. Training loop with GradNorm
+    # 7. Training loop with GradNorm + AMP
     optimizer = optim.Adam(model.parameters(), lr=RANK_LEARNING_RATE)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, min_lr=1e-6)
 
-    # GradNorm: learnable task weights
+    # AMP: mixed precision for GPU throughput
+    use_amp = device.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    amp_dtype = torch.float16 if use_amp else torch.float32
+    print(f"AMP: {'enabled (fp16)' if use_amp else 'disabled'}")
+
+    # GradNorm: learnable task weights (update every N steps to reduce overhead)
     log_task_weights = torch.zeros(2, requires_grad=True, device=device)
     weight_optimizer = optim.Adam([log_task_weights], lr=0.01)
     initial_losses = None
     shared_layer = model.cross_net.linears[-1].weight  # shared layer for grad norm
+    GRADNORM_INTERVAL = 10  # update GradNorm every N steps
 
     best_loss = float('inf')
     patience = 3
     no_improve = 0
     epoch = 0
+    global_step = 0
     while True:
         epoch += 1
         model.train()
@@ -140,44 +149,51 @@ def main():
             rating_label = batch['rating_label'].to(device, non_blocking=True)
             has_rating = batch['has_rating'].to(device, non_blocking=True)
 
-            # Forward
-            pCTR, pRating = model(features)
-            loss_bce, loss_mse = model.compute_loss(
-                pCTR, pRating, ctr_label, rating_label, has_rating
-            )
-
-            # Compute task weights (clamp min 0.2, then renormalize to sum=2)
+            # Compute task weights (clamp min 0.1, then renormalize to sum=2)
             task_weights_raw = torch.softmax(log_task_weights, dim=0).clamp(min=0.1)
             task_weights = task_weights_raw / task_weights_raw.sum() * 2
 
-            # --- GradNorm: compute BEFORE model update (graph still intact) ---
-            G_ctr = torch.norm(task_weights[0] * torch.autograd.grad(
-                loss_bce, shared_layer, retain_graph=True, create_graph=True)[0])
-            G_mse = torch.norm(task_weights[1] * torch.autograd.grad(
-                loss_mse, shared_layer, retain_graph=True, create_graph=True)[0])
-            G_avg = (G_ctr + G_mse) / 2
+            do_gradnorm = (global_step % GRADNORM_INTERVAL == 0)
 
-            with torch.no_grad():
-                if initial_losses is None:
-                    initial_losses = [loss_bce.item(), loss_mse.item()]
-                r_ctr = loss_bce.item() / max(initial_losses[0], 1e-8)
-                r_mse = loss_mse.item() / max(initial_losses[1], 1e-8)
-                r_avg = (r_ctr + r_mse) / 2
-                target_ctr = G_avg * (r_ctr / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
-                target_mse = G_avg * (r_mse / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
+            # Forward (AMP autocast)
+            with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                pCTR, pRating = model(features)
+                loss_bce, loss_mse = model.compute_loss(
+                    pCTR, pRating, ctr_label, rating_label, has_rating
+                )
 
-            gradnorm_loss = torch.abs(G_ctr - target_ctr) + torch.abs(G_mse - target_mse)
-            weight_optimizer.zero_grad()
-            gradnorm_loss.backward(retain_graph=True)
-            weight_optimizer.step()
+            # --- GradNorm: only every N steps (expensive due to retain_graph) ---
+            if do_gradnorm:
+                G_ctr = torch.norm(task_weights[0] * torch.autograd.grad(
+                    loss_bce, shared_layer, retain_graph=True, create_graph=True)[0])
+                G_mse = torch.norm(task_weights[1] * torch.autograd.grad(
+                    loss_mse, shared_layer, retain_graph=True, create_graph=True)[0])
+                G_avg = (G_ctr + G_mse) / 2
+
+                with torch.no_grad():
+                    if initial_losses is None:
+                        initial_losses = [loss_bce.item(), loss_mse.item()]
+                    r_ctr = loss_bce.item() / max(initial_losses[0], 1e-8)
+                    r_mse = loss_mse.item() / max(initial_losses[1], 1e-8)
+                    r_avg = (r_ctr + r_mse) / 2
+                    target_ctr = G_avg * (r_ctr / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
+                    target_mse = G_avg * (r_mse / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
+
+                gradnorm_loss = torch.abs(G_ctr - target_ctr) + torch.abs(G_mse - target_mse)
+                weight_optimizer.zero_grad()
+                gradnorm_loss.backward(retain_graph=True)
+                weight_optimizer.step()
 
             # --- Model update (use detached weights to avoid double grad) ---
             total_loss = task_weights[0].detach() * loss_bce + task_weights[1].detach() * loss_mse
             optimizer.zero_grad()
-            total_loss.backward()
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
+            global_step += 1
             w_ctr = task_weights[0].item()
             w_mse = task_weights[1].item()
             epoch_losses['total'].append(total_loss.item())

@@ -8,25 +8,18 @@ from src.config.settings import (
 
 
 class RankingDataset(Dataset):
-    """Zero-copy PyTorch Dataset for ranking model training.
+    """Vectorized ranking Dataset — __getitem__ returns only an index.
 
-    Samples are (user_id, item_id, ctr_label, rating_label, has_rating) tuples.
-    Features are looked up via pre-allocated numpy arrays indexed by raw IDs.
+    All feature lookups happen in the batch collate_fn via vectorized tensor
+    indexing, eliminating per-sample dict construction and small-tensor overhead.
     """
 
     def __init__(self, samples, user_profile_df, item_profile_df):
-        """
-        Args:
-            samples: ndarray of shape (N, 5) — [userId, movieId, ctr_label, rating_norm, has_rating]
-            user_profile_df: DataFrame with encoded user features
-            item_profile_df: DataFrame with encoded item features
-        """
-        self.samples = samples.astype(np.float32)
         self.n = len(samples)
 
-        # --- Pre-convert labels to tensors (avoid per-sample torch.tensor overhead) ---
-        self.sample_uids = samples[:, 0].astype(np.int64)
-        self.sample_iids = samples[:, 1].astype(np.int64)
+        # Sample-level arrays (indexed by sample idx)
+        self.sample_uids = torch.from_numpy(samples[:, 0].astype(np.int64))
+        self.sample_iids = torch.from_numpy(samples[:, 1].astype(np.int64))
         self.ctr_labels = torch.from_numpy(samples[:, 2].astype(np.float32))
         self.rating_labels = torch.from_numpy(samples[:, 3].astype(np.float32))
         self.has_ratings = torch.from_numpy((samples[:, 4] > 0.5).astype(np.bool_))
@@ -34,7 +27,7 @@ class RankingDataset(Dataset):
         max_u = int(user_profile_df['userId'].max())
         max_i = int(item_profile_df['movieId'].max())
 
-        # --- User side ---
+        # --- User lookup tables (indexed by raw userId) ---
         u_idx = user_profile_df['userId'].values
 
         user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
@@ -52,7 +45,7 @@ class RankingDataset(Dataset):
         self.user_top_genres = torch.from_numpy(user_top_genres)
         self.user_encoded_id = torch.from_numpy(user_encoded_id)
 
-        # --- Item side ---
+        # --- Item lookup tables (indexed by raw movieId) ---
         i_idx = item_profile_df['movieId'].values
 
         item_release_year = np.zeros(max_i + 1, dtype=np.float32)
@@ -83,24 +76,29 @@ class RankingDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        uid = self.sample_uids[idx]
-        iid = self.sample_iids[idx]
+        return idx
+
+    def collate_fn(self, indices):
+        """Batch collate: vectorized tensor indexing instead of per-sample dicts."""
+        idx = torch.tensor(indices, dtype=torch.long)
+        uids = self.sample_uids[idx]
+        iids = self.sample_iids[idx]
 
         return {
             # Sparse
-            'user_id': self.user_encoded_id[uid],
-            'item_id': self.item_encoded_id[iid],
-            'user_top_genres': self.user_top_genres[uid],
-            'item_genres': self.item_genres[iid],
+            'user_id': self.user_encoded_id[uids],
+            'item_id': self.item_encoded_id[iids],
+            'user_top_genres': self.user_top_genres[uids],
+            'item_genres': self.item_genres[iids],
             # Continuous
-            'user_avg_rating': self.user_avg_rating[uid],
-            'user_activity': self.user_activity[uid],
-            'item_release_year': self.item_release_year[iid],
-            'item_avg_rating': self.item_avg_rating[iid],
-            'item_revenue': self.item_revenue[iid],
-            'item_budget': self.item_budget[iid],
-            'item_vote_count': self.item_vote_count[iid],
-            # Labels (pre-converted tensors, zero-copy index)
+            'user_avg_rating': self.user_avg_rating[uids],
+            'user_activity': self.user_activity[uids],
+            'item_release_year': self.item_release_year[iids],
+            'item_avg_rating': self.item_avg_rating[iids],
+            'item_revenue': self.item_revenue[iids],
+            'item_budget': self.item_budget[iids],
+            'item_vote_count': self.item_vote_count[iids],
+            # Labels
             'ctr_label': self.ctr_labels[idx],
             'rating_label': self.rating_labels[idx],
             'has_rating': self.has_ratings[idx],
