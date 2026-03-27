@@ -196,11 +196,14 @@ def main():
             global_step += 1
             w_ctr = task_weights[0].item()
             w_mse = task_weights[1].item()
-            epoch_losses['total'].append(total_loss.item())
-            epoch_losses['bce'].append(loss_bce.item())
-            epoch_losses['mse'].append(loss_mse.item())
-            epoch_losses['w_ctr'].append(w_ctr)
-            epoch_losses['w_mse'].append(w_mse)
+            loss_val = total_loss.item()
+            # Skip NaN batches from AMP overflow in epoch stats
+            if not np.isnan(loss_val):
+                epoch_losses['total'].append(loss_val)
+                epoch_losses['bce'].append(loss_bce.item())
+                epoch_losses['mse'].append(loss_mse.item())
+                epoch_losses['w_ctr'].append(w_ctr)
+                epoch_losses['w_mse'].append(w_mse)
 
             pbar.set_postfix({
                 'loss': f"{total_loss.item():.4f}",

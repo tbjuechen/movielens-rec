@@ -3,6 +3,7 @@ import argparse
 import sys
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import torch
@@ -66,6 +67,7 @@ def evaluate(test_mode=False):
     MERGE_K = 500
     RAW_CHANNEL_K = 300
     CHANNEL_K = 200
+    CF_WORKERS = 32
 
     # 1. Load data & encoder
     val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
@@ -79,7 +81,7 @@ def evaluate(test_mode=False):
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Device: {device}")
 
-    # 2. Load recall models (same as 04_evaluate_e2e.py)
+    # 2. Load recall models
     dt_model = DualTowerModel(
         vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU,
         time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA, bpr_margin=BPR_MARGIN,
@@ -116,7 +118,7 @@ def evaluate(test_mode=False):
     )
     merger = RecallMerger(top_k=MERGE_K)
 
-    # 4. Build FAISS index
+    # 3. Build FAISS index
     index = None
     idx_to_movie_id = []
     if dt_ready:
@@ -137,7 +139,7 @@ def evaluate(test_mode=False):
         idx_to_movie_id = item_profile_sorted['movieId'].values
         print(f"FAISS index: {index.ntotal} items")
 
-    # 5. Load ranking model
+    # 4. Load ranking model
     ranking_model = RankingModel(
         vocab_sizes=encoder.vocab_sizes,
         id_embed_dim=RANK_ID_EMBED_DIM,
@@ -158,7 +160,7 @@ def evaluate(test_mode=False):
     ranking_model.eval()
     print("Loaded ranking model.")
 
-    # 6. Prepare item feature lookup for ranking (indexed by raw movieId)
+    # 5. Prepare item feature lookup for ranking (indexed by raw movieId)
     max_iid = int(item_profile['movieId'].max())
     item_encoded_id = np.zeros(max_iid + 1, dtype=np.int64)
     item_release_year = np.zeros(max_iid + 1, dtype=np.float32)
@@ -177,48 +179,100 @@ def evaluate(test_mode=False):
     item_vote_count[i_idx] = item_profile['vote_count_ml_norm'].values
     item_genres_arr[i_idx] = np.stack(item_profile['tmdb_genres_encoded'].values)
 
-    # 7. Evaluate
+    # 6. Prepare eval users
     val_ground_truth = val_data.groupby('userId')['movieId'].apply(list).to_dict()
     user_profile_indexed = user_profile.set_index('userId')
-    eval_users = list(val_ground_truth.keys())
+    eval_users = [uid for uid in val_ground_truth if uid in user_profile_indexed.index]
     if test_mode:
         eval_users = eval_users[:1000]
+    print(f"Evaluating {len(eval_users)} users...")
 
-    metrics = defaultdict(list)
-    n_recalled = 0
-    n_total = 0
+    # Pre-cache popularity & genre (same for all users or per-genre)
+    pop_candidates = pop_recall.retrieve(k=RAW_CHANNEL_K)
 
-    for uid in tqdm(eval_users, desc="Evaluating"):
-        if uid not in user_profile_indexed.index:
-            continue
-        user_row = user_profile_indexed.loc[uid]
-        actual_items = val_ground_truth[uid]
-        n_total += 1
+    # ================================================================
+    # Phase 1: Batch dual-tower recall (GPU batch + FAISS batch search)
+    # ================================================================
+    dt_results = {}
+    if dt_ready:
+        print("[Phase 1] Batch dual-tower recall...")
+        BATCH = 1024
+        for start in tqdm(range(0, len(eval_users), BATCH), desc="DualTower batch"):
+            batch_uids = eval_users[start:start + BATCH]
+            batch_rows = [user_profile_indexed.loc[uid] for uid in batch_uids]
 
-        # --- Recall ---
-        channels = {}
-        if dt_ready:
-            ts_padded = pad_ts_diff(user_row['history_ts_diff'], USER_HISTORY_MAX_LEN)
+            user_ids = [r['userId_encoded'] for r in batch_rows]
+            avg_ratings = [r['avg_rating_norm'] for r in batch_rows]
+            activities = [r['activity_norm'] for r in batch_rows]
+            histories = [r['history_encoded'] for r in batch_rows]
+            ts_diffs = [pad_ts_diff(r['history_ts_diff'], USER_HISTORY_MAX_LEN) for r in batch_rows]
+            top_genres = [r['top_genres_encoded'] for r in batch_rows]
+
             user_tensor = {
-                'user_id': torch.tensor([user_row['userId_encoded']], dtype=torch.long).to(device),
-                'avg_rating': torch.tensor([user_row['avg_rating_norm']], dtype=torch.float32).to(device),
-                'activity': torch.tensor([user_row['activity_norm']], dtype=torch.float32).to(device),
-                'history': torch.tensor([user_row['history_encoded']], dtype=torch.long).to(device),
-                'history_ts_diff': torch.tensor([ts_padded], dtype=torch.float32).to(device),
-                'top_genres': torch.tensor([user_row['top_genres_encoded']], dtype=torch.long).to(device),
+                'user_id': torch.tensor(user_ids, dtype=torch.long).to(device),
+                'avg_rating': torch.tensor(avg_ratings, dtype=torch.float32).to(device),
+                'activity': torch.tensor(activities, dtype=torch.float32).to(device),
+                'history': torch.tensor(np.array(histories), dtype=torch.long).to(device),
+                'history_ts_diff': torch.tensor(ts_diffs, dtype=torch.float32).to(device),
+                'top_genres': torch.tensor(np.array(top_genres), dtype=torch.long).to(device),
             }
             with torch.no_grad():
-                u_emb, _ = dt_model(user_tensor, None)
-                u_emb = u_emb.cpu().numpy().astype('float32')
-            _, I = index.search(u_emb, RAW_CHANNEL_K)
-            channels['dual_tower'] = [int(idx_to_movie_id[i]) for i in I[0]]
+                u_embs, _ = dt_model(user_tensor, None)
+                u_embs = u_embs.cpu().numpy().astype('float32')
 
-        if icf_ready:
-            history_orig = user_row.get('history')
-            channels['item_cf'] = item_cf.retrieve(list(history_orig), k=RAW_CHANNEL_K) if history_orig is not None else []
-        if ucf_ready:
-            channels['user_cf'] = user_cf.retrieve(uid, k=RAW_CHANNEL_K)
-        channels['popularity'] = pop_recall.retrieve(k=RAW_CHANNEL_K)
+            _, I = index.search(u_embs, RAW_CHANNEL_K)
+            for i, uid in enumerate(batch_uids):
+                dt_results[uid] = [int(idx_to_movie_id[j]) for j in I[i]]
+
+    # ================================================================
+    # Phase 2: Parallel CF recall (thread pool)
+    # ================================================================
+    icf_results = {}
+    ucf_results = {}
+
+    def _item_cf_one(uid):
+        row = user_profile_indexed.loc[uid]
+        history = row.get('history')
+        if history is not None and isinstance(history, (list, np.ndarray)):
+            return uid, item_cf.retrieve(list(history), k=RAW_CHANNEL_K)
+        return uid, []
+
+    def _user_cf_one(uid):
+        return uid, user_cf.retrieve(uid, k=RAW_CHANNEL_K)
+
+    if icf_ready or ucf_ready:
+        print(f"[Phase 2] Parallel CF recall ({CF_WORKERS} threads)...")
+        with ThreadPoolExecutor(max_workers=CF_WORKERS) as pool:
+            if icf_ready:
+                for uid, items in tqdm(pool.map(_item_cf_one, eval_users),
+                                       total=len(eval_users), desc="ItemCF"):
+                    icf_results[uid] = items
+            if ucf_ready:
+                for uid, items in tqdm(pool.map(_user_cf_one, eval_users),
+                                       total=len(eval_users), desc="UserCF"):
+                    ucf_results[uid] = items
+
+    # ================================================================
+    # Phase 3: Merge + Ranking (per-user merge, ranking on GPU)
+    # ================================================================
+    print("[Phase 3] Merge + Ranking...")
+    metrics = defaultdict(list)
+    n_recalled = 0
+    n_total = len(eval_users)
+
+    for uid in tqdm(eval_users, desc="Ranking"):
+        user_row = user_profile_indexed.loc[uid]
+        actual_items = val_ground_truth[uid]
+
+        # --- Assemble recall channels (all pre-computed) ---
+        channels = {}
+        if uid in dt_results:
+            channels['dual_tower'] = dt_results[uid]
+        if uid in icf_results:
+            channels['item_cf'] = icf_results[uid]
+        if uid in ucf_results:
+            channels['user_cf'] = ucf_results[uid]
+        channels['popularity'] = pop_candidates
         top_genres = user_row.get('top_genres')
         if isinstance(top_genres, (list, np.ndarray)):
             channels['genre'] = genre_recall.retrieve(list(top_genres), k=RAW_CHANNEL_K)
@@ -265,7 +319,6 @@ def evaluate(test_mode=False):
         with torch.no_grad():
             ctr_logit, pRating = ranking_model(rank_features)
             pCTR = torch.sigmoid(ctr_logit)
-            # Final score: pCTR^alpha * pRating^beta (clamp pRating to positive)
             pRating_clamped = pRating.clamp(min=0.01)
             final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
             order = final_score.cpu().numpy().argsort()[::-1]
