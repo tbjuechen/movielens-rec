@@ -82,16 +82,22 @@ class UserCFModel:
 
         self.save()
 
-    def retrieve(self, user_id: int, k=50):
+    def retrieve(self, user_id: int, k=50, max_sim_users=20):
         if user_id not in self.user_sim_matrix:
             return []
+        # Only use top max_sim_users most similar users (sorted by sim desc)
+        sim_users = self.user_sim_matrix[user_id]
+        if len(sim_users) > max_sim_users:
+            top_pairs = sorted(sim_users.items(), key=lambda x: x[1], reverse=True)[:max_sim_users]
+        else:
+            top_pairs = sim_users.items()
+
         rank = {}
         interacted_items = set(self.user_item_dict.get(user_id, []))
-        for v, sim in self.user_sim_matrix[user_id].items():
+        for v, sim in top_pairs:
             for item in self.user_item_dict.get(v, []):
-                if item in interacted_items:
-                    continue
-                rank[item] = rank.get(item, 0) + sim
+                if item not in interacted_items:
+                    rank[item] = rank.get(item, 0) + sim
         sorted_res = sorted(rank.items(), key=lambda x: x[1], reverse=True)[:k]
         return [res[0] for res in sorted_res]
 

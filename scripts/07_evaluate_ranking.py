@@ -3,7 +3,6 @@ import argparse
 import sys
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import torch
@@ -26,7 +25,6 @@ from src.config.settings import (
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
 from src.models.recall.item_cf import ItemCFModel
-from src.models.recall.user_cf import UserCFModel
 from src.models.recall.simple_recall import PopularityRecall, GenreRecall
 from src.models.recall.merger import RecallMerger
 from src.models.ranking.ranker import RankingModel
@@ -67,7 +65,6 @@ def evaluate(test_mode=False):
     MERGE_K = 500
     RAW_CHANNEL_K = 300
     CHANNEL_K = 200
-    CF_WORKERS = 32
 
     # 1. Load data & encoder
     val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
@@ -100,14 +97,6 @@ def evaluate(test_mode=False):
     try:
         item_cf.load()
         icf_ready = True
-    except FileNotFoundError:
-        pass
-
-    user_cf = UserCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "user_sim_matrix.pkl")
-    ucf_ready = False
-    try:
-        user_cf.load()
-        ucf_ready = True
     except FileNotFoundError:
         pass
 
@@ -187,148 +176,138 @@ def evaluate(test_mode=False):
         eval_users = eval_users[:1000]
     print(f"Evaluating {len(eval_users)} users...")
 
-    # Pre-cache popularity & genre (same for all users or per-genre)
     pop_candidates = pop_recall.retrieve(k=RAW_CHANNEL_K)
 
-    # ================================================================
-    # Phase 1: Batch dual-tower recall (GPU batch + FAISS batch search)
-    # ================================================================
-    dt_results = {}
-    if dt_ready:
-        print("[Phase 1] Batch dual-tower recall...")
-        BATCH = 1024
-        for start in tqdm(range(0, len(eval_users), BATCH), desc="DualTower batch"):
-            batch_uids = eval_users[start:start + BATCH]
-            batch_rows = [user_profile_indexed.loc[uid] for uid in batch_uids]
+    # Pre-build numpy lookup arrays for batch DT recall
+    max_uid = int(user_profile['userId'].max())
+    u_idx = user_profile['userId'].values
+    user_encoded_id = np.zeros(max_uid + 1, dtype=np.int64)
+    user_avg_rating_arr = np.zeros(max_uid + 1, dtype=np.float32)
+    user_activity_arr = np.zeros(max_uid + 1, dtype=np.float32)
+    user_history_arr = np.zeros((max_uid + 1, USER_HISTORY_MAX_LEN), dtype=np.int64)
+    user_ts_diff_arr = np.zeros((max_uid + 1, USER_HISTORY_MAX_LEN), dtype=np.float32)
+    user_top_genres_arr = np.zeros((max_uid + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
 
-            user_ids = [r['userId_encoded'] for r in batch_rows]
-            avg_ratings = [r['avg_rating_norm'] for r in batch_rows]
-            activities = [r['activity_norm'] for r in batch_rows]
-            histories = [r['history_encoded'] for r in batch_rows]
-            ts_diffs = [pad_ts_diff(r['history_ts_diff'], USER_HISTORY_MAX_LEN) for r in batch_rows]
-            top_genres = [r['top_genres_encoded'] for r in batch_rows]
+    user_encoded_id[u_idx] = user_profile['userId_encoded'].values
+    user_avg_rating_arr[u_idx] = user_profile['avg_rating_norm'].values
+    user_activity_arr[u_idx] = user_profile['activity_norm'].values
+    user_history_arr[u_idx] = np.stack(user_profile['history_encoded'].values)
+    user_top_genres_arr[u_idx] = np.stack(user_profile['top_genres_encoded'].values)
+    for i, row in user_profile.iterrows():
+        uid = row['userId']
+        ts = row.get('history_ts_diff')
+        if isinstance(ts, (list, np.ndarray)):
+            ts = list(ts)[:USER_HISTORY_MAX_LEN]
+            user_ts_diff_arr[uid, :len(ts)] = ts
 
-            user_tensor = {
-                'user_id': torch.tensor(user_ids, dtype=torch.long).to(device),
-                'avg_rating': torch.tensor(avg_ratings, dtype=torch.float32).to(device),
-                'activity': torch.tensor(activities, dtype=torch.float32).to(device),
-                'history': torch.tensor(np.array(histories), dtype=torch.long).to(device),
-                'history_ts_diff': torch.tensor(ts_diffs, dtype=torch.float32).to(device),
-                'top_genres': torch.tensor(np.array(top_genres), dtype=torch.long).to(device),
-            }
-            with torch.no_grad():
-                u_embs, _ = dt_model(user_tensor, None)
-                u_embs = u_embs.cpu().numpy().astype('float32')
+    # Pre-build dicts for CF recall (avoid pandas .loc per user)
+    user_history_dict = dict(zip(user_profile['userId'].values,
+                                 user_profile['history'].values))
+    user_top_genres_dict = dict(zip(user_profile['userId'].values,
+                                    user_profile['top_genres'].values))
+    user_watched_dict = {}
+    for uid_val, hist in user_history_dict.items():
+        if isinstance(hist, (list, np.ndarray)):
+            user_watched_dict[uid_val] = set(hist)
+        else:
+            user_watched_dict[uid_val] = set()
 
-            _, I = index.search(u_embs, RAW_CHANNEL_K)
-            for i, uid in enumerate(batch_uids):
-                dt_results[uid] = [int(idx_to_movie_id[j]) for j in I[i]]
-
-    # ================================================================
-    # Phase 2: Parallel CF recall (thread pool)
-    # ================================================================
-    icf_results = {}
-    ucf_results = {}
-
-    def _item_cf_one(uid):
-        row = user_profile_indexed.loc[uid]
-        history = row.get('history')
-        if history is not None and isinstance(history, (list, np.ndarray)):
-            return uid, item_cf.retrieve(list(history), k=RAW_CHANNEL_K)
-        return uid, []
-
-    def _user_cf_one(uid):
-        return uid, user_cf.retrieve(uid, k=RAW_CHANNEL_K)
-
-    if icf_ready or ucf_ready:
-        print(f"[Phase 2] Parallel CF recall ({CF_WORKERS} threads)...")
-        with ThreadPoolExecutor(max_workers=CF_WORKERS) as pool:
-            if icf_ready:
-                for uid, items in tqdm(pool.map(_item_cf_one, eval_users),
-                                       total=len(eval_users), desc="ItemCF"):
-                    icf_results[uid] = items
-            if ucf_ready:
-                for uid, items in tqdm(pool.map(_user_cf_one, eval_users),
-                                       total=len(eval_users), desc="UserCF"):
-                    ucf_results[uid] = items
-
-    # ================================================================
-    # Phase 3: Merge + Ranking (per-user merge, ranking on GPU)
-    # ================================================================
-    print("[Phase 3] Merge + Ranking...")
+    # 7. Chunked evaluation: batch DT → per-user CF + merge + rank
+    CHUNK = 4096
+    eval_uids_arr = np.array(eval_users, dtype=np.int64)
     metrics = defaultdict(list)
     n_recalled = 0
     n_total = len(eval_users)
 
-    for uid in tqdm(eval_users, desc="Ranking"):
-        user_row = user_profile_indexed.loc[uid]
-        actual_items = val_ground_truth[uid]
+    for chunk_start in tqdm(range(0, n_total, CHUNK), desc="Eval chunks"):
+        chunk_uids = eval_uids_arr[chunk_start:chunk_start + CHUNK]
 
-        # --- Assemble recall channels (all pre-computed) ---
-        channels = {}
-        if uid in dt_results:
-            channels['dual_tower'] = dt_results[uid]
-        if uid in icf_results:
-            channels['item_cf'] = icf_results[uid]
-        if uid in ucf_results:
-            channels['user_cf'] = ucf_results[uid]
-        channels['popularity'] = pop_candidates
-        top_genres = user_row.get('top_genres')
-        if isinstance(top_genres, (list, np.ndarray)):
-            channels['genre'] = genre_recall.retrieve(list(top_genres), k=RAW_CHANNEL_K)
+        # --- Batch DT recall for this chunk ---
+        chunk_dt = {}
+        if dt_ready:
+            user_tensor = {
+                'user_id': torch.from_numpy(user_encoded_id[chunk_uids]).to(device),
+                'avg_rating': torch.from_numpy(user_avg_rating_arr[chunk_uids]).to(device),
+                'activity': torch.from_numpy(user_activity_arr[chunk_uids]).to(device),
+                'history': torch.from_numpy(user_history_arr[chunk_uids]).to(device),
+                'history_ts_diff': torch.from_numpy(user_ts_diff_arr[chunk_uids]).to(device),
+                'top_genres': torch.from_numpy(user_top_genres_arr[chunk_uids]).to(device),
+            }
+            with torch.no_grad():
+                u_embs, _ = dt_model(user_tensor, None)
+                u_embs = u_embs.cpu().numpy().astype('float32')
+            _, I = index.search(u_embs, RAW_CHANNEL_K)
+            for i, uid in enumerate(chunk_uids):
+                chunk_dt[int(uid)] = [int(idx_to_movie_id[j]) for j in I[i]]
 
-        # Filter watched
-        watched_set = set(user_row['history']) if isinstance(user_row['history'], (list, np.ndarray)) else set()
-        for name in list(channels.keys()):
-            channels[name] = [iid for iid in channels[name] if iid not in watched_set][:CHANNEL_K]
+        # --- Per-user: CF + merge + rank ---
+        for uid in chunk_uids:
+            uid = int(uid)
+            actual_items = val_ground_truth[uid]
+            watched_set = user_watched_dict.get(uid, set())
 
-        # Merge
-        merged = merger.merge(channels, weights=MERGER_WEIGHTS)
+            # Assemble recall channels
+            channels = {}
+            if uid in chunk_dt:
+                channels['dual_tower'] = chunk_dt[uid]
+            if icf_ready:
+                history = user_history_dict.get(uid)
+                if history is not None and isinstance(history, (list, np.ndarray)):
+                    channels['item_cf'] = item_cf.retrieve(list(history), k=RAW_CHANNEL_K)
+            channels['popularity'] = pop_candidates
+            top_genres = user_top_genres_dict.get(uid)
+            if isinstance(top_genres, (list, np.ndarray)):
+                channels['genre'] = genre_recall.retrieve(list(top_genres), k=RAW_CHANNEL_K)
 
-        # Check if target is recalled
-        actual_set = set(actual_items)
-        if not actual_set & set(merged):
-            continue
-        n_recalled += 1
+            # Filter watched
+            for name in list(channels.keys()):
+                channels[name] = [iid for iid in channels[name] if iid not in watched_set][:CHANNEL_K]
 
-        # --- Recall baseline metrics ---
-        for ek in RANK_EVAL_KS:
-            metrics[f'Recall_Baseline_HR@{ek}'].append(hitrate_at_k(actual_items, merged, k=ek))
-            metrics[f'Recall_Baseline_NDCG@{ek}'].append(ndcg_at_k(actual_items, merged, k=ek))
-        metrics['Recall_Baseline_MRR'].append(mrr(actual_items, merged))
+            # Merge
+            merged = merger.merge(channels, weights=MERGER_WEIGHTS)
 
-        # --- Ranking reorder ---
-        candidates = merged
-        n_cand = len(candidates)
-        cand_arr = np.array(candidates, dtype=np.int64)
+            # Skip if target not recalled
+            if not set(actual_items) & set(merged):
+                continue
+            n_recalled += 1
 
-        rank_features = {
-            'user_id': torch.tensor([user_row['userId_encoded']] * n_cand, dtype=torch.long).to(device),
-            'item_id': torch.from_numpy(item_encoded_id[cand_arr]).to(device),
-            'user_top_genres': torch.tensor([user_row['top_genres_encoded']] * n_cand, dtype=torch.long).to(device),
-            'item_genres': torch.from_numpy(item_genres_arr[cand_arr]).to(device),
-            'user_avg_rating': torch.tensor([user_row['avg_rating_norm']] * n_cand, dtype=torch.float32).to(device),
-            'user_activity': torch.tensor([user_row['activity_norm']] * n_cand, dtype=torch.float32).to(device),
-            'item_release_year': torch.from_numpy(item_release_year[cand_arr]).float().to(device),
-            'item_avg_rating': torch.from_numpy(item_avg_rating[cand_arr]).float().to(device),
-            'item_revenue': torch.from_numpy(item_revenue[cand_arr]).float().to(device),
-            'item_budget': torch.from_numpy(item_budget[cand_arr]).float().to(device),
-            'item_vote_count': torch.from_numpy(item_vote_count[cand_arr]).float().to(device),
-        }
+            # Recall baseline metrics
+            for ek in RANK_EVAL_KS:
+                metrics[f'Recall_Baseline_HR@{ek}'].append(hitrate_at_k(actual_items, merged, k=ek))
+                metrics[f'Recall_Baseline_NDCG@{ek}'].append(ndcg_at_k(actual_items, merged, k=ek))
+            metrics['Recall_Baseline_MRR'].append(mrr(actual_items, merged))
 
-        with torch.no_grad():
-            ctr_logit, pRating = ranking_model(rank_features)
-            pCTR = torch.sigmoid(ctr_logit)
-            pRating_clamped = pRating.clamp(min=0.01)
-            final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
-            order = final_score.cpu().numpy().argsort()[::-1]
-            ranked = [candidates[i] for i in order]
+            # Ranking reorder
+            candidates = merged
+            n_cand = len(candidates)
+            cand_arr = np.array(candidates, dtype=np.int64)
 
-        # Ranking metrics
-        for ek in RANK_EVAL_KS:
-            metrics[f'Ranking_HR@{ek}'].append(hitrate_at_k(actual_items, ranked, k=ek))
-            metrics[f'Ranking_NDCG@{ek}'].append(ndcg_at_k(actual_items, ranked, k=ek))
-        metrics['Ranking_MRR'].append(mrr(actual_items, ranked))
+            rank_features = {
+                'user_id': torch.tensor([user_encoded_id[uid]] * n_cand, dtype=torch.long).to(device),
+                'item_id': torch.from_numpy(item_encoded_id[cand_arr]).to(device),
+                'user_top_genres': torch.from_numpy(np.tile(user_top_genres_arr[uid], (n_cand, 1))).to(device),
+                'item_genres': torch.from_numpy(item_genres_arr[cand_arr]).to(device),
+                'user_avg_rating': torch.tensor([user_avg_rating_arr[uid]] * n_cand, dtype=torch.float32).to(device),
+                'user_activity': torch.tensor([user_activity_arr[uid]] * n_cand, dtype=torch.float32).to(device),
+                'item_release_year': torch.from_numpy(item_release_year[cand_arr]).float().to(device),
+                'item_avg_rating': torch.from_numpy(item_avg_rating[cand_arr]).float().to(device),
+                'item_revenue': torch.from_numpy(item_revenue[cand_arr]).float().to(device),
+                'item_budget': torch.from_numpy(item_budget[cand_arr]).float().to(device),
+                'item_vote_count': torch.from_numpy(item_vote_count[cand_arr]).float().to(device),
+            }
+
+            with torch.no_grad():
+                ctr_logit, pRating = ranking_model(rank_features)
+                pCTR = torch.sigmoid(ctr_logit)
+                pRating_clamped = pRating.clamp(min=0.01)
+                final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
+                order = final_score.cpu().numpy().argsort()[::-1]
+                ranked = [candidates[i] for i in order]
+
+            for ek in RANK_EVAL_KS:
+                metrics[f'Ranking_HR@{ek}'].append(hitrate_at_k(actual_items, ranked, k=ek))
+                metrics[f'Ranking_NDCG@{ek}'].append(ndcg_at_k(actual_items, ranked, k=ek))
+            metrics['Ranking_MRR'].append(mrr(actual_items, ranked))
 
     # 8. Report
     print(f"\n=== Ranking Evaluation Report ===")
