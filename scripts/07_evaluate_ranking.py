@@ -3,6 +3,7 @@ import argparse
 import sys
 from pathlib import Path
 from collections import defaultdict
+from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 import torch
@@ -52,11 +53,33 @@ def apply_encoding(user_profile, item_profile, encoder):
     return user_profile, item_profile
 
 
-def pad_ts_diff(ts_list, max_len):
-    if not isinstance(ts_list, (list, np.ndarray)):
-        return [0.0] * max_len
-    ts = list(ts_list)[:max_len]
-    return ts + [0.0] * (max_len - len(ts))
+# Module-level shared data for multiprocessing (fork-based COW)
+_shared = {}
+
+
+def _recall_one_user(uid):
+    """Worker: ItemCF + genre + pop + merge + filter watched → candidate list."""
+    s = _shared
+    watched_set = s['watched'][uid]
+
+    channels = {}
+    dt = s['dt_results'].get(uid)
+    if dt is not None:
+        channels['dual_tower'] = dt
+    history = s['history'].get(uid)
+    if s['icf_ready'] and history is not None:
+        channels['item_cf'] = s['item_cf'].retrieve(list(history), k=s['RAW_K'])
+    channels['popularity'] = s['pop']
+    genres = s['genres'].get(uid)
+    if genres is not None:
+        channels['genre'] = s['genre_recall'].retrieve(list(genres), k=s['RAW_K'])
+
+    for name in list(channels.keys()):
+        channels[name] = [iid for iid in channels[name] if iid not in watched_set][:s['CH_K']]
+
+    merged = s['merger'].merge(channels, weights=s['weights'])
+    actual = s['ground_truth'][uid]
+    return uid, merged, actual
 
 
 def evaluate(test_mode=False):
@@ -65,6 +88,7 @@ def evaluate(test_mode=False):
     MERGE_K = 500
     RAW_CHANNEL_K = 300
     CHANNEL_K = 200
+    RECALL_WORKERS = 32
 
     # 1. Load data & encoder
     val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
@@ -168,17 +192,14 @@ def evaluate(test_mode=False):
     item_vote_count[i_idx] = item_profile['vote_count_ml_norm'].values
     item_genres_arr[i_idx] = np.stack(item_profile['tmdb_genres_encoded'].values)
 
-    # 6. Prepare eval users
+    # 6. Prepare eval users & user lookup arrays
     val_ground_truth = val_data.groupby('userId')['movieId'].apply(list).to_dict()
-    user_profile_indexed = user_profile.set_index('userId')
-    eval_users = [uid for uid in val_ground_truth if uid in user_profile_indexed.index]
+    eval_users = [uid for uid in val_ground_truth if uid in set(user_profile['userId'].values)]
     if test_mode:
         eval_users = eval_users[:1000]
     print(f"Evaluating {len(eval_users)} users...")
 
-    pop_candidates = pop_recall.retrieve(k=RAW_CHANNEL_K)
-
-    # Pre-build numpy lookup arrays for batch DT recall
+    # User feature lookup arrays (for DT batch + ranking)
     max_uid = int(user_profile['userId'].max())
     u_idx = user_profile['userId'].values
     user_encoded_id = np.zeros(max_uid + 1, dtype=np.int64)
@@ -193,80 +214,76 @@ def evaluate(test_mode=False):
     user_activity_arr[u_idx] = user_profile['activity_norm'].values
     user_history_arr[u_idx] = np.stack(user_profile['history_encoded'].values)
     user_top_genres_arr[u_idx] = np.stack(user_profile['top_genres_encoded'].values)
-    for i, row in user_profile.iterrows():
+    for _, row in user_profile.iterrows():
         uid = row['userId']
         ts = row.get('history_ts_diff')
         if isinstance(ts, (list, np.ndarray)):
             ts = list(ts)[:USER_HISTORY_MAX_LEN]
             user_ts_diff_arr[uid, :len(ts)] = ts
 
-    # Pre-build dicts for CF recall (avoid pandas .loc per user)
-    user_history_dict = dict(zip(user_profile['userId'].values,
-                                 user_profile['history'].values))
-    user_top_genres_dict = dict(zip(user_profile['userId'].values,
-                                    user_profile['top_genres'].values))
+    # Dicts for recall workers
+    user_history_dict = dict(zip(user_profile['userId'].values, user_profile['history'].values))
+    user_top_genres_dict = dict(zip(user_profile['userId'].values, user_profile['top_genres'].values))
     user_watched_dict = {}
     for uid_val, hist in user_history_dict.items():
-        if isinstance(hist, (list, np.ndarray)):
-            user_watched_dict[uid_val] = set(hist)
-        else:
-            user_watched_dict[uid_val] = set()
+        user_watched_dict[uid_val] = set(hist) if isinstance(hist, (list, np.ndarray)) else set()
 
-    # 7. Chunked evaluation: batch DT → per-user CF + merge + rank
-    CHUNK = 4096
-    eval_uids_arr = np.array(eval_users, dtype=np.int64)
-    metrics = defaultdict(list)
-    n_recalled = 0
-    n_total = len(eval_users)
+    pop_candidates = pop_recall.retrieve(k=RAW_CHANNEL_K)
 
-    for chunk_start in tqdm(range(0, n_total, CHUNK), desc="Eval chunks"):
-        chunk_uids = eval_uids_arr[chunk_start:chunk_start + CHUNK]
-
-        # --- Batch DT recall for this chunk ---
-        chunk_dt = {}
-        if dt_ready:
+    # ================================================================
+    # Phase 1: Batch DT recall (GPU, fast)
+    # ================================================================
+    dt_results = {}
+    if dt_ready:
+        print("[Phase 1] Batch dual-tower recall...")
+        BATCH = 4096
+        eval_uids_arr = np.array(eval_users, dtype=np.int64)
+        for start in tqdm(range(0, len(eval_users), BATCH), desc="DualTower"):
+            batch_uids = eval_uids_arr[start:start + BATCH]
             user_tensor = {
-                'user_id': torch.from_numpy(user_encoded_id[chunk_uids]).to(device),
-                'avg_rating': torch.from_numpy(user_avg_rating_arr[chunk_uids]).to(device),
-                'activity': torch.from_numpy(user_activity_arr[chunk_uids]).to(device),
-                'history': torch.from_numpy(user_history_arr[chunk_uids]).to(device),
-                'history_ts_diff': torch.from_numpy(user_ts_diff_arr[chunk_uids]).to(device),
-                'top_genres': torch.from_numpy(user_top_genres_arr[chunk_uids]).to(device),
+                'user_id': torch.from_numpy(user_encoded_id[batch_uids]).to(device),
+                'avg_rating': torch.from_numpy(user_avg_rating_arr[batch_uids]).to(device),
+                'activity': torch.from_numpy(user_activity_arr[batch_uids]).to(device),
+                'history': torch.from_numpy(user_history_arr[batch_uids]).to(device),
+                'history_ts_diff': torch.from_numpy(user_ts_diff_arr[batch_uids]).to(device),
+                'top_genres': torch.from_numpy(user_top_genres_arr[batch_uids]).to(device),
             }
             with torch.no_grad():
                 u_embs, _ = dt_model(user_tensor, None)
                 u_embs = u_embs.cpu().numpy().astype('float32')
             _, I = index.search(u_embs, RAW_CHANNEL_K)
-            for i, uid in enumerate(chunk_uids):
-                chunk_dt[int(uid)] = [int(idx_to_movie_id[j]) for j in I[i]]
+            for i, uid in enumerate(batch_uids):
+                dt_results[int(uid)] = [int(idx_to_movie_id[j]) for j in I[i]]
 
-        # --- Per-user: CF + merge + rank ---
-        for uid in chunk_uids:
-            uid = int(uid)
-            actual_items = val_ground_truth[uid]
-            watched_set = user_watched_dict.get(uid, set())
+    # ================================================================
+    # Phase 2+3: Parallel recall (CPU) + Ranking (GPU) pipeline
+    # Workers produce recall results, main process consumes for ranking.
+    # pool.imap is lazy — GPU ranking runs while workers are still recalling.
+    # ================================================================
+    print(f"[Phase 2+3] Parallel recall ({RECALL_WORKERS} workers) + GPU ranking...")
+    _shared['dt_results'] = dt_results
+    _shared['item_cf'] = item_cf
+    _shared['icf_ready'] = icf_ready
+    _shared['genre_recall'] = genre_recall
+    _shared['merger'] = merger
+    _shared['pop'] = pop_candidates
+    _shared['history'] = user_history_dict
+    _shared['genres'] = user_top_genres_dict
+    _shared['watched'] = user_watched_dict
+    _shared['ground_truth'] = val_ground_truth
+    _shared['weights'] = MERGER_WEIGHTS
+    _shared['RAW_K'] = RAW_CHANNEL_K
+    _shared['CH_K'] = CHANNEL_K
 
-            # Assemble recall channels
-            channels = {}
-            if uid in chunk_dt:
-                channels['dual_tower'] = chunk_dt[uid]
-            if icf_ready:
-                history = user_history_dict.get(uid)
-                if history is not None and isinstance(history, (list, np.ndarray)):
-                    channels['item_cf'] = item_cf.retrieve(list(history), k=RAW_CHANNEL_K)
-            channels['popularity'] = pop_candidates
-            top_genres = user_top_genres_dict.get(uid)
-            if isinstance(top_genres, (list, np.ndarray)):
-                channels['genre'] = genre_recall.retrieve(list(top_genres), k=RAW_CHANNEL_K)
+    metrics = defaultdict(list)
+    n_recalled = 0
+    n_total = len(eval_users)
 
-            # Filter watched
-            for name in list(channels.keys()):
-                channels[name] = [iid for iid in channels[name] if iid not in watched_set][:CHANNEL_K]
+    with Pool(RECALL_WORKERS) as pool:
+        for uid, merged, actual_items in tqdm(
+                pool.imap(_recall_one_user, eval_users, chunksize=256),
+                total=n_total, desc="Recall+Rank"):
 
-            # Merge
-            merged = merger.merge(channels, weights=MERGER_WEIGHTS)
-
-            # Skip if target not recalled
             if not set(actual_items) & set(merged):
                 continue
             n_recalled += 1
@@ -309,7 +326,9 @@ def evaluate(test_mode=False):
                 metrics[f'Ranking_NDCG@{ek}'].append(ndcg_at_k(actual_items, ranked, k=ek))
             metrics['Ranking_MRR'].append(mrr(actual_items, ranked))
 
-    # 8. Report
+    _shared.clear()
+
+    # Report
     print(f"\n=== Ranking Evaluation Report ===")
     print(f"Total users: {n_total}, Recalled target: {n_recalled} ({n_recalled/max(n_total,1)*100:.1f}%)\n")
 
