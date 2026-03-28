@@ -3,7 +3,7 @@ import argparse
 import sys
 from pathlib import Path
 from collections import defaultdict
-from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import torch
@@ -279,9 +279,9 @@ def evaluate(test_mode=False):
     n_recalled = 0
     n_total = len(eval_users)
 
-    with Pool(RECALL_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=RECALL_WORKERS) as pool:
         for uid, merged, actual_items in tqdm(
-                pool.imap(_recall_one_user, eval_users, chunksize=256),
+                pool.map(_recall_one_user, eval_users, chunksize=256),
                 total=n_total, desc="Recall+Rank"):
 
             if not set(actual_items) & set(merged):
