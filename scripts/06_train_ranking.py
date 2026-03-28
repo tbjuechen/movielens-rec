@@ -61,39 +61,38 @@ def main():
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
 
     # 3. Load pre-generated ranking samples
-    print("[3/6] Loading ranking samples...")
-    ranking_samples_path = Path(PROCESSED_DATA_DIR) / "ranking_train_samples.parquet"
+    print("[3/6] Loading ranking candidate pool...")
+    ranking_samples_path = Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet"
     if not ranking_samples_path.exists():
-        print(f"  {ranking_samples_path} not found, loading train_data for sampling...")
-        train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
-        all_item_ids = item_profile['movieId'].values
-        samples = build_ranking_samples(train_data, all_item_ids,
-                                        neg_sample_ratio=RANK_NEG_SAMPLE_RATIO, seed=42)
-        # Convert built samples to Tensors for consistency
-        samples = {k: torch.from_numpy(v) if k != 'has_rating' else torch.from_numpy(v) > 0.5 
-                   for k, v in samples.items()}
-        del train_data
-        import gc; gc.collect()
+        print(f"  {ranking_samples_path} not found. Please run 05_build_ranking_data.py first.")
+        sys.exit(1)
     else:
-        # Optimization: Use pyarrow for direct column-wise loading into Tensors
+        # Optimization: Use pyarrow to load the pool
         import pyarrow.parquet as pq
-        cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating']
+        cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']
         table = pq.read_table(ranking_samples_path, columns=cols)
+        
+        # Convert list column to fixed-size (N, 100) matrix
+        print("  Converting pool to matrix...")
+        raw_pool = table['candidate_pool'].to_numpy()
+        n_rows = len(raw_pool)
+        pool_matrix = np.zeros((n_rows, 100), dtype=np.int64)
+        for i, p in enumerate(tqdm(raw_pool, desc="Padding Pool")):
+            p_len = min(len(p), 100)
+            pool_matrix[i, :p_len] = p[:p_len]
         
         samples = {
             'userId': torch.from_numpy(table['userId'].to_numpy().astype(np.int64)),
             'movieId': torch.from_numpy(table['movieId'].to_numpy().astype(np.int64)),
             'ctr_label': torch.from_numpy(table['ctr_label'].to_numpy().astype(np.float32)),
             'rating_norm': torch.from_numpy(table['rating_norm'].to_numpy().astype(np.float32)),
-            'has_rating': torch.from_numpy(table['has_rating'].to_numpy().astype(np.float32)) > 0.5,
+            'candidate_pool': torch.from_numpy(pool_matrix),
         }
-        print(f"  Loaded {len(samples['userId']):,} recall-based samples (via pyarrow)")
-        del table; import gc; gc.collect()
+        print(f"  Loaded {n_rows:,} positive interactions with pools (via pyarrow)")
+        del table, raw_pool, pool_matrix; import gc; gc.collect()
         
-    n_pos = int((samples['ctr_label'] > 0.5).sum())
     n_total = len(samples['userId'])
-    n_neg = n_total - n_pos
-    print(f"  total={n_total:,} (pos={n_pos:,}, neg={n_neg:,})")
+    print(f"  Unique positives: {n_total:,} (Negative sampling will be 1:3 dynamic)")
 
     # 4. Compute quantile bucket boundaries
     print("[4/6] Computing bucket boundaries...")
@@ -117,17 +116,17 @@ def main():
 
     # Optimized for 1TB RAM Linux Server: 
     # - Increase num_workers to 32+ (depending on your CPU cores)
-    # - Disable pin_memory because we are using shared_memory tensors
+    # - Enable pin_memory: now useful with merged block tensors
     # - Add prefetch_factor to keep the GPU fed
     dataloader = DataLoader(
         dataset, 
         batch_size=RANK_BATCH_SIZE, # Suggest increasing this in config.yaml to 16384+
         shuffle=True,
-        num_workers=32,             # Hardcoded for 1TB machine, or use RANK_NUM_WORKERS
+        num_workers=32,             
         collate_fn=dataset.collate_fn,
-        pin_memory=False,           # Better performance with huge shared memory on Linux
+        pin_memory=True,            # ENABLED for faster transfers of merged blocks
         persistent_workers=True,
-        prefetch_factor=4           # Each worker will prefetch 4 batches
+        prefetch_factor=4           
     )
 
     # 6. Build model
@@ -167,7 +166,7 @@ def main():
     weight_optimizer = optim.Adam([log_task_weights], lr=0.01)
     initial_losses = None
     shared_layer = model.cross_net.linears[-1].weight  # shared layer for grad norm
-    GRADNORM_INTERVAL = 10  # update GradNorm every N steps
+    GRADNORM_INTERVAL = 100  # Increased to 100 to reduce main process overhead
 
     best_loss = float('inf')
     patience = 3
@@ -181,11 +180,18 @@ def main():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
-            features = {k: v.to(device, non_blocking=True) for k, v in batch.items()
-                        if k not in ('ctr_label', 'rating_label', 'has_rating')}
-            ctr_label = batch['ctr_label'].to(device, non_blocking=True)
-            rating_label = batch['rating_label'].to(device, non_blocking=True)
-            has_rating = batch['has_rating'].to(device, non_blocking=True)
+            # Efficiently move the 3 major blocks to GPU
+            int_feat = batch['int_features'].to(device, non_blocking=True)
+            float_feat = batch['float_features'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
+            
+            features = {
+                'int_features': int_feat,
+                'float_features': float_feat
+            }
+            ctr_label = labels[:, 0]
+            rating_label = labels[:, 1]
+            has_rating = labels[:, 2].bool()
 
             # Compute task weights (clamp min 0.1, then renormalize to sum=2)
             task_weights_raw = torch.softmax(log_task_weights, dim=0).clamp(min=0.1)

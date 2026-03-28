@@ -8,47 +8,41 @@ from src.config.settings import (
 
 
 class RankingDataset(Dataset):
-    """Lazy-lookup ranking Dataset for large-scale training.
+    """Lazy-lookup ranking Dataset with DYNAMIC online negative sampling.
 
-    Stores only the raw sample array (N, 5) in memory (~40GB for 1.3B samples).
-    Feature lookup is done at collate time via pre-built numpy arrays indexed by
-    raw userId/movieId, avoiding the 200GB+ cost of pre-materialization.
+    Stores the positive interactions and a pool of 100 recall candidates for each.
+    In each batch, it randomly samples 3 negatives from the pool for every positive.
     """
 
-    def __init__(self, samples, user_profile_df, item_profile_df):
+    def __init__(self, samples, user_profile_df, item_profile_df, neg_size=3):
+        self.neg_size = neg_size
+        
         if isinstance(samples, dict):
-            # Input is already optimized dictionary of tensors
+            # Input is from ranking_candidate_pool.parquet
             n = len(samples['userId'])
             self.n = n
-            print(f"  Using pre-loaded tensor samples: {n:,}")
-            # Explicitly share memory for all sample tensors
-            self.uids = samples['userId'].share_memory_()
-            self.iids = samples['movieId'].share_memory_()
-            self.ctr_label = samples['ctr_label'].share_memory_()
-            self.rating_label = samples['rating_norm'].share_memory_()
-            self.has_rating = samples['has_rating'].share_memory_()
+            print(f"  Loading candidate pool for {n:,} positives...")
+            self.uids_pos = samples['userId'].share_memory_()
+            self.iids_pos = samples['movieId'].share_memory_()
+            self.ctr_labels_pos = samples['ctr_label'].share_memory_()
+            self.rating_norms_pos = samples['rating_norm'].share_memory_()
+            # The pool: (N, 100) matrix
+            self.candidate_pool = samples['candidate_pool'].share_memory_()
         else:
-            n = len(samples)
-            self.n = n
-            print(f"  Building lookup tables for {n:,} samples...")
+            # Fallback for old flat format
+            raise ValueError("RankingDataset now requires the candidate pool format.")
 
-            # Store raw sample columns as contiguous tensors and share memory
-            self.uids = torch.from_numpy(samples[:, 0].astype(np.int64)).share_memory_()
-            self.iids = torch.from_numpy(samples[:, 1].astype(np.int64)).share_memory_()
-            self.ctr_label = torch.from_numpy(samples[:, 2].astype(np.float32)).share_memory_()
-            self.rating_label = torch.from_numpy(samples[:, 3].astype(np.float32)).share_memory_()
-            self.has_rating = (torch.from_numpy(samples[:, 4].astype(np.float32)) > 0.5).share_memory_()
-
-        # --- Build lookup tables (shared across all collate calls) ---
+        # --- Build lookup tables (Shared Memory) ---
         max_u = int(user_profile_df['userId'].max())
         max_i = int(item_profile_df['movieId'].max())
-
         u_idx = user_profile_df['userId'].values
+        i_idx = item_profile_df['movieId'].values
+
+        print(f"  Processing lookup tables (Shared Memory)...")
+        # User tables
         user_encoded_id = np.zeros(max_u + 1, dtype=np.int64)
         user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
         user_activity = np.zeros(max_u + 1, dtype=np.float32)
-        
-        print(f"  Processing user profile lookup tables...")
         user_encoded_id[u_idx] = user_profile_df['userId_encoded'].values
         user_avg_rating[u_idx] = user_profile_df['avg_rating_norm'].values
         user_activity[u_idx] = user_profile_df['activity_norm'].values
@@ -56,18 +50,13 @@ class RankingDataset(Dataset):
         user_genres_list = user_profile_df['top_genres_encoded'].tolist()
         user_top_genres = np.zeros((max_u + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
         user_top_genres[u_idx] = np.array(user_genres_list, dtype=np.int64)
-        del user_genres_list
-
-        # PRE-MERGE User Continuous Features (B, 2)
-        user_cont = np.stack([user_avg_rating, user_activity], axis=1)
-        self.user_cont_table = torch.from_numpy(user_cont).share_memory_()
-
-        # Convert to PyTorch Tensors and ENABLE SHARED MEMORY
+        
+        # User shared tensors
         self.user_encoded_id = torch.from_numpy(user_encoded_id).share_memory_()
         self.user_top_genres = torch.from_numpy(user_top_genres).share_memory_()
+        self.user_cont_table = torch.from_numpy(np.stack([user_avg_rating, user_activity], axis=1)).share_memory_()
 
-        print(f"  Processing item profile lookup tables...")
-        i_idx = item_profile_df['movieId'].values
+        # Item tables
         item_encoded_id = np.zeros(max_i + 1, dtype=np.int64)
         item_release_year = np.zeros(max_i + 1, dtype=np.float32)
         item_avg_rating = np.zeros(max_i + 1, dtype=np.float32)
@@ -85,20 +74,15 @@ class RankingDataset(Dataset):
         item_genres_list = item_profile_df['tmdb_genres_encoded'].tolist()
         item_genres = np.zeros((max_i + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
         item_genres[i_idx] = np.array(item_genres_list, dtype=np.int64)
-        del item_genres_list
 
-        # PRE-MERGE Item Continuous Features (B, 5)
-        item_cont = np.stack([
-            item_release_year, item_avg_rating, item_revenue, 
-            item_budget, item_vote_count
-        ], axis=1)
-        self.item_cont_table = torch.from_numpy(item_cont).share_memory_()
-
-        # Convert to PyTorch Tensors and ENABLE SHARED MEMORY
+        # Item shared tensors
         self.item_encoded_id = torch.from_numpy(item_encoded_id).share_memory_()
         self.item_genres = torch.from_numpy(item_genres).share_memory_()
+        self.item_cont_table = torch.from_numpy(np.stack([
+            item_release_year, item_avg_rating, item_revenue, item_budget, item_vote_count
+        ], axis=1)).share_memory_()
 
-        print(f"  Lookup tables built and shared. Sample memory: ~{n * 5 * 4 / 1e9:.1f}GB")
+        print(f"  Lookup tables built and shared. Pool memory: ~{self.candidate_pool.nbytes / 1e9:.1f}GB")
 
     def __len__(self):
         return self.n
@@ -107,27 +91,67 @@ class RankingDataset(Dataset):
         return idx
 
     def collate_fn(self, indices):
-        """Batch collate: lookup and MERGE features to reduce IPC overhead."""
-        idx = torch.as_tensor(indices, dtype=torch.long)
-        uids = self.uids[idx]
-        iids = self.iids[idx]
+        """Dynamic sampling: 1 positive + neg_size negatives per interaction."""
+        batch_idx = torch.as_tensor(indices, dtype=torch.long)
+        batch_size = len(batch_idx)
+        
+        # 1. Positive IDs
+        uids_pos = self.uids_pos[batch_idx]
+        iids_pos = self.iids_pos[batch_idx]
+        
+        # 2. Randomly sample negatives from the pool (Dynamic!)
+        pool_size = self.candidate_pool.shape[1]
+        # Generate random indices for sampling (batch_size, neg_size)
+        rel_neg_idx = torch.randint(0, pool_size, (batch_size, self.neg_size))
+        # Gather movieId from pool
+        iids_neg = torch.gather(self.candidate_pool[batch_idx], 1, rel_neg_idx)
+        
+        # 3. Concatenate (All Positives then All Negatives)
+        # Final batch shape: (batch_size * (1 + neg_size), ...)
+        uids = torch.cat([uids_pos, uids_pos.repeat_interleave(self.neg_size)])
+        iids = torch.cat([iids_pos, iids_neg.view(-1)])
+        
+        # 4. Construct Labels
+        ctr_label = torch.cat([
+            self.ctr_labels_pos[batch_idx],
+            torch.zeros(batch_size * self.neg_size)
+        ])
+        rating_label = torch.cat([
+            self.rating_norms_pos[batch_idx],
+            torch.zeros(batch_size * self.neg_size)
+        ])
+        has_rating = torch.cat([
+            torch.ones(batch_size, dtype=torch.bool),
+            torch.zeros(batch_size * self.neg_size, dtype=torch.bool)
+        ])
 
-        # Combine all continuous features into a single block (N, 7)
-        # Faster lookup from 2 pre-merged tables instead of 7
-        cont_features = torch.cat([
+        # 5. Fast Lookup and MERGE everything into 3 blocks to minimize IPC
+        # Block 1: Int features (user_id, item_id, user_genres, item_genres) -> (Total_B, 1 + 1 + 10 + 10 = 22)
+        int_features = torch.cat([
+            self.user_encoded_id[uids].unsqueeze(1),
+            self.item_encoded_id[iids].unsqueeze(1),
+            self.user_top_genres[uids],
+            self.item_genres[iids]
+        ], dim=1)
+
+        # Block 2: Float features (cont_features) -> (Total_B, 7)
+        float_features = torch.cat([
             self.user_cont_table[uids],
             self.item_cont_table[iids]
         ], dim=1)
 
+        # Block 3: Labels and Mask -> (Total_B, 3)
+        # 0: ctr, 1: rating, 2: has_rating_mask
+        labels = torch.stack([
+            ctr_label,
+            rating_label,
+            has_rating.float()
+        ], dim=1)
+
         return {
-            'user_id': self.user_encoded_id[uids],
-            'item_id': self.item_encoded_id[iids],
-            'user_top_genres': self.user_top_genres[uids],
-            'item_genres': self.item_genres[iids],
-            'cont_features': cont_features, # Merged 7 columns into 1 tensor
-            'ctr_label': self.ctr_label[idx],
-            'rating_label': self.rating_label[idx],
-            'has_rating': self.has_rating[idx],
+            'int_features': int_features,
+            'float_features': float_features,
+            'labels': labels
         }
 
 

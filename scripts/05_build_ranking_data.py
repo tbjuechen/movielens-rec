@@ -31,10 +31,10 @@ from src.models.recall.simple_recall import PopularityRecall, GenreRecall
 from src.models.recall.merger import RecallMerger
 
 SNAPSHOT_WINDOW = 10
-RECALL_K = 200
-MERGE_K = 300
+RECALL_K = 100
+MERGE_K = 100
 MAX_INTERACTIONS_PER_USER = 100
-SAMPLES_PER_INTERACTION = 100
+SAMPLES_PER_INTERACTION = 4
 RECALL_WORKERS = 32
 DT_BATCH = 4096
 
@@ -300,66 +300,43 @@ def main():
         print("  WARNING: DualTower not found, skipping DT recall")
 
     # ================================================================
-    # Phase 3: Merge CPU + DT candidates → sample positives & negatives
+    # Phase 3: Merge CPU + DT candidates → Create Candidate Pool
     # ================================================================
-    print("[6/7] Merging candidates and sampling...")
-    all_samples = []
-    rng = np.random.RandomState(42)
+    print("[6/7] Merging candidates into pools...")
+    pool_data = []
     final_merger = RecallMerger(top_k=MERGE_K)
 
-    for uid, mid, rating, snap_idx, channels, watched_list in tqdm(all_interactions, desc="Merge+Sample"):
-        # Add DT as another channel alongside item_cf/popularity/genre
+    for uid, mid, rating, snap_idx, channels, watched_list in tqdm(all_interactions, desc="Create Pool"):
+        # Add DT as another channel
         if dt_ready:
             dt_cands = dt_snap_results.get((uid, snap_idx), [])
             if dt_cands:
                 watched_set = set(watched_list)
                 channels['dual_tower'] = [iid for iid in dt_cands if iid not in watched_set][:RECALL_K]
 
-        # All channels → RRF merge with configured weights
+        # RRF merge
         merged = final_merger.merge(channels, weights=MERGER_WEIGHTS) if channels else []
-
         if not merged:
             continue
 
-        # Ensure target item is in candidate set
-        if mid not in set(merged):
-            merged[-1] = mid
-
-        # Sample negatives
-        neg_candidates = [c for c in merged if c != mid]
-        n_neg = min(SAMPLES_PER_INTERACTION - 1, len(neg_candidates))
-        if n_neg < len(neg_candidates):
-            neg_sampled = list(rng.choice(neg_candidates, size=n_neg, replace=False))
-        else:
-            neg_sampled = neg_candidates
+        # Keep Top 100 as the negative candidate pool (excluding the positive item)
+        pool = [int(c) for c in merged if c != mid][:100]
+        if len(pool) < 10: # Skip if too few candidates
+            continue
 
         ctr_label = 1.0 if rating >= 3.0 else 0.0
         rating_norm = rating / 5.0
+        pool_data.append((uid, mid, ctr_label, rating_norm, pool))
 
-        all_samples.append((uid, mid, ctr_label, rating_norm, 1.0))
-        for cand in neg_sampled:
-            all_samples.append((uid, cand, 0.0, 0.0, 0.0))
+    print(f"  Total positive interactions with pools: {len(pool_data):,}")
 
-    print(f"  Total samples: {len(all_samples):,}")
-
-    # 7. Save
-    print("[7/7] Saving...")
-    samples_arr = np.array(all_samples, dtype=np.float64)
-    df = pd.DataFrame(samples_arr, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating'])
-    df['userId'] = df['userId'].astype(np.int64)
-    df['movieId'] = df['movieId'].astype(np.int64)
-    df['ctr_label'] = df['ctr_label'].astype(np.float32)
-    df['rating_norm'] = df['rating_norm'].astype(np.float32)
-    df['has_rating'] = df['has_rating'].astype(np.float32)
-
-    out_path = Path(PROCESSED_DATA_DIR) / "ranking_train_samples.parquet"
+    # 7. Save as Pool format
+    print("[7/7] Saving Candidate Pool...")
+    df = pd.DataFrame(pool_data, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool'])
+    
+    out_path = Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet"
     df.to_parquet(out_path, index=False)
-
-    n_pos = int((df['ctr_label'] > 0.5).sum())
-    n_neg = len(df) - n_pos
-    print(f"\n=== Done ===")
-    print(f"Total samples: {len(df):,} (pos={n_pos:,}, neg={n_neg:,})")
-    print(f"Saved to: {out_path}")
+    print(f"\n=== Done ===\nSaved to: {out_path}")
 
 
 if __name__ == "__main__":

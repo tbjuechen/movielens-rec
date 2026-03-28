@@ -64,29 +64,36 @@ class EmbeddingLayer(nn.Module):
 
     def forward(self, features):
         """Returns (B, output_dim) concatenated embedding vector."""
+        # Unpack from merged blocks: 
+        # int_features: [user_id(0), item_id(1), user_genres(2:12), item_genres(12:22)]
+        int_feat = features['int_features']
+        float_feat = features['float_features']
+        
         embs = []
 
         # 1-2. Sparse IDs (64d each)
-        embs.append(self.user_emb(features['user_id']))
-        embs.append(self.item_emb(features['item_id']))
+        embs.append(self.user_emb(int_feat[:, 0]))
+        embs.append(self.item_emb(int_feat[:, 1]))
 
         # 3-4. Genre pooling — masked mean (8d each)
-        for key in ('user_top_genres', 'item_genres'):
-            g_emb = self.genre_emb(features[key])
-            mask = (features[key] > 0).float().unsqueeze(-1)
+        # user_genres: 2 to 12, item_genres: 12 to 22
+        for col_start in (2, 12):
+            g_ids = int_feat[:, col_start : col_start + 10]
+            g_emb = self.genre_emb(g_ids)
+            mask = (g_ids > 0).float().unsqueeze(-1)
             pooled = (g_emb * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
             embs.append(pooled)
 
-        # 5-11. Continuous features — bucketized from merged block (8d each)
+        # 5-11. Continuous features — bucketized from float block (8d each)
         cont_keys = [
             'user_avg_rating', 'user_activity',
             'item_release_year', 'item_avg_rating', 'item_revenue',
             'item_budget', 'item_vote_count',
         ]
-        # features['cont_features'] has shape (B, 7)
+        # float_feat has shape (B, 7)
         for i, name in enumerate(cont_keys):
             bounds = getattr(self, f'{name}_bounds')
-            val = features['cont_features'][:, i]
+            val = float_feat[:, i]
             bucket_idx = torch.bucketize(val, bounds)
             embs.append(self.bucket_embs[name](bucket_idx))
 
