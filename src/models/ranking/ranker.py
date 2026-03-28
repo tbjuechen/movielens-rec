@@ -77,15 +77,17 @@ class EmbeddingLayer(nn.Module):
             pooled = (g_emb * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
             embs.append(pooled)
 
-        # 5-11. Continuous features — bucketized (8d each)
+        # 5-11. Continuous features — bucketized from merged block (8d each)
         cont_keys = [
             'user_avg_rating', 'user_activity',
             'item_release_year', 'item_avg_rating', 'item_revenue',
             'item_budget', 'item_vote_count',
         ]
-        for name in cont_keys:
+        # features['cont_features'] has shape (B, 7)
+        for i, name in enumerate(cont_keys):
             bounds = getattr(self, f'{name}_bounds')
-            bucket_idx = torch.bucketize(features[name], bounds)
+            val = features['cont_features'][:, i]
+            bucket_idx = torch.bucketize(val, bounds)
             embs.append(self.bucket_embs[name](bucket_idx))
 
         return torch.cat(embs, dim=-1)  # (B, output_dim)

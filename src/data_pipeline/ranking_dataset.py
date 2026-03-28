@@ -21,22 +21,23 @@ class RankingDataset(Dataset):
             n = len(samples['userId'])
             self.n = n
             print(f"  Using pre-loaded tensor samples: {n:,}")
-            self.uids = samples['userId']
-            self.iids = samples['movieId']
-            self.ctr_label = samples['ctr_label']
-            self.rating_label = samples['rating_norm']
-            self.has_rating = samples['has_rating']
+            # Explicitly share memory for all sample tensors
+            self.uids = samples['userId'].share_memory_()
+            self.iids = samples['movieId'].share_memory_()
+            self.ctr_label = samples['ctr_label'].share_memory_()
+            self.rating_label = samples['rating_norm'].share_memory_()
+            self.has_rating = samples['has_rating'].share_memory_()
         else:
             n = len(samples)
             self.n = n
             print(f"  Building lookup tables for {n:,} samples...")
 
-            # Store raw sample columns as contiguous tensors to avoid Python CoW memory duplication in DataLoader
-            self.uids = torch.from_numpy(samples[:, 0].astype(np.int64))
-            self.iids = torch.from_numpy(samples[:, 1].astype(np.int64))
-            self.ctr_label = torch.from_numpy(samples[:, 2].astype(np.float32))
-            self.rating_label = torch.from_numpy(samples[:, 3].astype(np.float32))
-            self.has_rating = torch.from_numpy(samples[:, 4].astype(np.float32)) > 0.5
+            # Store raw sample columns as contiguous tensors and share memory
+            self.uids = torch.from_numpy(samples[:, 0].astype(np.int64)).share_memory_()
+            self.iids = torch.from_numpy(samples[:, 1].astype(np.int64)).share_memory_()
+            self.ctr_label = torch.from_numpy(samples[:, 2].astype(np.float32)).share_memory_()
+            self.rating_label = torch.from_numpy(samples[:, 3].astype(np.float32)).share_memory_()
+            self.has_rating = (torch.from_numpy(samples[:, 4].astype(np.float32)) > 0.5).share_memory_()
 
         # --- Build lookup tables (shared across all collate calls) ---
         max_u = int(user_profile_df['userId'].max())
@@ -46,18 +47,24 @@ class RankingDataset(Dataset):
         user_encoded_id = np.zeros(max_u + 1, dtype=np.int64)
         user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
         user_activity = np.zeros(max_u + 1, dtype=np.float32)
-        user_top_genres = np.zeros((max_u + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
+        
+        print(f"  Processing user profile lookup tables...")
         user_encoded_id[u_idx] = user_profile_df['userId_encoded'].values
         user_avg_rating[u_idx] = user_profile_df['avg_rating_norm'].values
         user_activity[u_idx] = user_profile_df['activity_norm'].values
-        user_top_genres[u_idx] = np.stack(user_profile_df['top_genres_encoded'].values)
+        
+        user_genres_list = user_profile_df['top_genres_encoded'].tolist()
+        user_top_genres = np.zeros((max_u + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
+        user_top_genres[u_idx] = np.array(user_genres_list, dtype=np.int64)
+        del user_genres_list
 
-        # Convert to PyTorch Tensors for DataLoader shared memory
-        self.user_encoded_id = torch.from_numpy(user_encoded_id)
-        self.user_avg_rating = torch.from_numpy(user_avg_rating)
-        self.user_activity = torch.from_numpy(user_activity)
-        self.user_top_genres = torch.from_numpy(user_top_genres)
+        # Convert to PyTorch Tensors and ENABLE SHARED MEMORY
+        self.user_encoded_id = torch.from_numpy(user_encoded_id).share_memory_()
+        self.user_avg_rating = torch.from_numpy(user_avg_rating).share_memory_()
+        self.user_activity = torch.from_numpy(user_activity).share_memory_()
+        self.user_top_genres = torch.from_numpy(user_top_genres).share_memory_()
 
+        print(f"  Processing item profile lookup tables...")
         i_idx = item_profile_df['movieId'].values
         item_encoded_id = np.zeros(max_i + 1, dtype=np.int64)
         item_release_year = np.zeros(max_i + 1, dtype=np.float32)
@@ -65,25 +72,29 @@ class RankingDataset(Dataset):
         item_revenue = np.zeros(max_i + 1, dtype=np.float32)
         item_budget = np.zeros(max_i + 1, dtype=np.float32)
         item_vote_count = np.zeros(max_i + 1, dtype=np.float32)
-        item_genres = np.zeros((max_i + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
+        
         item_encoded_id[i_idx] = item_profile_df['movieId_encoded'].values
         item_release_year[i_idx] = item_profile_df['release_year_norm'].values
         item_avg_rating[i_idx] = item_profile_df['avg_rating_norm'].values
         item_revenue[i_idx] = item_profile_df['revenue_norm'].values
         item_budget[i_idx] = item_profile_df['budget_norm'].values
         item_vote_count[i_idx] = item_profile_df['vote_count_ml_norm'].values
-        item_genres[i_idx] = np.stack(item_profile_df['tmdb_genres_encoded'].values)
+        
+        item_genres_list = item_profile_df['tmdb_genres_encoded'].tolist()
+        item_genres = np.zeros((max_i + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
+        item_genres[i_idx] = np.array(item_genres_list, dtype=np.int64)
+        del item_genres_list
 
-        # Convert to PyTorch Tensors for DataLoader shared memory
-        self.item_encoded_id = torch.from_numpy(item_encoded_id)
-        self.item_release_year = torch.from_numpy(item_release_year)
-        self.item_avg_rating = torch.from_numpy(item_avg_rating)
-        self.item_revenue = torch.from_numpy(item_revenue)
-        self.item_budget = torch.from_numpy(item_budget)
-        self.item_vote_count = torch.from_numpy(item_vote_count)
-        self.item_genres = torch.from_numpy(item_genres)
+        # Convert to PyTorch Tensors and ENABLE SHARED MEMORY
+        self.item_encoded_id = torch.from_numpy(item_encoded_id).share_memory_()
+        self.item_release_year = torch.from_numpy(item_release_year).share_memory_()
+        self.item_avg_rating = torch.from_numpy(item_avg_rating).share_memory_()
+        self.item_revenue = torch.from_numpy(item_revenue).share_memory_()
+        self.item_budget = torch.from_numpy(item_budget).share_memory_()
+        self.item_vote_count = torch.from_numpy(item_vote_count).share_memory_()
+        self.item_genres = torch.from_numpy(item_genres).share_memory_()
 
-        print(f"  Lookup tables built. Sample memory: ~{n * 5 * 4 / 1e9:.1f}GB")
+        print(f"  Lookup tables built and shared. Sample memory: ~{n * 5 * 4 / 1e9:.1f}GB")
 
     def __len__(self):
         return self.n
@@ -92,23 +103,30 @@ class RankingDataset(Dataset):
         return idx
 
     def collate_fn(self, indices):
-        """Batch collate: lookup features from pre-built tensor arrays."""
-        idx = torch.tensor(indices, dtype=torch.long)
+        """Batch collate: lookup and MERGE features to reduce IPC overhead."""
+        idx = torch.as_tensor(indices, dtype=torch.long)
         uids = self.uids[idx]
         iids = self.iids[idx]
+
+        # Combine all continuous features into a single block (N, 7)
+        # 0: user_avg_rating, 1: user_activity, 2: item_release_year, 
+        # 3: item_avg_rating, 4: item_revenue, 5: item_budget, 6: item_vote_count
+        cont_features = torch.stack([
+            self.user_avg_rating[uids],
+            self.user_activity[uids],
+            self.item_release_year[iids],
+            self.item_avg_rating[iids],
+            self.item_revenue[iids],
+            self.item_budget[iids],
+            self.item_vote_count[iids]
+        ], dim=1)
 
         return {
             'user_id': self.user_encoded_id[uids],
             'item_id': self.item_encoded_id[iids],
             'user_top_genres': self.user_top_genres[uids],
             'item_genres': self.item_genres[iids],
-            'user_avg_rating': self.user_avg_rating[uids],
-            'user_activity': self.user_activity[uids],
-            'item_release_year': self.item_release_year[iids],
-            'item_avg_rating': self.item_avg_rating[iids],
-            'item_revenue': self.item_revenue[iids],
-            'item_budget': self.item_budget[iids],
-            'item_vote_count': self.item_vote_count[iids],
+            'cont_features': cont_features, # Merged 7 columns into 1 tensor
             'ctr_label': self.ctr_label[idx],
             'rating_label': self.rating_label[idx],
             'has_rating': self.has_rating[idx],

@@ -50,32 +50,32 @@ def apply_encoding(user_profile, item_profile, encoder):
 def main():
     print("=== Training Ranking Model (DCNv2 + MMoE) ===")
 
-    # 1. Load data
-    print("[1/6] Loading data...")
-    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
+    # 1. Load profiles first (train_data is only needed if samples don't exist)
+    print("[1/6] Loading profiles...")
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
     item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
-    print(f"  train={len(train_data):,}, users={len(user_profile):,}, items={len(item_profile):,}")
-
+    
     print("[2/6] Encoding features...")
     encoder = FeatureEncoder(FEATURE_STORE_DIR)
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
 
-    # 3. Load pre-generated ranking samples (from 05_build_ranking_data.py)
+    # 3. Load pre-generated ranking samples
     print("[3/6] Loading ranking samples...")
     ranking_samples_path = Path(PROCESSED_DATA_DIR) / "ranking_train_samples.parquet"
     if not ranking_samples_path.exists():
-        print(f"  {ranking_samples_path} not found, falling back to random negative sampling...")
+        print(f"  {ranking_samples_path} not found, loading train_data for sampling...")
+        train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
         all_item_ids = item_profile['movieId'].values
         samples = build_ranking_samples(train_data, all_item_ids,
                                         neg_sample_ratio=RANK_NEG_SAMPLE_RATIO, seed=42)
         # Convert built samples to Tensors for consistency
         samples = {k: torch.from_numpy(v) if k != 'has_rating' else torch.from_numpy(v) > 0.5 
                    for k, v in samples.items()}
+        del train_data
+        import gc; gc.collect()
     else:
         # Optimization: Use pyarrow for direct column-wise loading into Tensors
-        # This avoids giant Pandas DataFrame and NumPy intermediate copies
         import pyarrow.parquet as pq
         cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating']
         table = pq.read_table(ranking_samples_path, columns=cols)
@@ -88,14 +88,14 @@ def main():
             'has_rating': torch.from_numpy(table['has_rating'].to_numpy().astype(np.float32)) > 0.5,
         }
         print(f"  Loaded {len(samples['userId']):,} recall-based samples (via pyarrow)")
-        del table # Free memory immediately
+        del table; import gc; gc.collect()
         
     n_pos = int((samples['ctr_label'] > 0.5).sum())
     n_total = len(samples['userId'])
     n_neg = n_total - n_pos
     print(f"  total={n_total:,} (pos={n_pos:,}, neg={n_neg:,})")
 
-    # 4. Compute quantile bucket boundaries from training profiles
+    # 4. Compute quantile bucket boundaries
     print("[4/6] Computing bucket boundaries...")
     bucket_boundaries = {
         'user_avg_rating': _quantile_bounds(user_profile['avg_rating_norm'].values, RANK_CONT_BUCKET_SIZE),
@@ -110,10 +110,24 @@ def main():
     # 5. Create dataset & dataloader
     print("[5/6] Creating dataset & dataloader...")
     dataset = RankingDataset(samples, user_profile, item_profile)
+    
+    # Crucial: Clean up profiles after dataset lookup table is built
+    del user_profile, item_profile, samples
+    import gc; gc.collect()
+
+    # Optimized for 1TB RAM Linux Server: 
+    # - Increase num_workers to 32+ (depending on your CPU cores)
+    # - Disable pin_memory because we are using shared_memory tensors
+    # - Add prefetch_factor to keep the GPU fed
     dataloader = DataLoader(
-        dataset, batch_size=RANK_BATCH_SIZE, shuffle=True,
-        num_workers=RANK_NUM_WORKERS, collate_fn=dataset.collate_fn,
-        pin_memory=True, persistent_workers=RANK_NUM_WORKERS > 0,
+        dataset, 
+        batch_size=RANK_BATCH_SIZE, # Suggest increasing this in config.yaml to 16384+
+        shuffle=True,
+        num_workers=32,             # Hardcoded for 1TB machine, or use RANK_NUM_WORKERS
+        collate_fn=dataset.collate_fn,
+        pin_memory=False,           # Better performance with huge shared memory on Linux
+        persistent_workers=True,
+        prefetch_factor=4           # Each worker will prefetch 4 batches
     )
 
     # 6. Build model
