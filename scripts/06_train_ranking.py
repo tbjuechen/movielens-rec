@@ -95,8 +95,8 @@ def main():
     dataset = RankingDataset(samples, user_profile, item_profile)
     dataloader = DataLoader(
         dataset, batch_size=RANK_BATCH_SIZE, shuffle=True,
-        num_workers=0,  # collate_fn does vectorized batch lookup; workers add IPC overhead
-        collate_fn=dataset.collate_fn, pin_memory=True,
+        num_workers=RANK_NUM_WORKERS, collate_fn=dataset.collate_fn,
+        pin_memory=True, persistent_workers=RANK_NUM_WORKERS > 0,
     )
 
     # 6. Build model
