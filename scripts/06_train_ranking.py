@@ -62,11 +62,18 @@ def main():
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
 
-    # 3. Build training samples
-    print("[3/6] Building training samples...")
-    all_item_ids = item_profile['movieId'].values
-    samples = build_ranking_samples(train_data, all_item_ids,
-                                    neg_sample_ratio=RANK_NEG_SAMPLE_RATIO, seed=42)
+    # 3. Load pre-generated ranking samples (from 05_build_ranking_data.py)
+    print("[3/6] Loading ranking samples...")
+    ranking_samples_path = Path(PROCESSED_DATA_DIR) / "ranking_train_samples.parquet"
+    if not ranking_samples_path.exists():
+        print(f"  {ranking_samples_path} not found, falling back to random negative sampling...")
+        all_item_ids = item_profile['movieId'].values
+        samples = build_ranking_samples(train_data, all_item_ids,
+                                        neg_sample_ratio=RANK_NEG_SAMPLE_RATIO, seed=42)
+    else:
+        samples_df = pd.read_parquet(ranking_samples_path)
+        samples = samples_df[['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating']].values
+        print(f"  Loaded {len(samples):,} recall-based samples")
     n_pos = int((samples[:, 2] > 0.5).sum())
     n_neg = len(samples) - n_pos
     print(f"  total={len(samples):,} (pos={n_pos:,}, neg={n_neg:,})")

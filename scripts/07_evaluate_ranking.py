@@ -194,7 +194,10 @@ def evaluate(test_mode=False):
 
     # 6. Prepare eval users & user lookup arrays
     val_ground_truth = val_data.groupby('userId')['movieId'].apply(list).to_dict()
-    eval_users = [uid for uid in val_ground_truth if uid in set(user_profile['userId'].values)]
+    user_history_dict = dict(zip(user_profile['userId'].values, user_profile['history'].values))
+    uid_set = set(user_profile['userId'].values)
+    eval_users = [uid for uid in val_ground_truth
+                  if uid in uid_set and len(user_history_dict.get(uid, [])) >= 5]
     if test_mode:
         eval_users = eval_users[:1000]
     print(f"Evaluating {len(eval_users)} users...")
@@ -222,7 +225,6 @@ def evaluate(test_mode=False):
             user_ts_diff_arr[uid, :len(ts)] = ts
 
     # Dicts for recall workers
-    user_history_dict = dict(zip(user_profile['userId'].values, user_profile['history'].values))
     user_top_genres_dict = dict(zip(user_profile['userId'].values, user_profile['top_genres'].values))
     user_watched_dict = {}
     for uid_val, hist in user_history_dict.items():

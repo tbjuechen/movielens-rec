@@ -134,7 +134,10 @@ def evaluate(test_mode=False):
     # 4. Prepare Eval Users
     val_ground_truth = val_data.groupby('userId')['movieId'].apply(list).to_dict()
     user_profile_indexed = user_profile.set_index('userId')
-    eval_users = list(val_ground_truth.keys())
+    eval_users = [uid for uid in val_ground_truth
+                  if uid in user_profile_indexed.index
+                  and isinstance(user_profile_indexed.loc[uid, 'history'], (list, np.ndarray))
+                  and len(user_profile_indexed.loc[uid, 'history']) >= 5]
     if test_mode:
         eval_users = eval_users[:1000]
 
@@ -143,8 +146,6 @@ def evaluate(test_mode=False):
     metrics = defaultdict(list)
 
     for uid in tqdm(eval_users, desc="Evaluating"):
-        if uid not in user_profile_indexed.index:
-            continue
         user_row = user_profile_indexed.loc[uid]
         actual_items = val_ground_truth[uid]
         channels = {}
