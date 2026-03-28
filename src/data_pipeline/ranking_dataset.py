@@ -20,42 +20,57 @@ class RankingDataset(Dataset):
         self.n = n
         print(f"  Building lookup tables for {n:,} samples...")
 
-        # Store raw sample columns as contiguous arrays
-        self.uids = samples[:, 0].astype(np.int64)
-        self.iids = samples[:, 1].astype(np.int64)
-        self.ctr_label = samples[:, 2].astype(np.float32)
-        self.rating_label = samples[:, 3].astype(np.float32)
-        self.has_rating = (samples[:, 4] > 0.5)
+        # Store raw sample columns as contiguous tensors to avoid Python CoW memory duplication in DataLoader
+        self.uids = torch.from_numpy(samples[:, 0].astype(np.int64))
+        self.iids = torch.from_numpy(samples[:, 1].astype(np.int64))
+        self.ctr_label = torch.from_numpy(samples[:, 2].astype(np.float32))
+        self.rating_label = torch.from_numpy(samples[:, 3].astype(np.float32))
+        self.has_rating = torch.from_numpy(samples[:, 4].astype(np.float32)) > 0.5
 
         # --- Build lookup tables (shared across all collate calls) ---
         max_u = int(user_profile_df['userId'].max())
         max_i = int(item_profile_df['movieId'].max())
 
         u_idx = user_profile_df['userId'].values
-        self.user_encoded_id = np.zeros(max_u + 1, dtype=np.int64)
-        self.user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
-        self.user_activity = np.zeros(max_u + 1, dtype=np.float32)
-        self.user_top_genres = np.zeros((max_u + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
-        self.user_encoded_id[u_idx] = user_profile_df['userId_encoded'].values
-        self.user_avg_rating[u_idx] = user_profile_df['avg_rating_norm'].values
-        self.user_activity[u_idx] = user_profile_df['activity_norm'].values
-        self.user_top_genres[u_idx] = np.stack(user_profile_df['top_genres_encoded'].values)
+        user_encoded_id = np.zeros(max_u + 1, dtype=np.int64)
+        user_avg_rating = np.zeros(max_u + 1, dtype=np.float32)
+        user_activity = np.zeros(max_u + 1, dtype=np.float32)
+        user_top_genres = np.zeros((max_u + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
+        user_encoded_id[u_idx] = user_profile_df['userId_encoded'].values
+        user_avg_rating[u_idx] = user_profile_df['avg_rating_norm'].values
+        user_activity[u_idx] = user_profile_df['activity_norm'].values
+        user_top_genres[u_idx] = np.stack(user_profile_df['top_genres_encoded'].values)
+
+        # Convert to PyTorch Tensors for DataLoader shared memory
+        self.user_encoded_id = torch.from_numpy(user_encoded_id)
+        self.user_avg_rating = torch.from_numpy(user_avg_rating)
+        self.user_activity = torch.from_numpy(user_activity)
+        self.user_top_genres = torch.from_numpy(user_top_genres)
 
         i_idx = item_profile_df['movieId'].values
-        self.item_encoded_id = np.zeros(max_i + 1, dtype=np.int64)
-        self.item_release_year = np.zeros(max_i + 1, dtype=np.float32)
-        self.item_avg_rating = np.zeros(max_i + 1, dtype=np.float32)
-        self.item_revenue = np.zeros(max_i + 1, dtype=np.float32)
-        self.item_budget = np.zeros(max_i + 1, dtype=np.float32)
-        self.item_vote_count = np.zeros(max_i + 1, dtype=np.float32)
-        self.item_genres = np.zeros((max_i + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
-        self.item_encoded_id[i_idx] = item_profile_df['movieId_encoded'].values
-        self.item_release_year[i_idx] = item_profile_df['release_year_norm'].values
-        self.item_avg_rating[i_idx] = item_profile_df['avg_rating_norm'].values
-        self.item_revenue[i_idx] = item_profile_df['revenue_norm'].values
-        self.item_budget[i_idx] = item_profile_df['budget_norm'].values
-        self.item_vote_count[i_idx] = item_profile_df['vote_count_ml_norm'].values
-        self.item_genres[i_idx] = np.stack(item_profile_df['tmdb_genres_encoded'].values)
+        item_encoded_id = np.zeros(max_i + 1, dtype=np.int64)
+        item_release_year = np.zeros(max_i + 1, dtype=np.float32)
+        item_avg_rating = np.zeros(max_i + 1, dtype=np.float32)
+        item_revenue = np.zeros(max_i + 1, dtype=np.float32)
+        item_budget = np.zeros(max_i + 1, dtype=np.float32)
+        item_vote_count = np.zeros(max_i + 1, dtype=np.float32)
+        item_genres = np.zeros((max_i + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
+        item_encoded_id[i_idx] = item_profile_df['movieId_encoded'].values
+        item_release_year[i_idx] = item_profile_df['release_year_norm'].values
+        item_avg_rating[i_idx] = item_profile_df['avg_rating_norm'].values
+        item_revenue[i_idx] = item_profile_df['revenue_norm'].values
+        item_budget[i_idx] = item_profile_df['budget_norm'].values
+        item_vote_count[i_idx] = item_profile_df['vote_count_ml_norm'].values
+        item_genres[i_idx] = np.stack(item_profile_df['tmdb_genres_encoded'].values)
+
+        # Convert to PyTorch Tensors for DataLoader shared memory
+        self.item_encoded_id = torch.from_numpy(item_encoded_id)
+        self.item_release_year = torch.from_numpy(item_release_year)
+        self.item_avg_rating = torch.from_numpy(item_avg_rating)
+        self.item_revenue = torch.from_numpy(item_revenue)
+        self.item_budget = torch.from_numpy(item_budget)
+        self.item_vote_count = torch.from_numpy(item_vote_count)
+        self.item_genres = torch.from_numpy(item_genres)
 
         print(f"  Lookup tables built. Sample memory: ~{n * 5 * 4 / 1e9:.1f}GB")
 
@@ -66,26 +81,26 @@ class RankingDataset(Dataset):
         return idx
 
     def collate_fn(self, indices):
-        """Batch collate: lookup features from pre-built numpy arrays."""
-        idx = np.array(indices, dtype=np.int64)
+        """Batch collate: lookup features from pre-built tensor arrays."""
+        idx = torch.tensor(indices, dtype=torch.long)
         uids = self.uids[idx]
         iids = self.iids[idx]
 
         return {
-            'user_id': torch.from_numpy(self.user_encoded_id[uids]),
-            'item_id': torch.from_numpy(self.item_encoded_id[iids]),
-            'user_top_genres': torch.from_numpy(self.user_top_genres[uids]),
-            'item_genres': torch.from_numpy(self.item_genres[iids]),
-            'user_avg_rating': torch.from_numpy(self.user_avg_rating[uids].copy()),
-            'user_activity': torch.from_numpy(self.user_activity[uids].copy()),
-            'item_release_year': torch.from_numpy(self.item_release_year[iids].copy()),
-            'item_avg_rating': torch.from_numpy(self.item_avg_rating[iids].copy()),
-            'item_revenue': torch.from_numpy(self.item_revenue[iids].copy()),
-            'item_budget': torch.from_numpy(self.item_budget[iids].copy()),
-            'item_vote_count': torch.from_numpy(self.item_vote_count[iids].copy()),
-            'ctr_label': torch.from_numpy(self.ctr_label[idx].copy()),
-            'rating_label': torch.from_numpy(self.rating_label[idx].copy()),
-            'has_rating': torch.from_numpy(self.has_rating[idx].copy()),
+            'user_id': self.user_encoded_id[uids],
+            'item_id': self.item_encoded_id[iids],
+            'user_top_genres': self.user_top_genres[uids],
+            'item_genres': self.item_genres[iids],
+            'user_avg_rating': self.user_avg_rating[uids],
+            'user_activity': self.user_activity[uids],
+            'item_release_year': self.item_release_year[iids],
+            'item_avg_rating': self.item_avg_rating[iids],
+            'item_revenue': self.item_revenue[iids],
+            'item_budget': self.item_budget[iids],
+            'item_vote_count': self.item_vote_count[iids],
+            'ctr_label': self.ctr_label[idx],
+            'rating_label': self.rating_label[idx],
+            'has_rating': self.has_rating[idx],
         }
 
 
