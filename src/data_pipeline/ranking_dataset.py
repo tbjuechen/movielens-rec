@@ -58,10 +58,12 @@ class RankingDataset(Dataset):
         user_top_genres[u_idx] = np.array(user_genres_list, dtype=np.int64)
         del user_genres_list
 
+        # PRE-MERGE User Continuous Features (B, 2)
+        user_cont = np.stack([user_avg_rating, user_activity], axis=1)
+        self.user_cont_table = torch.from_numpy(user_cont).share_memory_()
+
         # Convert to PyTorch Tensors and ENABLE SHARED MEMORY
         self.user_encoded_id = torch.from_numpy(user_encoded_id).share_memory_()
-        self.user_avg_rating = torch.from_numpy(user_avg_rating).share_memory_()
-        self.user_activity = torch.from_numpy(user_activity).share_memory_()
         self.user_top_genres = torch.from_numpy(user_top_genres).share_memory_()
 
         print(f"  Processing item profile lookup tables...")
@@ -85,13 +87,15 @@ class RankingDataset(Dataset):
         item_genres[i_idx] = np.array(item_genres_list, dtype=np.int64)
         del item_genres_list
 
+        # PRE-MERGE Item Continuous Features (B, 5)
+        item_cont = np.stack([
+            item_release_year, item_avg_rating, item_revenue, 
+            item_budget, item_vote_count
+        ], axis=1)
+        self.item_cont_table = torch.from_numpy(item_cont).share_memory_()
+
         # Convert to PyTorch Tensors and ENABLE SHARED MEMORY
         self.item_encoded_id = torch.from_numpy(item_encoded_id).share_memory_()
-        self.item_release_year = torch.from_numpy(item_release_year).share_memory_()
-        self.item_avg_rating = torch.from_numpy(item_avg_rating).share_memory_()
-        self.item_revenue = torch.from_numpy(item_revenue).share_memory_()
-        self.item_budget = torch.from_numpy(item_budget).share_memory_()
-        self.item_vote_count = torch.from_numpy(item_vote_count).share_memory_()
         self.item_genres = torch.from_numpy(item_genres).share_memory_()
 
         print(f"  Lookup tables built and shared. Sample memory: ~{n * 5 * 4 / 1e9:.1f}GB")
@@ -109,16 +113,10 @@ class RankingDataset(Dataset):
         iids = self.iids[idx]
 
         # Combine all continuous features into a single block (N, 7)
-        # 0: user_avg_rating, 1: user_activity, 2: item_release_year, 
-        # 3: item_avg_rating, 4: item_revenue, 5: item_budget, 6: item_vote_count
-        cont_features = torch.stack([
-            self.user_avg_rating[uids],
-            self.user_activity[uids],
-            self.item_release_year[iids],
-            self.item_avg_rating[iids],
-            self.item_revenue[iids],
-            self.item_budget[iids],
-            self.item_vote_count[iids]
+        # Faster lookup from 2 pre-merged tables instead of 7
+        cont_features = torch.cat([
+            self.user_cont_table[uids],
+            self.item_cont_table[iids]
         ], dim=1)
 
         return {
