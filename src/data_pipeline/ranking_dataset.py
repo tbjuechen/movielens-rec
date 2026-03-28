@@ -16,16 +16,27 @@ class RankingDataset(Dataset):
     """
 
     def __init__(self, samples, user_profile_df, item_profile_df):
-        n = len(samples)
-        self.n = n
-        print(f"  Building lookup tables for {n:,} samples...")
+        if isinstance(samples, dict):
+            # Input is already optimized dictionary of tensors
+            n = len(samples['userId'])
+            self.n = n
+            print(f"  Using pre-loaded tensor samples: {n:,}")
+            self.uids = samples['userId']
+            self.iids = samples['movieId']
+            self.ctr_label = samples['ctr_label']
+            self.rating_label = samples['rating_norm']
+            self.has_rating = samples['has_rating']
+        else:
+            n = len(samples)
+            self.n = n
+            print(f"  Building lookup tables for {n:,} samples...")
 
-        # Store raw sample columns as contiguous tensors to avoid Python CoW memory duplication in DataLoader
-        self.uids = torch.from_numpy(samples[:, 0].astype(np.int64))
-        self.iids = torch.from_numpy(samples[:, 1].astype(np.int64))
-        self.ctr_label = torch.from_numpy(samples[:, 2].astype(np.float32))
-        self.rating_label = torch.from_numpy(samples[:, 3].astype(np.float32))
-        self.has_rating = torch.from_numpy(samples[:, 4].astype(np.float32)) > 0.5
+            # Store raw sample columns as contiguous tensors to avoid Python CoW memory duplication in DataLoader
+            self.uids = torch.from_numpy(samples[:, 0].astype(np.int64))
+            self.iids = torch.from_numpy(samples[:, 1].astype(np.int64))
+            self.ctr_label = torch.from_numpy(samples[:, 2].astype(np.float32))
+            self.rating_label = torch.from_numpy(samples[:, 3].astype(np.float32))
+            self.has_rating = torch.from_numpy(samples[:, 4].astype(np.float32)) > 0.5
 
         # --- Build lookup tables (shared across all collate calls) ---
         max_u = int(user_profile_df['userId'].max())
@@ -107,7 +118,7 @@ class RankingDataset(Dataset):
 def build_ranking_samples(train_data, all_item_ids, neg_sample_ratio=3, seed=42):
     """Construct training samples for ranking model.
 
-    Returns ndarray of shape (N, 5): [userId, movieId, ctr_label, rating_norm, has_rating]
+    Returns dict of ndarrays: [userId, movieId, ctr_label, rating_norm, has_rating]
     """
     rng = np.random.RandomState(seed)
 
@@ -134,22 +145,19 @@ def build_ranking_samples(train_data, all_item_ids, neg_sample_ratio=3, seed=42)
     implicit_items = rng.choice(all_items_arr, size=n_implicit)
     print(f"Implicit negative sampling done.")
 
-    neg_implicit = np.column_stack([
-        implicit_users,
-        implicit_items,
-        np.zeros(n_implicit),      # ctr_label
-        np.zeros(n_implicit),      # rating_norm (placeholder)
-        np.zeros(n_implicit),      # has_rating = False
-    ])
+    # Combine all samples while keeping them separate
+    uids = np.concatenate([pos['userId'].values, neg_explicit['userId'].values, implicit_users])
+    iids = np.concatenate([pos['movieId'].values, neg_explicit['movieId'].values, implicit_items])
+    ctr_labels = np.concatenate([pos['ctr_label'].values, neg_explicit['ctr_label'].values, np.zeros(n_implicit)])
+    rating_norms = np.concatenate([pos['rating_norm'].values, neg_explicit['rating_norm'].values, np.zeros(n_implicit)])
+    has_ratings = np.concatenate([pos['has_rating'].values, neg_explicit['has_rating'].values, np.zeros(n_implicit)])
 
-    # Combine all samples
-    cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating']
-    explicit = np.vstack([
-        pos[cols].values,
-        neg_explicit[cols].values,
-    ])
-    all_samples = np.vstack([explicit, neg_implicit])
-
-    # Shuffle
-    perm = rng.permutation(len(all_samples))
-    return all_samples[perm]
+    # Shuffle everything together
+    perm = rng.permutation(len(uids))
+    return {
+        'userId': uids[perm],
+        'movieId': iids[perm],
+        'ctr_label': ctr_labels[perm],
+        'rating_norm': rating_norms[perm],
+        'has_rating': has_ratings[perm],
+    }

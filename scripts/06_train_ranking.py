@@ -70,13 +70,30 @@ def main():
         all_item_ids = item_profile['movieId'].values
         samples = build_ranking_samples(train_data, all_item_ids,
                                         neg_sample_ratio=RANK_NEG_SAMPLE_RATIO, seed=42)
+        # Convert built samples to Tensors for consistency
+        samples = {k: torch.from_numpy(v) if k != 'has_rating' else torch.from_numpy(v) > 0.5 
+                   for k, v in samples.items()}
     else:
-        samples_df = pd.read_parquet(ranking_samples_path)
-        samples = samples_df[['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating']].values
-        print(f"  Loaded {len(samples):,} recall-based samples")
-    n_pos = int((samples[:, 2] > 0.5).sum())
-    n_neg = len(samples) - n_pos
-    print(f"  total={len(samples):,} (pos={n_pos:,}, neg={n_neg:,})")
+        # Optimization: Use pyarrow for direct column-wise loading into Tensors
+        # This avoids giant Pandas DataFrame and NumPy intermediate copies
+        import pyarrow.parquet as pq
+        cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'has_rating']
+        table = pq.read_table(ranking_samples_path, columns=cols)
+        
+        samples = {
+            'userId': torch.from_numpy(table['userId'].to_numpy().astype(np.int64)),
+            'movieId': torch.from_numpy(table['movieId'].to_numpy().astype(np.int64)),
+            'ctr_label': torch.from_numpy(table['ctr_label'].to_numpy().astype(np.float32)),
+            'rating_norm': torch.from_numpy(table['rating_norm'].to_numpy().astype(np.float32)),
+            'has_rating': torch.from_numpy(table['has_rating'].to_numpy().astype(np.float32)) > 0.5,
+        }
+        print(f"  Loaded {len(samples['userId']):,} recall-based samples (via pyarrow)")
+        del table # Free memory immediately
+        
+    n_pos = int((samples['ctr_label'] > 0.5).sum())
+    n_total = len(samples['userId'])
+    n_neg = n_total - n_pos
+    print(f"  total={n_total:,} (pos={n_pos:,}, neg={n_neg:,})")
 
     # 4. Compute quantile bucket boundaries from training profiles
     print("[4/6] Computing bucket boundaries...")
