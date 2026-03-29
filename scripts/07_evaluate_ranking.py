@@ -82,11 +82,11 @@ def _recall_one_user(uid):
     return uid, merged, actual
 
 
-def evaluate(test_mode=False):
-    print("=== Ranking Evaluation (Pre-aligned Candidates) ===")
+def evaluate(test_mode=False, eval_set='val'):
+    print(f"=== Ranking Evaluation ({eval_set.upper()} Set) ===")
 
     # 1. Load data & encoder
-    ranking_val_path = Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet"
+    ranking_val_path = Path(PROCESSED_DATA_DIR) / f"ranking_{eval_set}_candidates.parquet"
     if not ranking_val_path.exists():
         print(f"ERROR: {ranking_val_path} not found. Run 05_build_ranking_data.py first.")
         return
