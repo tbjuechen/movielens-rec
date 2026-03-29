@@ -83,15 +83,18 @@ def _recall_one_user(uid):
 
 
 def evaluate(test_mode=False):
-    print("=== Ranking End-to-End Evaluation ===")
-
-    MERGE_K = 500
-    RAW_CHANNEL_K = 300
-    CHANNEL_K = 200
-    RECALL_WORKERS = 32
+    print("=== Ranking Evaluation (Pre-aligned Candidates) ===")
 
     # 1. Load data & encoder
-    val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
+    ranking_val_path = Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet"
+    if not ranking_val_path.exists():
+        print(f"ERROR: {ranking_val_path} not found. Run 05_build_ranking_data.py first.")
+        return
+    
+    val_df = pd.read_parquet(ranking_val_path)
+    if test_mode:
+        val_df = val_df.head(1000)
+    
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
     item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
 
@@ -102,57 +105,7 @@ def evaluate(test_mode=False):
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Device: {device}")
 
-    # 2. Load recall models
-    dt_model = DualTowerModel(
-        vocab_sizes=encoder.vocab_sizes, embed_dim=EMBEDDING_DIM, tau=TAU,
-        time_decay_lambda=TIME_DECAY_LAMBDA, bpr_gamma=BPR_GAMMA, bpr_margin=BPR_MARGIN,
-        loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT,
-        logit_scale_max=LOGIT_SCALE_MAX, cont_bucket_size=CONT_BUCKET_SIZE
-    ).to(device)
-    dt_ready = False
-    dt_path = Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth"
-    if dt_path.exists():
-        dt_model.load_state_dict(torch.load(dt_path, map_location=device))
-        dt_ready = True
-    dt_model.eval()
-
-    item_cf = ItemCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "item_sim_matrix.pkl")
-    icf_ready = False
-    try:
-        item_cf.load()
-        icf_ready = True
-    except FileNotFoundError:
-        pass
-
-    pop_recall = PopularityRecall(item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
-    genre_recall = GenreRecall(
-        genre_to_items_path=Path(FEATURE_STORE_DIR) / "genre_to_items.json",
-        item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet"
-    )
-    merger = RecallMerger(top_k=MERGE_K)
-
-    # 3. Build FAISS index
-    index = None
-    idx_to_movie_id = []
-    if dt_ready:
-        print("Building FAISS index...")
-        item_profile_sorted = item_profile.sort_values('movieId_encoded')
-        item_feat_tensors = {
-            'item_id': torch.tensor(item_profile_sorted['movieId_encoded'].values, dtype=torch.long).to(device),
-            'release_year': torch.tensor(item_profile_sorted['release_year_norm'].values, dtype=torch.float32).to(device),
-            'avg_rating': torch.tensor(item_profile_sorted['avg_rating_norm'].values, dtype=torch.float32).to(device),
-            'revenue': torch.tensor(item_profile_sorted['revenue_norm'].values, dtype=torch.float32).to(device),
-            'tmdb_genres': torch.tensor(np.stack(item_profile_sorted['tmdb_genres_encoded'].values), dtype=torch.long).to(device),
-        }
-        with torch.no_grad():
-            _, all_item_embs = dt_model(None, item_feat_tensors)
-            all_item_embs = all_item_embs.cpu().numpy().astype('float32')
-        index = faiss.IndexFlatIP(EMBEDDING_DIM)
-        index.add(all_item_embs)
-        idx_to_movie_id = item_profile_sorted['movieId'].values
-        print(f"FAISS index: {index.ntotal} items")
-
-    # 4. Load ranking model
+    # 2. Load ranking model
     ranking_model = RankingModel(
         vocab_sizes=encoder.vocab_sizes,
         id_embed_dim=RANK_ID_EMBED_DIM,
@@ -167,171 +120,110 @@ def evaluate(test_mode=False):
     ).to(device)
     ranking_path = Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth"
     if not ranking_path.exists():
-        print(f"ERROR: {ranking_path} not found. Train the ranking model first.")
+        print(f"ERROR: {ranking_path} not found.")
         return
     ranking_model.load_state_dict(torch.load(ranking_path, map_location=device, weights_only=True))
     ranking_model.eval()
-    print("Loaded ranking model.")
 
-    # 5. Prepare item feature lookup for ranking (indexed by raw movieId)
+    # 3. Prepare Feature Lookup Matrices (Optimized for evaluation)
+    # Item Lookup
     max_iid = int(item_profile['movieId'].max())
     item_encoded_id = np.zeros(max_iid + 1, dtype=np.int64)
-    item_release_year = np.zeros(max_iid + 1, dtype=np.float32)
-    item_avg_rating = np.zeros(max_iid + 1, dtype=np.float32)
-    item_revenue = np.zeros(max_iid + 1, dtype=np.float32)
-    item_budget = np.zeros(max_iid + 1, dtype=np.float32)
-    item_vote_count = np.zeros(max_iid + 1, dtype=np.float32)
     item_genres_arr = np.zeros((max_iid + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
+    item_cont_arr = np.zeros((max_iid + 1, 5), dtype=np.float32)
 
     i_idx = item_profile['movieId'].values
     item_encoded_id[i_idx] = item_profile['movieId_encoded'].values
-    item_release_year[i_idx] = item_profile['release_year_norm'].values
-    item_avg_rating[i_idx] = item_profile['avg_rating_norm'].values
-    item_revenue[i_idx] = item_profile['revenue_norm'].values
-    item_budget[i_idx] = item_profile['budget_norm'].values
-    item_vote_count[i_idx] = item_profile['vote_count_ml_norm'].values
     item_genres_arr[i_idx] = np.stack(item_profile['tmdb_genres_encoded'].values)
+    item_cont_arr[i_idx] = np.stack([
+        item_profile['release_year_norm'].values,
+        item_profile['avg_rating_norm'].values,
+        item_profile['revenue_norm'].values,
+        item_profile['budget_norm'].values,
+        item_profile['vote_count_ml_norm'].values
+    ], axis=1)
 
-    # 6. Prepare eval users & user lookup arrays
-    val_ground_truth = val_data.groupby('userId')['movieId'].apply(list).to_dict()
-    user_history_dict = dict(zip(user_profile['userId'].values, user_profile['history'].values))
-    uid_set = set(user_profile['userId'].values)
-    eval_users = [uid for uid in val_ground_truth
-                  if uid in uid_set and len(user_history_dict.get(uid, [])) >= 5]
-    if test_mode:
-        eval_users = eval_users[:1000]
-    print(f"Evaluating {len(eval_users)} users...")
+    item_encoded_id = torch.from_numpy(item_encoded_id).to(device)
+    item_genres_arr = torch.from_numpy(item_genres_arr).to(device)
+    item_cont_arr = torch.from_numpy(item_cont_arr).to(device)
 
-    # User feature lookup arrays (for DT batch + ranking)
+    # User Lookup
     max_uid = int(user_profile['userId'].max())
-    u_idx = user_profile['userId'].values
     user_encoded_id = np.zeros(max_uid + 1, dtype=np.int64)
-    user_avg_rating_arr = np.zeros(max_uid + 1, dtype=np.float32)
-    user_activity_arr = np.zeros(max_uid + 1, dtype=np.float32)
-    user_history_arr = np.zeros((max_uid + 1, USER_HISTORY_MAX_LEN), dtype=np.int64)
-    user_ts_diff_arr = np.zeros((max_uid + 1, USER_HISTORY_MAX_LEN), dtype=np.float32)
     user_top_genres_arr = np.zeros((max_uid + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
+    user_cont_arr = np.zeros((max_uid + 1, 2), dtype=np.float32)
 
+    u_idx = user_profile['userId'].values
     user_encoded_id[u_idx] = user_profile['userId_encoded'].values
-    user_avg_rating_arr[u_idx] = user_profile['avg_rating_norm'].values
-    user_activity_arr[u_idx] = user_profile['activity_norm'].values
-    user_history_arr[u_idx] = np.stack(user_profile['history_encoded'].values)
     user_top_genres_arr[u_idx] = np.stack(user_profile['top_genres_encoded'].values)
-    for _, row in user_profile.iterrows():
-        uid = row['userId']
-        ts = row.get('history_ts_diff')
-        if isinstance(ts, (list, np.ndarray)):
-            ts = list(ts)[:USER_HISTORY_MAX_LEN]
-            user_ts_diff_arr[uid, :len(ts)] = ts
+    user_cont_arr[u_idx] = np.stack([
+        user_profile['avg_rating_norm'].values,
+        user_profile['activity_norm'].values
+    ], axis=1)
 
-    # Dicts for recall workers
-    user_top_genres_dict = dict(zip(user_profile['userId'].values, user_profile['top_genres'].values))
-    user_watched_dict = {}
-    for uid_val, hist in user_history_dict.items():
-        user_watched_dict[uid_val] = set(hist) if isinstance(hist, (list, np.ndarray)) else set()
+    user_encoded_id = torch.from_numpy(user_encoded_id).to(device)
+    user_top_genres_arr = torch.from_numpy(user_top_genres_arr).to(device)
+    user_cont_arr = torch.from_numpy(user_cont_arr).to(device)
 
-    pop_candidates = pop_recall.retrieve(k=RAW_CHANNEL_K)
-
-    # ================================================================
-    # Phase 1: Batch DT recall (GPU, fast)
-    # ================================================================
-    dt_results = {}
-    if dt_ready:
-        print("[Phase 1] Batch dual-tower recall...")
-        BATCH = 4096
-        eval_uids_arr = np.array(eval_users, dtype=np.int64)
-        for start in tqdm(range(0, len(eval_users), BATCH), desc="DualTower"):
-            batch_uids = eval_uids_arr[start:start + BATCH]
-            user_tensor = {
-                'user_id': torch.from_numpy(user_encoded_id[batch_uids]).to(device),
-                'avg_rating': torch.from_numpy(user_avg_rating_arr[batch_uids]).to(device),
-                'activity': torch.from_numpy(user_activity_arr[batch_uids]).to(device),
-                'history': torch.from_numpy(user_history_arr[batch_uids]).to(device),
-                'history_ts_diff': torch.from_numpy(user_ts_diff_arr[batch_uids]).to(device),
-                'top_genres': torch.from_numpy(user_top_genres_arr[batch_uids]).to(device),
-            }
-            with torch.no_grad():
-                u_embs, _ = dt_model(user_tensor, None)
-                u_embs = u_embs.cpu().numpy().astype('float32')
-            _, I = index.search(u_embs, RAW_CHANNEL_K)
-            for i, uid in enumerate(batch_uids):
-                dt_results[int(uid)] = [int(idx_to_movie_id[j]) for j in I[i]]
-
-    # ================================================================
-    # Phase 2+3: Parallel recall (CPU) + Ranking (GPU) pipeline
-    # Workers produce recall results, main process consumes for ranking.
-    # pool.imap is lazy — GPU ranking runs while workers are still recalling.
-    # ================================================================
-    print(f"[Phase 2+3] Parallel recall ({RECALL_WORKERS} workers) + GPU ranking...")
-    _shared['dt_results'] = dt_results
-    _shared['item_cf'] = item_cf
-    _shared['icf_ready'] = icf_ready
-    _shared['genre_recall'] = genre_recall
-    _shared['merger'] = merger
-    _shared['pop'] = pop_candidates
-    _shared['history'] = user_history_dict
-    _shared['genres'] = user_top_genres_dict
-    _shared['watched'] = user_watched_dict
-    _shared['ground_truth'] = val_ground_truth
-    _shared['weights'] = MERGER_WEIGHTS
-    _shared['RAW_K'] = RAW_CHANNEL_K
-    _shared['CH_K'] = CHANNEL_K
-
+    # 4. Evaluation Loop
     metrics = defaultdict(list)
     n_recalled = 0
-    n_total = len(eval_users)
-
-    with ThreadPoolExecutor(max_workers=RECALL_WORKERS) as pool:
-        for uid, merged, actual_items in tqdm(
-                pool.map(_recall_one_user, eval_users, chunksize=256),
-                total=n_total, desc="Recall+Rank"):
-
-            if not set(actual_items) & set(merged):
-                continue
+    
+    print(f"Ranking {len(val_df):,} users with batch scoring...")
+    
+    for _, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Ranking"):
+        uid = int(row['userId'])
+        candidates = list(row['candidates'])
+        actual_items = list(row['actual'])
+        
+        if not candidates:
+            continue
+        if set(actual_items) & set(candidates):
             n_recalled += 1
 
-            # Recall baseline metrics
-            for ek in RANK_EVAL_KS:
-                metrics[f'Recall_Baseline_HR@{ek}'].append(hitrate_at_k(actual_items, merged, k=ek))
-                metrics[f'Recall_Baseline_NDCG@{ek}'].append(ndcg_at_k(actual_items, merged, k=ek))
-            metrics['Recall_Baseline_MRR'].append(mrr(actual_items, merged))
+        # Baseline metrics (Recall only)
+        for ek in RANK_EVAL_KS:
+            metrics[f'Recall_Baseline_HR@{ek}'].append(hitrate_at_k(actual_items, candidates, k=ek))
+            metrics[f'Recall_Baseline_NDCG@{ek}'].append(ndcg_at_k(actual_items, candidates, k=ek))
+        metrics['Recall_Baseline_MRR'].append(mrr(actual_items, candidates))
 
-            # Ranking reorder
-            candidates = merged
-            n_cand = len(candidates)
-            cand_arr = np.array(candidates, dtype=np.int64)
+        # Ranking reorder (GPU Batch)
+        cand_arr = torch.tensor(candidates, dtype=torch.long, device=device)
+        n_cand = len(cand_arr)
+        
+        # Prepare merged blocks for RankingModel
+        int_features = torch.cat([
+            user_encoded_id[uid].expand(n_cand, 1),
+            item_encoded_id[cand_arr].unsqueeze(1),
+            user_top_genres_arr[uid].expand(n_cand, -1),
+            item_genres_arr[cand_arr]
+        ], dim=1)
+        
+        float_features = torch.cat([
+            user_cont_arr[uid].expand(n_cand, -1),
+            item_cont_arr[cand_arr]
+        ], dim=1)
+        
+        features = {'int_features': int_features, 'float_features': float_features}
 
-            rank_features = {
-                'user_id': torch.tensor([user_encoded_id[uid]] * n_cand, dtype=torch.long).to(device),
-                'item_id': torch.from_numpy(item_encoded_id[cand_arr]).to(device),
-                'user_top_genres': torch.from_numpy(np.tile(user_top_genres_arr[uid], (n_cand, 1))).to(device),
-                'item_genres': torch.from_numpy(item_genres_arr[cand_arr]).to(device),
-                'user_avg_rating': torch.tensor([user_avg_rating_arr[uid]] * n_cand, dtype=torch.float32).to(device),
-                'user_activity': torch.tensor([user_activity_arr[uid]] * n_cand, dtype=torch.float32).to(device),
-                'item_release_year': torch.from_numpy(item_release_year[cand_arr]).float().to(device),
-                'item_avg_rating': torch.from_numpy(item_avg_rating[cand_arr]).float().to(device),
-                'item_revenue': torch.from_numpy(item_revenue[cand_arr]).float().to(device),
-                'item_budget': torch.from_numpy(item_budget[cand_arr]).float().to(device),
-                'item_vote_count': torch.from_numpy(item_vote_count[cand_arr]).float().to(device),
-            }
+        with torch.no_grad():
+            ctr_logit, pRating = ranking_model(features)
+            pCTR = torch.sigmoid(ctr_logit).squeeze()
+            pRating_clamped = pRating.clamp(min=0.01).squeeze()
+            final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
+            
+            # Sort
+            order = final_score.argsort(descending=True)
+            ranked = [candidates[i] for i in order.cpu().numpy()]
 
-            with torch.no_grad():
-                ctr_logit, pRating = ranking_model(rank_features)
-                pCTR = torch.sigmoid(ctr_logit)
-                pRating_clamped = pRating.clamp(min=0.01)
-                final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
-                order = final_score.cpu().numpy().argsort()[::-1]
-                ranked = [candidates[i] for i in order]
+        for ek in RANK_EVAL_KS:
+            metrics[f'Ranking_HR@{ek}'].append(hitrate_at_k(actual_items, ranked, k=ek))
+            metrics[f'Ranking_NDCG@{ek}'].append(ndcg_at_k(actual_items, ranked, k=ek))
+        metrics['Ranking_MRR'].append(mrr(actual_items, ranked))
 
-            for ek in RANK_EVAL_KS:
-                metrics[f'Ranking_HR@{ek}'].append(hitrate_at_k(actual_items, ranked, k=ek))
-                metrics[f'Ranking_NDCG@{ek}'].append(ndcg_at_k(actual_items, ranked, k=ek))
-            metrics['Ranking_MRR'].append(mrr(actual_items, ranked))
-
-    _shared.clear()
-
-    # Report
-    print(f"\n=== Ranking Evaluation Report ===")
+    # 5. Report
+    n_total = len(val_df)
+    print(f"\n=== Ranking Evaluation Report ({eval_set.upper()}) ===")
     print(f"Total users: {n_total}, Recalled target: {n_recalled} ({n_recalled/max(n_total,1)*100:.1f}%)\n")
 
     print(f"{'Metric':<30} {'Value':>10}")
@@ -345,5 +237,6 @@ def evaluate(test_mode=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Quick eval with 1000 users")
+    parser.add_argument("--set", type=str, default="val", choices=['val', 'test'], help="Set to evaluate: val or test")
     args = parser.parse_args()
-    evaluate(test_mode=args.test)
+    evaluate(test_mode=args.test, eval_set=args.set)

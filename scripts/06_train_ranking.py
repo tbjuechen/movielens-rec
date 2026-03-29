@@ -258,20 +258,23 @@ def main():
                 'LR': f"{optimizer.param_groups[0]['lr']:.6f}",
             })
 
-        avg_loss = np.mean(epoch_losses['total'])
-        scheduler.step(avg_loss)
-        print(f"Epoch {epoch} avg: loss={avg_loss:.4f} "
-              f"BCE={np.mean(epoch_losses['bce']):.4f} "
-              f"MSE={np.mean(epoch_losses['mse']):.4f} "
+        avg_bce = np.mean(epoch_losses['bce'])
+        avg_mse = np.mean(epoch_losses['mse'])
+        # Use unweighted sum for monitoring to avoid GradNorm weight jitter
+        monitor_loss = avg_bce + avg_mse
+        
+        scheduler.step(monitor_loss)
+        print(f"Epoch {epoch} avg: BCE={avg_bce:.4f} MSE={avg_mse:.4f} "
+              f"monitor_sum={monitor_loss:.4f} "
               f"w_ctr={np.mean(epoch_losses['w_ctr']):.2f} "
               f"w_mse={np.mean(epoch_losses['w_mse']):.2f}")
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if monitor_loss < best_loss:
+            best_loss = monitor_loss
             no_improve = 0
             Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
-            print(f"  -> Saved best model (loss={best_loss:.4f})")
+            print(f"  -> Saved best model (monitor_sum={best_loss:.4f})")
         else:
             no_improve += 1
             print(f"  -> No improvement ({no_improve}/{patience})")

@@ -300,43 +300,63 @@ def main():
         print("  WARNING: DualTower not found, skipping DT recall")
 
     # ================================================================
-    # Phase 3: Merge CPU + DT candidates → Create Candidate Pool
+    # Phase 3: Merge CPU + DT candidates → Create Train Pool, Val & Test Candidates
     # ================================================================
-    print("[6/7] Merging candidates into pools...")
+    print("[6/7] Merging candidates into pools (Train/Val/Test)...")
     pool_data = []
+    val_candidate_data = [] 
+    test_candidate_data = []
     final_merger = RecallMerger(top_k=MERGE_K)
+    
+    # Load ground truth for Val and Test
+    val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
+    test_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "test_data.parquet")
+    val_gt = val_data.groupby('userId')['movieId'].apply(list).to_dict()
+    test_gt = test_data.groupby('userId')['movieId'].apply(list).to_dict()
+    
+    # Track the last interaction for each user to generate Eval candidates
+    last_inter_idx = {}
+    for i, inter in enumerate(all_interactions):
+        last_inter_idx[inter[0]] = i
 
-    for uid, mid, rating, snap_idx, channels, watched_list in tqdm(all_interactions, desc="Create Pool"):
-        # Add DT as another channel
+    for i, (uid, mid, rating, snap_idx, channels, watched_list) in enumerate(tqdm(all_interactions, desc="Processing Sets")):
         if dt_ready:
             dt_cands = dt_snap_results.get((uid, snap_idx), [])
             if dt_cands:
                 watched_set = set(watched_list)
                 channels['dual_tower'] = [iid for iid in dt_cands if iid not in watched_set][:RECALL_K]
 
-        # RRF merge
         merged = final_merger.merge(channels, weights=MERGER_WEIGHTS) if channels else []
         if not merged:
             continue
 
-        # Keep Top 100 as the negative candidate pool (excluding the positive item)
+        # 1. Training Data (Every interaction gets a 100-neg pool)
         pool = [int(c) for c in merged if c != mid][:100]
-        if len(pool) < 10: # Skip if too few candidates
-            continue
+        if len(pool) >= 10:
+            ctr_label = 1.0 if rating >= 3.0 else 0.0
+            rating_norm = rating / 5.0
+            pool_data.append((uid, mid, ctr_label, rating_norm, pool))
+            
+        # 2. Evaluation Data (Only at the user's LATEST state in train_data)
+        if i == last_inter_idx[uid]:
+            # Validation Candidates
+            if uid in val_gt:
+                val_candidate_data.append({'userId': uid, 'candidates': merged[:500], 'actual': val_gt[uid]})
+            # Test Candidates
+            if uid in test_gt:
+                test_candidate_data.append({'userId': uid, 'candidates': merged[:500], 'actual': test_gt[uid]})
 
-        ctr_label = 1.0 if rating >= 3.0 else 0.0
-        rating_norm = rating / 5.0
-        pool_data.append((uid, mid, ctr_label, rating_norm, pool))
+    print(f"  Train: {len(pool_data):,}, Val: {len(val_candidate_data):,}, Test: {len(test_candidate_data):,}")
 
-    print(f"  Total positive interactions with pools: {len(pool_data):,}")
-
-    # 7. Save as Pool format
-    print("[7/7] Saving Candidate Pool...")
-    df = pd.DataFrame(pool_data, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool'])
+    # 7. Save
+    print("[7/7] Saving Results...")
+    pd.DataFrame(pool_data, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']).to_parquet(
+        Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet", index=False)
     
-    out_path = Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet"
-    df.to_parquet(out_path, index=False)
-    print(f"\n=== Done ===\nSaved to: {out_path}")
+    pd.DataFrame(val_candidate_data).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet", index=False)
+    pd.DataFrame(test_candidate_data).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)
+    
+    print(f"\n=== Done ===\nSaved all candidate sets to {PROCESSED_DATA_DIR}")
 
 
 if __name__ == "__main__":
