@@ -197,24 +197,25 @@ def evaluate(test_mode=False, eval_set='val'):
             item_encoded_id[cand_arr].unsqueeze(1),
             user_top_genres_arr[uid].expand(n_cand, -1),
             item_genres_arr[cand_arr]
-        ], dim=1)
+        ], dim=1).contiguous()
         
         float_features = torch.cat([
             user_cont_arr[uid].expand(n_cand, -1),
             item_cont_arr[cand_arr]
-        ], dim=1)
+        ], dim=1).contiguous()
         
         features = {'int_features': int_features, 'float_features': float_features}
 
         with torch.no_grad():
             ctr_logit, pRating = ranking_model(features)
-            pCTR = torch.sigmoid(ctr_logit).squeeze()
-            pRating_clamped = pRating.clamp(min=0.01).squeeze()
+            # Use view(-1) instead of squeeze() to avoid 0-d scalar issues when n_cand=1
+            pCTR = torch.sigmoid(ctr_logit).view(-1)
+            pRating_clamped = pRating.clamp(min=0.01).view(-1)
             final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
             
             # Sort
             order = final_score.argsort(descending=True)
-            ranked = [candidates[i] for i in order.cpu().numpy()]
+            ranked = [candidates[i] for i in order.cpu().numpy().reshape(-1)]
 
         for ek in RANK_EVAL_KS:
             metrics[f'Ranking_HR@{ek}'].append(hitrate_at_k(actual_items, ranked, k=ek))
