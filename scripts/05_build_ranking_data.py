@@ -43,146 +43,145 @@ DT_BATCH = 4096
 _shared = {}
 
 
-def _build_user_snapshots(uid):
-    """Worker: build feature snapshots and CPU recall candidates for one user.
-
-    Returns:
-        interactions_out: list of (uid, mid, rating, snap_idx, channels_dict, watched_list)
-            where channels_dict has per-channel candidate lists (watched filtered)
-        snapshots_out: list of (uid, snap_idx, history_list, top_genres_list)
-            unique snapshots needed for DT recall
-    """
+def _build_user_data(uid):
+    """Worker: Build EVERYTHING for one user (Recall + Merge + Training/Eval data)."""
     s = _shared
-    interactions = s['user_interactions'][uid]  # list of (movieId, rating, genres_str, timestamp)
+    interactions = s['user_interactions'][uid] 
     item_cf = s['item_cf']
     icf_ready = s['icf_ready']
     genre_recall = s['genre_recall']
     pop_candidates = s['pop']
     merger = s['merger']
     weights = s['weights']
+    val_gt = s['val_gt']
+    test_gt = s['test_gt']
 
-    interactions_out = []
-    snapshots_out = []
+    train_out = []
+    val_out = []
+    test_out = []
+    snapshots_out = [] # Needed for Phase 2 GPU DT recall
+    
     history = []
-    history_ts = []  # timestamps for ts_diff computation
+    history_ts = []
     genre_counter = Counter()
 
     n_total = len(interactions)
     sample_start = max(0, n_total - MAX_INTERACTIONS_PER_USER)
-    cur_snap_idx = -1
 
     for i, (mid, rating, genres_str, timestamp) in enumerate(interactions):
-        # Update snapshot every SNAPSHOT_WINDOW interactions
+        # 1. Update Snapshot (Features)
         if i % SNAPSHOT_WINDOW == 0:
             snap_history = list(history[-USER_HISTORY_MAX_LEN:])
             snap_top_genres = [g for g, _ in genre_counter.most_common(USER_TOP_GENRES_MAX_LEN)]
-            # Compute ts_diff: (latest_ts - each_ts) / 3600
             if history_ts:
                 recent_ts = history_ts[-USER_HISTORY_MAX_LEN:]
                 max_ts = recent_ts[-1]
                 snap_ts_diff = [(max_ts - t) / 3600.0 for t in recent_ts]
             else:
                 snap_ts_diff = []
+            
             cur_snap_idx = i // SNAPSHOT_WINDOW
             if i >= sample_start:
                 snapshots_out.append((uid, cur_snap_idx, snap_history, snap_top_genres, snap_ts_diff))
 
+        # 2. Recall + Merge (If in sampling window)
         if i >= sample_start:
             watched_set = set(history)
             channels = {}
-
             if icf_ready and snap_history:
-                channels['item_cf'] = item_cf.retrieve(snap_history, k=RECALL_K)
-            channels['popularity'] = pop_candidates
+                channels['item_cf'] = [iid for iid in item_cf.retrieve(snap_history, k=RECALL_K) if iid not in watched_set][:RECALL_K]
+            channels['popularity'] = [iid for iid in pop_candidates if iid not in watched_set][:RECALL_K]
             if snap_top_genres:
-                channels['genre'] = genre_recall.retrieve(snap_top_genres, k=RECALL_K)
+                channels['genre'] = [iid for iid in genre_recall.retrieve(snap_top_genres, k=RECALL_K) if iid not in watched_set][:RECALL_K]
 
-            # Filter watched per channel (keep separate for Phase 3 multi-channel merge)
-            for name in list(channels.keys()):
-                channels[name] = [iid for iid in channels[name] if iid not in watched_set][:RECALL_K]
+            # RRF Merge (Initial CPU-only merge, DT will be added later if available)
+            merged = merger.merge(channels, weights=weights) if channels else []
+            
+            # Record state for training
+            if merged:
+                # We'll placeholder the DT results and do a second pass merge for DT in main()
+                # to keep workers CPU-only and avoid CUDA fork issues.
+                # But we can already save the non-DT merged list.
+                ctr_label = 1.0 if rating >= 3.0 else 0.0
+                rating_norm = rating / 5.0
+                train_out.append({
+                    'uid': uid, 'mid': mid, 'ctr': ctr_label, 'rat': rating_norm,
+                    'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW
+                })
 
-            interactions_out.append((uid, mid, rating, cur_snap_idx, channels, list(watched_set)))
+            # Record state for Evaluation (If it's the last interaction)
+            if i == n_total - 1:
+                if uid in val_gt:
+                    val_out.append({'userId': uid, 'cpu_merged': merged, 'actual': val_gt[uid], 'snap_idx': i // SNAPSHOT_WINDOW, 'watched': list(watched_set)})
+                if uid in test_gt:
+                    test_out.append({'userId': uid, 'cpu_merged': merged, 'actual': test_gt[uid], 'snap_idx': i // SNAPSHOT_WINDOW, 'watched': list(watched_set)})
 
-        # Update history (always)
+        # Update History
         history.append(mid)
         history_ts.append(timestamp)
         if genres_str:
             for g in genres_str.split('|'):
                 genre_counter[g] += 1
 
-    return interactions_out, snapshots_out
-
+    return train_out, val_out, test_out, snapshots_out
 
 def main():
-    print("=== Building Ranking Training Data (Recall-Based Candidates) ===")
+    print("=== Building Ranking Data (Optimized Multiprocessing) ===")
 
     # 1. Load data
     print("[1/7] Loading data...")
     train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
-    print(f"  train_data: {len(train_data):,} interactions")
-
+    val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
+    test_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "test_data.parquet")
+    
     raw_dir = Path(PROCESSED_DATA_DIR).parent / "raw" / "ml-32m"
     movies = pd.read_csv(raw_dir / "movies.csv")
     movie_genres = dict(zip(movies['movieId'].values, movies['genres'].values))
 
-    # 2. Load CPU recall models (before CUDA init for fork safety)
-    print("[2/7] Loading recall models...")
+    # 2. Load CPU models
+    print("[2/7] Loading CPU recall models...")
     item_cf = ItemCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "item_sim_matrix.pkl")
-    icf_ready = False
-    try:
-        item_cf.load()
-        icf_ready = True
-    except FileNotFoundError:
-        print("  WARNING: ItemCF not found, skipping")
-
+    item_cf.load()
     pop_recall = PopularityRecall(item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
     genre_recall = GenreRecall(
         genre_to_items_path=Path(FEATURE_STORE_DIR) / "genre_to_items.json",
         item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet"
     )
-    merger = RecallMerger(top_k=MERGE_K)
     pop_candidates = pop_recall.retrieve(k=RECALL_K)
 
-    # 3. Prepare per-user interaction lists
+    # 3. Sort & Group
     print("[3/7] Preparing per-user interactions...")
     train_data = train_data.sort_values(['userId', 'timestamp'])
     train_data['genres_str'] = train_data['movieId'].map(movie_genres).fillna('')
+    user_interactions = {uid: list(zip(g['movieId'].values, g['rating'].values, g['genres_str'].values, g['timestamp'].values))
+                         for uid, g in tqdm(train_data.groupby('userId'), desc="Grouping")}
+    
+    val_gt = val_data.groupby('userId')['movieId'].apply(list).to_dict()
+    test_gt = test_data.groupby('userId')['movieId'].apply(list).to_dict()
 
-    user_interactions = {}
-    for uid, group in tqdm(train_data.groupby('userId'), desc="Grouping"):
-        user_interactions[uid] = list(zip(
-            group['movieId'].values,
-            group['rating'].values,
-            group['genres_str'].values,
-            group['timestamp'].values,
-        ))
-    eval_users = list(user_interactions.keys())
-    print(f"  {len(eval_users):,} users, {len(train_data):,} interactions")
+    # 4. Phase 1: Parallel CPU Recall + Merge
+    print(f"[4/7] Phase 1: Parallel Recall & Merge ({RECALL_WORKERS} workers)...")
+    _shared.update({
+        'user_interactions': user_interactions, 'item_cf': item_cf, 'icf_ready': True,
+        'genre_recall': genre_recall, 'pop': pop_candidates,
+        'merger': RecallMerger(top_k=MERGE_K), 'weights': MERGER_WEIGHTS,
+        'val_gt': val_gt, 'test_gt': test_gt
+    })
 
-    # ================================================================
-    # Phase 1: Multiprocessing CPU recall (ItemCF + Pop + Genre)
-    # Must fork BEFORE any CUDA init to avoid deadlock
-    # ================================================================
-    print(f"[4/7] Phase 1: Parallel CPU recall ({RECALL_WORKERS} workers)...")
-    _shared['user_interactions'] = user_interactions
-    _shared['item_cf'] = item_cf
-    _shared['icf_ready'] = icf_ready
-    _shared['genre_recall'] = genre_recall
-    _shared['pop'] = pop_candidates
-    _shared['merger'] = merger
-    _shared['weights'] = MERGER_WEIGHTS
-
-    all_interactions = []  # (uid, mid, rating, snap_idx, cpu_merged, watched_list)
-    all_snapshots = []     # (uid, snap_idx, history_list, top_genres_list)
+    all_train = []; all_val = []; all_test = []; all_snapshots = []
     with Pool(RECALL_WORKERS) as pool:
-        for interactions_out, snapshots_out in tqdm(
-                pool.imap(_build_user_snapshots, eval_users, chunksize=64),
-                total=len(eval_users), desc="CPU Recall"):
-            all_interactions.extend(interactions_out)
-            all_snapshots.extend(snapshots_out)
+        for t, v, te, s in tqdm(pool.imap(_build_user_data, list(user_interactions.keys()), chunksize=64),
+                               total=len(user_interactions), desc="Parallel Build"):
+            all_train.extend(t); all_val.extend(v); all_test.extend(te); all_snapshots.extend(s)
     _shared.clear()
 
-    print(f"  Phase 1 done: {len(all_interactions):,} interactions, {len(all_snapshots):,} snapshots")
+    # 5. Phase 2: DualTower (GPU)
+    print("[5/7] Phase 2: DualTower recall (GPU batch)...")
+    # ... [Keep FAISS and DT logic, it's already fast] ...
+    # Assume dt_snap_results is populated from batch DT search
+    
+    # [Rest of Phase 2 logic remains similar, getting dt_snap_results]
+
 
     # ================================================================
     # Phase 2: DualTower recall (GPU batch, after fork)
@@ -274,8 +273,10 @@ def main():
             for j, td in enumerate(ts_diff[-USER_HISTORY_MAX_LEN:]):
                 snap_ts_diff_arr[si, j] = td
 
-        # Batch forward + FAISS search
-        n_snaps = len(snap_keys)
+    # Batch forward + FAISS search
+    n_snaps = len(snap_keys)
+    dt_snap_results = {}
+    if dt_ready and n_snaps > 0:
         print(f"  Batch DT forward ({n_snaps:,} snapshots, batch={DT_BATCH})...")
         for start in tqdm(range(0, n_snaps, DT_BATCH), desc="DT Recall"):
             end = min(start + DT_BATCH, n_snaps)
@@ -294,69 +295,64 @@ def main():
             _, I = index.search(u_embs, RECALL_K)
             for i in range(end - start):
                 dt_snap_results[snap_keys[start + i]] = [int(idx_to_movie_id[j]) for j in I[i]]
-
         print(f"  DT recall done: {len(dt_snap_results):,} snapshot results")
-    else:
-        print("  WARNING: DualTower not found, skipping DT recall")
 
     # ================================================================
-    # Phase 3: Merge CPU + DT candidates → Create Train Pool, Val & Test Candidates
+    # Phase 3: Final Integration (Merge DT with CPU-only pools)
     # ================================================================
-    print("[6/7] Merging candidates into pools (Train/Val/Test)...")
-    pool_data = []
-    val_candidate_data = [] 
-    test_candidate_data = []
-    final_merger = RecallMerger(top_k=MERGE_K)
-    
-    # Load ground truth for Val and Test
-    val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
-    test_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "test_data.parquet")
-    val_gt = val_data.groupby('userId')['movieId'].apply(list).to_dict()
-    test_gt = test_data.groupby('userId')['movieId'].apply(list).to_dict()
-    
-    # Track the last interaction for each user to generate Eval candidates
-    last_inter_idx = {}
-    for i, inter in enumerate(all_interactions):
-        last_inter_idx[inter[0]] = i
+    print("[6/7] Integrating DualTower into candidate pools...")
+    pool_merger = RecallMerger(top_k=MERGE_K)
+    final_train = []
+    final_val = []
+    final_test = []
 
-    for i, (uid, mid, rating, snap_idx, channels, watched_list) in enumerate(tqdm(all_interactions, desc="Processing Sets")):
-        if dt_ready:
-            dt_cands = dt_snap_results.get((uid, snap_idx), [])
-            if dt_cands:
-                watched_set = set(watched_list)
-                channels['dual_tower'] = [iid for iid in dt_cands if iid not in watched_set][:RECALL_K]
-
-        merged = final_merger.merge(channels, weights=MERGER_WEIGHTS) if channels else []
-        if not merged:
-            continue
-
-        # 1. Training Data (Every interaction gets a 100-neg pool)
+    # Process Train interactions
+    for item in tqdm(all_train, desc="Final Train Pool"):
+        uid, mid, snap_idx = item['uid'], item['mid'], item['snap_idx']
+        cpu_merged = item['cpu_merged']
+        watched_set = set(item['watched'])
+        
+        dt_cands = dt_snap_results.get((uid, snap_idx), [])
+        if dt_cands:
+            dt_cands = [c for c in dt_cands if c not in watched_set][:RECALL_K]
+            # Fast merge: combine CPU results with DT
+            merged = pool_merger.merge({'cpu': cpu_merged, 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
+        else:
+            merged = cpu_merged
+            
         pool = [int(c) for c in merged if c != mid][:100]
         if len(pool) >= 10:
-            ctr_label = 1.0 if rating >= 3.0 else 0.0
-            rating_norm = rating / 5.0
-            pool_data.append((uid, mid, ctr_label, rating_norm, pool))
-            
-        # 2. Evaluation Data (Only at the user's LATEST state in train_data)
-        if i == last_inter_idx[uid]:
-            # Validation Candidates
-            if uid in val_gt:
-                val_candidate_data.append({'userId': uid, 'candidates': merged[:500], 'actual': val_gt[uid]})
-            # Test Candidates
-            if uid in test_gt:
-                test_candidate_data.append({'userId': uid, 'candidates': merged[:500], 'actual': test_gt[uid]})
+            final_train.append((uid, mid, item['ctr'], item['rat'], pool))
 
-    print(f"  Train: {len(pool_data):,}, Val: {len(val_candidate_data):,}, Test: {len(test_candidate_data):,}")
+    # Process Eval sets
+    for item in tqdm(all_val, desc="Final Val Pool"):
+        uid, snap_idx = item['userId'], item['snap_idx']
+        dt_cands = dt_snap_results.get((uid, snap_idx), [])
+        if dt_cands:
+            dt_cands = [c for c in dt_cands if c not in set(item['watched'])][:RECALL_K]
+            merged = pool_merger.merge({'cpu': item['cpu_merged'], 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
+        else:
+            merged = item['cpu_merged']
+        final_val.append({'userId': uid, 'candidates': merged[:500], 'actual': item['actual']})
+
+    for item in tqdm(all_test, desc="Final Test Pool"):
+        uid, snap_idx = item['userId'], item['snap_idx']
+        dt_cands = dt_snap_results.get((uid, snap_idx), [])
+        if dt_cands:
+            dt_cands = [c for c in dt_cands if c not in set(item['watched'])][:RECALL_K]
+            merged = pool_merger.merge({'cpu': item['cpu_merged'], 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
+        else:
+            merged = item['cpu_merged']
+        final_test.append({'userId': uid, 'candidates': merged[:500], 'actual': item['actual']})
 
     # 7. Save
     print("[7/7] Saving Results...")
-    pd.DataFrame(pool_data, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']).to_parquet(
+    pd.DataFrame(final_train, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']).to_parquet(
         Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet", index=False)
+    pd.DataFrame(final_val).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet", index=False)
+    pd.DataFrame(final_test).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)
     
-    pd.DataFrame(val_candidate_data).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet", index=False)
-    pd.DataFrame(test_candidate_data).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)
-    
-    print(f"\n=== Done ===\nSaved all candidate sets to {PROCESSED_DATA_DIR}")
+    print(f"\n=== Done ===\nSaved Training: {len(final_train):,}, Val: {len(final_val):,}, Test: {len(final_test):,}")
 
 
 if __name__ == "__main__":
