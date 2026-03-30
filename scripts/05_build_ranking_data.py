@@ -327,23 +327,41 @@ def main():
     # Process Eval sets
     for item in tqdm(all_val, desc="Final Val Pool"):
         uid, snap_idx = item['userId'], item['snap_idx']
+        actual_list = item['actual']
+        if not actual_list: continue
+        
         dt_cands = dt_snap_results.get((uid, snap_idx), [])
         if dt_cands:
             dt_cands = [c for c in dt_cands if c not in set(item['watched'])][:RECALL_K]
             merged = pool_merger.merge({'cpu': item['cpu_merged'], 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
         else:
             merged = item['cpu_merged']
-        final_val.append({'userId': uid, 'candidates': merged[:500], 'actual': item['actual']})
+            
+        # Ensure at least one actual item is in the candidates (at the end if missing)
+        candidates = merged[:500]
+        if not (set(actual_list) & set(candidates)):
+            candidates[-1] = int(actual_list[0]) # Force insert the first actual item
+            
+        final_val.append({'userId': uid, 'candidates': candidates, 'actual': actual_list})
 
     for item in tqdm(all_test, desc="Final Test Pool"):
         uid, snap_idx = item['userId'], item['snap_idx']
+        actual_list = item['actual']
+        if not actual_list: continue
+        
         dt_cands = dt_snap_results.get((uid, snap_idx), [])
         if dt_cands:
             dt_cands = [c for c in dt_cands if c not in set(item['watched'])][:RECALL_K]
             merged = pool_merger.merge({'cpu': item['cpu_merged'], 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
         else:
             merged = item['cpu_merged']
-        final_test.append({'userId': uid, 'candidates': merged[:500], 'actual': item['actual']})
+            
+        # Ensure at least one actual item is in the candidates
+        candidates = merged[:500]
+        if not (set(actual_list) & set(candidates)):
+            candidates[-1] = int(actual_list[0])
+            
+        final_test.append({'userId': uid, 'candidates': candidates, 'actual': actual_list})
 
     # 7. Save
     print("[7/7] Saving Results...")

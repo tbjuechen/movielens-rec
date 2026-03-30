@@ -93,7 +93,8 @@ class EmbeddingLayer(nn.Module):
         # float_feat has shape (B, 7)
         for i, name in enumerate(cont_keys):
             bounds = getattr(self, f'{name}_bounds')
-            val = float_feat[:, i]
+            # Slice [:, i] is non-contiguous, need .contiguous() for searchsorted performance
+            val = float_feat[:, i].contiguous()
             bucket_idx = torch.bucketize(val, bounds)
             embs.append(self.bucket_embs[name](bucket_idx))
 
