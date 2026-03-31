@@ -72,13 +72,14 @@ def main():
         cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']
         table = pq.read_table(ranking_samples_path, columns=cols)
         
-        # Convert list column to fixed-size (N, 100) matrix
+        # Convert list column to fixed-size matrix based on the saved pool length
         print("  Converting pool to matrix...")
         raw_pool = table['candidate_pool'].to_numpy()
         n_rows = len(raw_pool)
-        pool_matrix = np.zeros((n_rows, 100), dtype=np.int64)
+        pool_width = max((len(p) for p in raw_pool), default=0)
+        pool_matrix = np.zeros((n_rows, pool_width), dtype=np.int64)
         for i, p in enumerate(tqdm(raw_pool, desc="Padding Pool")):
-            p_len = min(len(p), 100)
+            p_len = min(len(p), pool_width)
             pool_matrix[i, :p_len] = p[:p_len]
         
         samples = {
@@ -88,7 +89,7 @@ def main():
             'rating_norm': torch.from_numpy(table['rating_norm'].to_numpy().astype(np.float32)),
             'candidate_pool': torch.from_numpy(pool_matrix),
         }
-        print(f"  Loaded {n_rows:,} positive interactions with pools (via pyarrow)")
+        print(f"  Loaded {n_rows:,} interactions with pool width {pool_width} (via pyarrow)")
         del table, raw_pool, pool_matrix; import gc; gc.collect()
         
     n_total = len(samples['userId'])
@@ -122,7 +123,7 @@ def main():
         dataset, 
         batch_size=RANK_BATCH_SIZE, # Suggest increasing this in config.yaml to 16384+
         shuffle=True,
-        num_workers=32,             
+        num_workers=RANK_NUM_WORKERS,
         collate_fn=dataset.collate_fn,
         pin_memory=True,            # ENABLED for faster transfers of merged blocks
         persistent_workers=True,

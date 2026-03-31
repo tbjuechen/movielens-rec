@@ -72,6 +72,9 @@ RANK_GRADNORM_ALPHA = _ranking.get('gradnorm_alpha', 1.5)
 RANK_CTR_ALPHA = _ranking.get('ctr_alpha', 1.0)
 RANK_RATING_BETA = _ranking.get('rating_beta', 0.5)
 RANK_EVAL_KS = _ranking.get('eval_ks', [10, 20, 50])
+RANK_TRAIN_POOL_SIZE = _ranking.get('train_pool_size', 100)
+RANK_EVAL_POOL_SIZE = _ranking.get('eval_pool_size', 500)
+RANK_FORCE_INSERT_TARGET = _ranking.get('force_insert_target', True)
 
 # 8. Merger Weights
 MERGER_WEIGHTS = config.get('merger_weights', {

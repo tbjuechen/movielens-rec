@@ -22,7 +22,8 @@ from src.config.settings import (
     EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA, BPR_MARGIN,
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
-    MERGER_WEIGHTS,
+    MERGER_WEIGHTS, RANK_TRAIN_POOL_SIZE, RANK_EVAL_POOL_SIZE,
+    RANK_FORCE_INSERT_TARGET,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
@@ -31,16 +32,80 @@ from src.models.recall.simple_recall import PopularityRecall, GenreRecall
 from src.models.recall.merger import RecallMerger
 
 SNAPSHOT_WINDOW = 10
-RECALL_K = 100
-MERGE_K = 100
+RECALL_K = max(RANK_EVAL_POOL_SIZE, 500)
+MERGE_K = max(RANK_EVAL_POOL_SIZE, 500)
 MAX_INTERACTIONS_PER_USER = 100
 SAMPLES_PER_INTERACTION = 4
 RECALL_WORKERS = 32
 DT_BATCH = 4096
+MIN_USER_TOTAL_INTERACTIONS = 6
 
 
 # ── Module-level shared data for multiprocessing (fork COW) ──
 _shared = {}
+
+
+def _filter_valid_users(train_data, val_data, test_data):
+    total_counts = pd.concat([
+        train_data[['userId']],
+        val_data[['userId']],
+        test_data[['userId']],
+    ], ignore_index=True)['userId'].value_counts()
+    valid_user_ids = set(total_counts[total_counts >= MIN_USER_TOTAL_INTERACTIONS].index.tolist())
+    return valid_user_ids
+
+
+def _prepare_candidate_pool(merged_candidates, actual_list, pool_size, force_insert=True):
+    actual_items = [int(x) for x in actual_list] if actual_list else []
+    if not actual_items:
+        return None, {
+            'target_in_pool_before_fix': False,
+            'target_force_inserted': False,
+            'target_pool_was_empty': False,
+        }
+
+    deduped = []
+    seen = set()
+    for item in merged_candidates:
+        item = int(item)
+        if item in seen:
+            continue
+        deduped.append(item)
+        seen.add(item)
+        if len(deduped) >= pool_size:
+            break
+
+    actual_set = set(actual_items)
+    target_in_pool = bool(actual_set & set(deduped))
+    pool_was_empty = len(deduped) == 0
+    force_inserted = False
+
+    if force_insert and not target_in_pool:
+        target_item = actual_items[0]
+        if deduped:
+            deduped[-1] = target_item
+        else:
+            deduped = [target_item]
+            pool_was_empty = True
+        force_inserted = True
+
+    return deduped, {
+        'target_in_pool_before_fix': target_in_pool,
+        'target_force_inserted': force_inserted,
+        'target_pool_was_empty': pool_was_empty,
+    }
+
+
+def _merge_with_dt(pool_merger, cpu_merged, dt_snap_results, uid, snap_idx, watched_items):
+    dt_cands = dt_snap_results.get((uid, snap_idx), [])
+    if dt_cands:
+        watched_set = set(watched_items)
+        dt_cands = [c for c in dt_cands if c not in watched_set][:RECALL_K]
+        return pool_merger.merge(
+            {'cpu': cpu_merged, 'dt': dt_cands},
+            weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)}
+        )
+    return cpu_merged
 
 
 def _build_user_data(uid):
@@ -97,17 +162,14 @@ def _build_user_data(uid):
             # RRF Merge (Initial CPU-only merge, DT will be added later if available)
             merged = merger.merge(channels, weights=weights) if channels else []
             
-            # Record state for training
-            if merged:
-                # We'll placeholder the DT results and do a second pass merge for DT in main()
-                # to keep workers CPU-only and avoid CUDA fork issues.
-                # But we can already save the non-DT merged list.
-                ctr_label = 1.0 if rating >= 3.0 else 0.0
-                rating_norm = rating / 5.0
-                train_out.append({
-                    'uid': uid, 'mid': mid, 'ctr': ctr_label, 'rat': rating_norm,
-                    'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW
-                })
+            # Record state for training, even if the current merged pool is empty.
+            # The final integration step may still force-insert the target item.
+            ctr_label = 1.0 if rating >= 3.0 else 0.0
+            rating_norm = rating / 5.0
+            train_out.append({
+                'uid': uid, 'mid': mid, 'ctr': ctr_label, 'rat': rating_norm,
+                'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW
+            })
 
             # Record state for Evaluation (If it's the last interaction)
             if i == n_total - 1:
@@ -133,6 +195,11 @@ def main():
     train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
     val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
     test_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "test_data.parquet")
+    valid_user_ids = _filter_valid_users(train_data, val_data, test_data)
+    print(f"  Ranking users with total interactions > 5: {len(valid_user_ids):,}")
+    train_data = train_data[train_data['userId'].isin(valid_user_ids)].copy()
+    val_data = val_data[val_data['userId'].isin(valid_user_ids)].copy()
+    test_data = test_data[test_data['userId'].isin(valid_user_ids)].copy()
     
     raw_dir = Path(PROCESSED_DATA_DIR).parent / "raw" / "ml-32m"
     movies = pd.read_csv(raw_dir / "movies.csv")
@@ -218,6 +285,7 @@ def main():
         print("  Loaded DualTower model")
     dt_model.eval()
 
+    snap_keys = []
     dt_snap_results = {}  # (uid, snap_idx) → [movieId, ...]
     if dt_ready:
         # Build FAISS index
@@ -305,63 +373,73 @@ def main():
     final_train = []
     final_val = []
     final_test = []
+    pool_stats = {
+        'train': {'target_in_pool_before_fix': 0, 'target_force_inserted': 0, 'target_pool_was_empty': 0},
+        'val': {'target_in_pool_before_fix': 0, 'target_force_inserted': 0, 'target_pool_was_empty': 0},
+        'test': {'target_in_pool_before_fix': 0, 'target_force_inserted': 0, 'target_pool_was_empty': 0},
+    }
 
     # Process Train interactions
     for item in tqdm(all_train, desc="Final Train Pool"):
         uid, mid, snap_idx = item['uid'], item['mid'], item['snap_idx']
-        cpu_merged = item['cpu_merged']
-        watched_set = set(item['watched'])
-        
-        dt_cands = dt_snap_results.get((uid, snap_idx), [])
-        if dt_cands:
-            dt_cands = [c for c in dt_cands if c not in watched_set][:RECALL_K]
-            # Fast merge: combine CPU results with DT
-            merged = pool_merger.merge({'cpu': cpu_merged, 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
-        else:
-            merged = cpu_merged
-            
-        pool = [int(c) for c in merged if c != mid][:100]
-        if len(pool) >= 10:
+        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, snap_idx, item['watched'])
+        pool, stats = _prepare_candidate_pool(
+            merged_candidates=merged,
+            actual_list=[mid],
+            pool_size=RANK_TRAIN_POOL_SIZE,
+            force_insert=RANK_FORCE_INSERT_TARGET,
+        )
+        if pool is None:
+            continue
+        for key, value in stats.items():
+            pool_stats['train'][key] += int(value)
+
+        neg_count = sum(1 for c in pool if c != int(mid))
+        if neg_count >= 10:
             final_train.append((uid, mid, item['ctr'], item['rat'], pool))
 
     # Process Eval sets
     for item in tqdm(all_val, desc="Final Val Pool"):
         uid, snap_idx = item['userId'], item['snap_idx']
         actual_list = item['actual']
-        if not actual_list: continue
-        
-        dt_cands = dt_snap_results.get((uid, snap_idx), [])
-        if dt_cands:
-            dt_cands = [c for c in dt_cands if c not in set(item['watched'])][:RECALL_K]
-            merged = pool_merger.merge({'cpu': item['cpu_merged'], 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
-        else:
-            merged = item['cpu_merged']
-            
-        # Ensure at least one actual item is in the candidates (at the end if missing)
-        candidates = merged[:500]
-        if not (set(actual_list) & set(candidates)):
-            candidates[-1] = int(actual_list[0]) # Force insert the first actual item
-            
-        final_val.append({'userId': uid, 'candidates': candidates, 'actual': actual_list})
+        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, snap_idx, item['watched'])
+        candidates, stats = _prepare_candidate_pool(
+            merged_candidates=merged,
+            actual_list=actual_list,
+            pool_size=RANK_EVAL_POOL_SIZE,
+            force_insert=RANK_FORCE_INSERT_TARGET,
+        )
+        if candidates is None:
+            continue
+        for key, value in stats.items():
+            pool_stats['val'][key] += int(value)
+        final_val.append({
+            'userId': uid,
+            'candidates': candidates,
+            'actual': actual_list,
+            **stats,
+        })
 
     for item in tqdm(all_test, desc="Final Test Pool"):
         uid, snap_idx = item['userId'], item['snap_idx']
         actual_list = item['actual']
-        if not actual_list: continue
-        
-        dt_cands = dt_snap_results.get((uid, snap_idx), [])
-        if dt_cands:
-            dt_cands = [c for c in dt_cands if c not in set(item['watched'])][:RECALL_K]
-            merged = pool_merger.merge({'cpu': item['cpu_merged'], 'dt': dt_cands}, weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)})
-        else:
-            merged = item['cpu_merged']
-            
-        # Ensure at least one actual item is in the candidates
-        candidates = merged[:500]
-        if not (set(actual_list) & set(candidates)):
-            candidates[-1] = int(actual_list[0])
-            
-        final_test.append({'userId': uid, 'candidates': candidates, 'actual': actual_list})
+        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, snap_idx, item['watched'])
+        candidates, stats = _prepare_candidate_pool(
+            merged_candidates=merged,
+            actual_list=actual_list,
+            pool_size=RANK_EVAL_POOL_SIZE,
+            force_insert=RANK_FORCE_INSERT_TARGET,
+        )
+        if candidates is None:
+            continue
+        for key, value in stats.items():
+            pool_stats['test'][key] += int(value)
+        final_test.append({
+            'userId': uid,
+            'candidates': candidates,
+            'actual': actual_list,
+            **stats,
+        })
 
     # 7. Save
     print("[7/7] Saving Results...")
@@ -371,6 +449,12 @@ def main():
     pd.DataFrame(final_test).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)
     
     print(f"\n=== Done ===\nSaved Training: {len(final_train):,}, Val: {len(final_val):,}, Test: {len(final_test):,}")
+    for split, stats in pool_stats.items():
+        print(
+            f"  {split}: raw_hit={stats['target_in_pool_before_fix']:,}, "
+            f"force_inserted={stats['target_force_inserted']:,}, "
+            f"empty_pool_fallback={stats['target_pool_was_empty']:,}"
+        )
 
 
 if __name__ == "__main__":

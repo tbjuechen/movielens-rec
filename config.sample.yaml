@@ -73,6 +73,9 @@ ranking:
   rating_beta: 0.5
   # Evaluation
   eval_ks: [10, 20, 50]
+  train_pool_size: 100
+  eval_pool_size: 500
+  force_insert_target: true
 
 # 5. Feature Settings
 features:

@@ -1,4 +1,4 @@
-"""End-to-end ranking evaluation: recall candidates → ranking reorder → metrics."""
+"""Ranking-only evaluation on prebuilt candidate pools."""
 import argparse
 import sys
 from pathlib import Path
@@ -167,7 +167,9 @@ def evaluate(test_mode=False, eval_set='val'):
 
     # 4. Evaluation Loop
     metrics = defaultdict(list)
-    n_recalled = 0
+    n_target_in_eval_pool = 0
+    force_inserted_count = 0
+    empty_pool_fallback_count = 0
     
     print(f"Ranking {len(val_df):,} users with batch scoring...")
     
@@ -179,13 +181,15 @@ def evaluate(test_mode=False, eval_set='val'):
         if not candidates:
             continue
         if set(actual_items) & set(candidates):
-            n_recalled += 1
+            n_target_in_eval_pool += 1
+        force_inserted_count += int(row.get('target_force_inserted', False))
+        empty_pool_fallback_count += int(row.get('target_pool_was_empty', False))
 
-        # Baseline metrics (Recall only)
+        # Candidate-pool baseline metrics
         for ek in RANK_EVAL_KS:
-            metrics[f'Recall_Baseline_HR@{ek}'].append(hitrate_at_k(actual_items, candidates, k=ek))
-            metrics[f'Recall_Baseline_NDCG@{ek}'].append(ndcg_at_k(actual_items, candidates, k=ek))
-        metrics['Recall_Baseline_MRR'].append(mrr(actual_items, candidates))
+            metrics[f'CandidatePool_HR@{ek}'].append(hitrate_at_k(actual_items, candidates, k=ek))
+            metrics[f'CandidatePool_NDCG@{ek}'].append(ndcg_at_k(actual_items, candidates, k=ek))
+        metrics['CandidatePool_MRR'].append(mrr(actual_items, candidates))
 
         # Ranking reorder (GPU Batch)
         cand_arr = torch.tensor(candidates, dtype=torch.long, device=device)
@@ -225,7 +229,16 @@ def evaluate(test_mode=False, eval_set='val'):
     # 5. Report
     n_total = len(val_df)
     print(f"\n=== Ranking Evaluation Report ({eval_set.upper()}) ===")
-    print(f"Total users: {n_total}, Recalled target: {n_recalled} ({n_recalled/max(n_total,1)*100:.1f}%)\n")
+    print(
+        f"Total users: {n_total}, Target in eval pool: {n_target_in_eval_pool} "
+        f"({n_target_in_eval_pool/max(n_total,1)*100:.1f}%)"
+    )
+    print(
+        f"Forced target insertions: {force_inserted_count} "
+        f"({force_inserted_count/max(n_total,1)*100:.1f}%), "
+        f"Empty-pool fallback: {empty_pool_fallback_count} "
+        f"({empty_pool_fallback_count/max(n_total,1)*100:.1f}%)\n"
+    )
 
     print(f"{'Metric':<30} {'Value':>10}")
     print("-" * 42)

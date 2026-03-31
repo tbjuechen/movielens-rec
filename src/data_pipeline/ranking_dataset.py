@@ -10,8 +10,8 @@ from src.config.settings import (
 class RankingDataset(Dataset):
     """Lazy-lookup ranking Dataset with DYNAMIC online negative sampling.
 
-    Stores the positive interactions and a pool of 100 recall candidates for each.
-    In each batch, it randomly samples 3 negatives from the pool for every positive.
+    Stores the training interactions and a candidate pool for each.
+    In each batch, it samples negatives from valid pool entries only.
     """
 
     def __init__(self, samples, user_profile_df, item_profile_df, neg_size=3):
@@ -26,7 +26,7 @@ class RankingDataset(Dataset):
             self.iids_pos = samples['movieId'].share_memory_()
             self.ctr_labels_pos = samples['ctr_label'].share_memory_()
             self.rating_norms_pos = samples['rating_norm'].share_memory_()
-            # The pool: (N, 100) matrix
+            # The pool: (N, pool_width) matrix
             self.candidate_pool = samples['candidate_pool'].share_memory_()
         else:
             # Fallback for old flat format
@@ -99,12 +99,17 @@ class RankingDataset(Dataset):
         uids_pos = self.uids_pos[batch_idx]
         iids_pos = self.iids_pos[batch_idx]
         
-        # 2. Randomly sample negatives from the pool (Dynamic!)
-        pool_size = self.candidate_pool.shape[1]
-        # Generate random indices for sampling (batch_size, neg_size)
-        rel_neg_idx = torch.randint(0, pool_size, (batch_size, self.neg_size))
-        # Gather movieId from pool
-        iids_neg = torch.gather(self.candidate_pool[batch_idx], 1, rel_neg_idx)
+        # 2. Randomly sample negatives from valid pool entries only.
+        batch_pool = self.candidate_pool[batch_idx]
+        valid_mask = (batch_pool > 0) & (batch_pool != iids_pos.unsqueeze(1))
+        valid_counts = valid_mask.sum(dim=1)
+        if torch.any(valid_counts == 0):
+            raise ValueError("Encountered a training sample without valid negative candidates.")
+
+        random_scores = torch.rand(batch_pool.shape, device=batch_pool.device)
+        random_scores = random_scores.masked_fill(~valid_mask, -1.0)
+        rel_neg_idx = random_scores.topk(self.neg_size, dim=1).indices
+        iids_neg = torch.gather(batch_pool, 1, rel_neg_idx)
         
         # 3. Concatenate (All Positives then All Negatives)
         # Final batch shape: (batch_size * (1 + neg_size), ...)
