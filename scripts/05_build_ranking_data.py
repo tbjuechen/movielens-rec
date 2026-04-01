@@ -23,7 +23,7 @@ from src.config.settings import (
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS, RANK_TRAIN_POOL_SIZE, RANK_EVAL_POOL_SIZE,
-    RANK_FORCE_INSERT_TARGET,
+    RANK_FORCE_INSERT_TARGET, RANK_EXPLICIT_NEGATIVE_THRESHOLD,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
@@ -53,6 +53,18 @@ def _filter_valid_users(train_data, val_data, test_data):
     ], ignore_index=True)['userId'].value_counts()
     valid_user_ids = set(total_counts[total_counts >= MIN_USER_TOTAL_INTERACTIONS].index.tolist())
     return valid_user_ids
+
+
+def _unique_int_list(values):
+    seen = set()
+    out = []
+    for value in values:
+        value = int(value)
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
 
 
 def _prepare_candidate_pool(merged_candidates, actual_list, pool_size, force_insert=True):
@@ -164,12 +176,13 @@ def _build_user_data(uid):
             
             # Record state for training, even if the current merged pool is empty.
             # The final integration step may still force-insert the target item.
-            ctr_label = 1.0 if rating >= 3.0 else 0.0
-            rating_norm = rating / 5.0
-            train_out.append({
-                'uid': uid, 'mid': mid, 'ctr': ctr_label, 'rat': rating_norm,
-                'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW
-            })
+            if rating >= RANK_EXPLICIT_NEGATIVE_THRESHOLD:
+                ctr_label = 1.0
+                rating_norm = rating / 5.0
+                train_out.append({
+                    'uid': uid, 'mid': mid, 'ctr': ctr_label, 'rat': rating_norm,
+                    'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW
+                })
 
             # Record state for Evaluation (If it's the last interaction)
             if i == n_total - 1:
@@ -200,6 +213,12 @@ def main():
     train_data = train_data[train_data['userId'].isin(valid_user_ids)].copy()
     val_data = val_data[val_data['userId'].isin(valid_user_ids)].copy()
     test_data = test_data[test_data['userId'].isin(valid_user_ids)].copy()
+    explicit_negative_map = (
+        train_data[train_data['rating'] < RANK_EXPLICIT_NEGATIVE_THRESHOLD]
+        .groupby('userId')['movieId']
+        .apply(lambda x: _unique_int_list(x.tolist()))
+        .to_dict()
+    )
     
     raw_dir = Path(PROCESSED_DATA_DIR).parent / "raw" / "ml-32m"
     movies = pd.read_csv(raw_dir / "movies.csv")
@@ -394,9 +413,10 @@ def main():
         for key, value in stats.items():
             pool_stats['train'][key] += int(value)
 
+        explicit_negatives = [iid for iid in explicit_negative_map.get(uid, []) if iid != int(mid)]
         neg_count = sum(1 for c in pool if c != int(mid))
         if neg_count >= 10:
-            final_train.append((uid, mid, item['ctr'], item['rat'], pool))
+            final_train.append((uid, mid, item['ctr'], item['rat'], pool, explicit_negatives))
 
     # Process Eval sets
     for item in tqdm(all_val, desc="Final Val Pool"):
@@ -443,7 +463,7 @@ def main():
 
     # 7. Save
     print("[7/7] Saving Results...")
-    pd.DataFrame(final_train, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']).to_parquet(
+    pd.DataFrame(final_train, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool', 'explicit_negatives']).to_parquet(
         Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet", index=False)
     pd.DataFrame(final_val).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet", index=False)
     pd.DataFrame(final_test).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)

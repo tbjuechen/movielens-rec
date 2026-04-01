@@ -101,8 +101,8 @@ class EmbeddingLayer(nn.Module):
         return torch.cat(embs, dim=-1)  # (B, output_dim)
 
 
-class RankingModel(nn.Module):
-    """DCNv2 + MMoE ranking model with dual objectives (pCTR + pRating)."""
+class RankingModel(torch.nn.Module):
+    """DCNv2 + MMoE ranking model for a single CTR objective."""
 
     def __init__(self, vocab_sizes, id_embed_dim=64, genre_embed_dim=8,
                  cont_embed_dim=8, cont_bucket_size=20,
@@ -120,29 +120,17 @@ class RankingModel(nn.Module):
         input_dim = self.embedding_layer.output_dim
 
         self.cross_net = CrossNetV2(input_dim, cross_layers)
-        self.mmoe = MMoE(input_dim, num_experts, expert_dim, num_tasks=2)
+        self.mmoe = MMoE(input_dim, num_experts, expert_dim, num_tasks=1)
 
         tower_input_dim = input_dim + expert_dim  # cross_out + expert_out
         self.ctr_tower = TaskTower(tower_input_dim, tower_dims, use_sigmoid=False)
-        self.rating_tower = TaskTower(tower_input_dim, tower_dims, use_sigmoid=False)
 
     def forward(self, features):
-        emb = self.embedding_layer(features)       # (B, input_dim)
-        cross_out = self.cross_net(emb)             # (B, input_dim)
-        ctr_expert, rat_expert = self.mmoe(emb)     # (B, expert_dim) each
+        emb = self.embedding_layer(features)
+        cross_out = self.cross_net(emb)
+        ctr_expert = self.mmoe(emb)[0]
+        return self.ctr_tower(torch.cat([cross_out, ctr_expert], dim=-1))
 
-        ctr_logit = self.ctr_tower(torch.cat([cross_out, ctr_expert], dim=-1))
-        pRating = self.rating_tower(torch.cat([cross_out, rat_expert], dim=-1))
-        return ctr_logit, pRating
-
-    def compute_loss(self, ctr_logit, pRating, ctr_label, rating_label, has_rating):
-        """Returns individual task losses (no weighting — handled by GradNorm externally)."""
-        # 1. BCE with logits for CTR (AMP-safe, numerically stable)
-        loss_bce = F.binary_cross_entropy_with_logits(ctr_logit, ctr_label, reduction='mean')
-
-        # 2. MSE for Rating (masked: only on interacted items with real ratings)
-        loss_mse = torch.tensor(0.0, device=pRating.device)
-        if has_rating.any():
-            loss_mse = F.mse_loss(pRating[has_rating], rating_label[has_rating])
-
-        return loss_bce, loss_mse
+    def compute_loss(self, ctr_logit, ctr_label):
+        """Returns the BCE loss for the CTR task."""
+        return F.binary_cross_entropy_with_logits(ctr_logit, ctr_label, reduction='mean')

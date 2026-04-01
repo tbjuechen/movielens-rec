@@ -1,4 +1,4 @@
-"""Train the ranking model (DCNv2 + MMoE) with pCTR + pRating dual objectives."""
+"""Train the ranking model as a single-objective CTR ranker."""
 import sys
 from pathlib import Path
 import numpy as np
@@ -19,12 +19,17 @@ from src.config.settings import (
     RANK_CROSS_LAYERS, RANK_DROPOUT,
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_BATCH_SIZE, RANK_LEARNING_RATE, RANK_EPOCHS,
-    RANK_NEG_SAMPLE_RATIO, RANK_NUM_WORKERS,
-    RANK_GRADNORM_ALPHA,
+    RANK_NUM_WORKERS, RANK_EXPLICIT_NEGATIVE_THRESHOLD,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
-from src.data_pipeline.ranking_dataset import RankingDataset, build_ranking_samples
+from src.data_pipeline.ranking_dataset import RankingDataset
+
+VAL_SUBSET_RATIO = 0.01
+VAL_SUBSET_SEED = 42
+EARLY_STOP_PATIENCE = 5
+EARLY_STOP_MIN_DELTA = 1e-4
+VAL_BATCH_SIZE = 8192
 
 
 def apply_encoding(user_profile, item_profile, encoder):
@@ -45,6 +50,138 @@ def apply_encoding(user_profile, item_profile, encoder):
     item_profile['budget_norm'] = item_cont['item_budget']
     item_profile['vote_count_ml_norm'] = item_cont['item_vote_count_ml']
     return user_profile, item_profile
+
+
+def _unique_int_list(values):
+    seen = set()
+    out = []
+    for value in values:
+        value = int(value)
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _build_feature_lookup_tables(user_profile, item_profile):
+    max_uid = int(user_profile['userId'].max())
+    max_iid = int(item_profile['movieId'].max())
+
+    user_encoded_id = np.zeros(max_uid + 1, dtype=np.int64)
+    user_top_genres_arr = np.zeros((max_uid + 1, USER_TOP_GENRES_MAX_LEN), dtype=np.int64)
+    user_cont_arr = np.zeros((max_uid + 1, 2), dtype=np.float32)
+
+    u_idx = user_profile['userId'].values
+    user_encoded_id[u_idx] = user_profile['userId_encoded'].values
+    user_top_genres_arr[u_idx] = np.stack(user_profile['top_genres_encoded'].values)
+    user_cont_arr[u_idx] = np.stack([
+        user_profile['avg_rating_norm'].values,
+        user_profile['activity_norm'].values
+    ], axis=1)
+
+    item_encoded_id = np.zeros(max_iid + 1, dtype=np.int64)
+    item_genres_arr = np.zeros((max_iid + 1, ITEM_GENRES_MAX_LEN), dtype=np.int64)
+    item_cont_arr = np.zeros((max_iid + 1, 5), dtype=np.float32)
+
+    i_idx = item_profile['movieId'].values
+    item_encoded_id[i_idx] = item_profile['movieId_encoded'].values
+    item_genres_arr[i_idx] = np.stack(item_profile['tmdb_genres_encoded'].values)
+    item_cont_arr[i_idx] = np.stack([
+        item_profile['release_year_norm'].values,
+        item_profile['avg_rating_norm'].values,
+        item_profile['revenue_norm'].values,
+        item_profile['budget_norm'].values,
+        item_profile['vote_count_ml_norm'].values
+    ], axis=1)
+
+    return {
+        'user_encoded_id': user_encoded_id,
+        'user_top_genres': user_top_genres_arr,
+        'user_cont': user_cont_arr,
+        'item_encoded_id': item_encoded_id,
+        'item_genres': item_genres_arr,
+        'item_cont': item_cont_arr,
+    }
+
+
+def _load_validation_subset(processed_dir):
+    ranking_val_path = Path(processed_dir) / "ranking_val_candidates.parquet"
+    if not ranking_val_path.exists():
+        print(
+            f"  {ranking_val_path} not found. Please run 05_build_ranking_data.py first "
+            "to generate validation candidate pools."
+        )
+        sys.exit(1)
+
+    val_df = pd.read_parquet(ranking_val_path, columns=['userId', 'actual'])
+    n_total = len(val_df)
+    subset_size = max(1, int(np.ceil(n_total * VAL_SUBSET_RATIO)))
+    subset_df = val_df.sample(n=subset_size, random_state=VAL_SUBSET_SEED).reset_index(drop=True)
+    print(
+        f"  Loaded validation pool with {n_total:,} rows; using fixed subset of "
+        f"{subset_size:,} rows ({VAL_SUBSET_RATIO:.2%}, seed={VAL_SUBSET_SEED})"
+    )
+    return subset_df
+
+
+def _evaluate_validation_loss(model, val_subset_df, lookup_tables, device):
+    model.eval()
+    losses = []
+
+    user_encoded_id = lookup_tables['user_encoded_id']
+    user_top_genres = lookup_tables['user_top_genres']
+    user_cont = lookup_tables['user_cont']
+    item_encoded_id = lookup_tables['item_encoded_id']
+    item_genres = lookup_tables['item_genres']
+    item_cont = lookup_tables['item_cont']
+
+    uid_buffer = []
+    iid_buffer = []
+
+    def _flush_batch():
+        if not uid_buffer:
+            return
+
+        uids = torch.tensor(uid_buffer, dtype=torch.long, device=device)
+        iids = torch.tensor(iid_buffer, dtype=torch.long, device=device)
+        int_features = torch.cat([
+            user_encoded_id[uids].unsqueeze(1),
+            item_encoded_id[iids].unsqueeze(1),
+            user_top_genres[uids],
+            item_genres[iids]
+        ], dim=1).contiguous()
+        float_features = torch.cat([
+            user_cont[uids],
+            item_cont[iids]
+        ], dim=1).contiguous()
+        features = {'int_features': int_features, 'float_features': float_features}
+        labels = torch.ones(len(uid_buffer), device=device)
+
+        with torch.no_grad():
+            logits = model(features).view(-1)
+            losses.append(model.compute_loss(logits, labels).item())
+
+        uid_buffer.clear()
+        iid_buffer.clear()
+
+    for row in val_subset_df.itertuples(index=False):
+        actual_items = [int(iid) for iid in row.actual if int(iid) > 0]
+        if not actual_items:
+            continue
+
+        for item_id in actual_items:
+            uid_buffer.append(int(row.userId))
+            iid_buffer.append(item_id)
+            if len(uid_buffer) >= VAL_BATCH_SIZE:
+                _flush_batch()
+
+    _flush_batch()
+    model.train()
+
+    if not losses:
+        raise ValueError("Validation subset produced no valid positive targets for early stopping.")
+    return float(np.mean(losses))
 
 
 def main():
@@ -69,7 +206,12 @@ def main():
     else:
         # Optimization: Use pyarrow to load the pool
         import pyarrow.parquet as pq
+        parquet_file = pq.ParquetFile(ranking_samples_path)
+        available_cols = set(parquet_file.schema.names)
+        has_explicit_negatives = 'explicit_negatives' in available_cols
         cols = ['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool']
+        if has_explicit_negatives:
+            cols.append('explicit_negatives')
         table = pq.read_table(ranking_samples_path, columns=cols)
         
         # Convert list column to fixed-size matrix based on the saved pool length
@@ -81,6 +223,24 @@ def main():
         for i, p in enumerate(tqdm(raw_pool, desc="Padding Pool")):
             p_len = min(len(p), pool_width)
             pool_matrix[i, :p_len] = p[:p_len]
+
+        if has_explicit_negatives:
+            raw_explicit = table['explicit_negatives'].to_numpy()
+            explicit_width = max((len(p) for p in raw_explicit), default=0)
+            explicit_matrix = np.zeros((n_rows, explicit_width), dtype=np.int64)
+            for i, p in enumerate(tqdm(raw_explicit, desc="Padding Explicit Negatives")):
+                p_len = min(len(p), explicit_width)
+                explicit_matrix[i, :p_len] = p[:p_len]
+            explicit_source = "ranking_candidate_pool.parquet"
+        else:
+            print(
+                "  explicit_negatives not found in ranking_candidate_pool.parquet. "
+                "Falling back to no explicit hard negatives for this run. "
+                "Rebuild ranking data with 05_build_ranking_data.py to restore them."
+            )
+            explicit_width = 0
+            explicit_matrix = np.zeros((n_rows, 0), dtype=np.int64)
+            explicit_source = "disabled fallback"
         
         samples = {
             'userId': torch.from_numpy(table['userId'].to_numpy().astype(np.int64)),
@@ -88,12 +248,19 @@ def main():
             'ctr_label': torch.from_numpy(table['ctr_label'].to_numpy().astype(np.float32)),
             'rating_norm': torch.from_numpy(table['rating_norm'].to_numpy().astype(np.float32)),
             'candidate_pool': torch.from_numpy(pool_matrix),
+            'explicit_negatives': torch.from_numpy(explicit_matrix),
         }
-        print(f"  Loaded {n_rows:,} interactions with pool width {pool_width} (via pyarrow)")
-        del table, raw_pool, pool_matrix; import gc; gc.collect()
+        print(
+            f"  Loaded {n_rows:,} interactions with pool width {pool_width} "
+            f"and explicit-negative width {explicit_width} ({explicit_source})"
+        )
+        del table, raw_pool, pool_matrix, explicit_matrix; import gc; gc.collect()
         
     n_total = len(samples['userId'])
     print(f"  Unique positives: {n_total:,} (Negative sampling will be 1:3 dynamic)")
+
+    print("[3.5/6] Loading validation subset for early stopping...")
+    val_subset_df = _load_validation_subset(PROCESSED_DATA_DIR)
 
     # 4. Compute quantile bucket boundaries
     print("[4/6] Computing bucket boundaries...")
@@ -110,6 +277,7 @@ def main():
     # 5. Create dataset & dataloader
     print("[5/6] Creating dataset & dataloader...")
     dataset = RankingDataset(samples, user_profile, item_profile)
+    lookup_tables = _build_feature_lookup_tables(user_profile, item_profile)
     
     # Crucial: Clean up profiles after dataset lookup table is built
     del user_profile, item_profile, samples
@@ -152,7 +320,12 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # 7. Training loop with GradNorm + AMP
+    lookup_tables = {
+        key: torch.from_numpy(value).to(device)
+        for key, value in lookup_tables.items()
+    }
+
+    # 7. Training loop with CTR-only objective + AMP
     optimizer = optim.Adam(model.parameters(), lr=RANK_LEARNING_RATE)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, min_lr=1e-6)
 
@@ -162,22 +335,12 @@ def main():
     amp_dtype = torch.float16 if use_amp else torch.float32
     print(f"AMP: {'enabled (fp16)' if use_amp else 'disabled'}")
 
-    # GradNorm: learnable task weights (update every N steps to reduce overhead)
-    log_task_weights = torch.zeros(2, requires_grad=True, device=device)
-    weight_optimizer = optim.Adam([log_task_weights], lr=0.01)
-    initial_losses = None
-    shared_layer = model.cross_net.linears[-1].weight  # shared layer for grad norm
-    GRADNORM_INTERVAL = 100  # Increased to 100 to reduce main process overhead
-
-    best_loss = float('inf')
-    patience = 3
+    best_val_loss = float('inf')
+    best_epoch = 0
     no_improve = 0
-    epoch = 0
-    global_step = 0
-    while True:
-        epoch += 1
+    for epoch in range(1, RANK_EPOCHS + 1):
         model.train()
-        epoch_losses = {'total': [], 'bce': [], 'mse': [], 'w_ctr': [], 'w_mse': []}
+        epoch_losses = {'total': []}
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
@@ -191,46 +354,11 @@ def main():
                 'float_features': float_feat
             }
             ctr_label = labels[:, 0]
-            rating_label = labels[:, 1]
-            has_rating = labels[:, 2].bool()
 
-            # Compute task weights (clamp min 0.1, then renormalize to sum=2)
-            task_weights_raw = torch.softmax(log_task_weights, dim=0).clamp(min=0.1)
-            task_weights = task_weights_raw / task_weights_raw.sum() * 2
-
-            do_gradnorm = (global_step % GRADNORM_INTERVAL == 0)
-
-            # Forward (AMP autocast for model; loss uses bce_with_logits which is AMP-safe)
+            # Forward (AMP autocast for model; BCE-with-logits remains numerically stable)
             with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                ctr_logit, pRating = model(features)
-                loss_bce, loss_mse = model.compute_loss(
-                    ctr_logit, pRating, ctr_label, rating_label, has_rating
-                )
-
-            # --- GradNorm: only every N steps (expensive due to retain_graph) ---
-            if do_gradnorm:
-                G_ctr = torch.norm(task_weights[0] * torch.autograd.grad(
-                    loss_bce, shared_layer, retain_graph=True, create_graph=True)[0])
-                G_mse = torch.norm(task_weights[1] * torch.autograd.grad(
-                    loss_mse, shared_layer, retain_graph=True, create_graph=True)[0])
-                G_avg = (G_ctr + G_mse) / 2
-
-                with torch.no_grad():
-                    if initial_losses is None:
-                        initial_losses = [loss_bce.item(), loss_mse.item()]
-                    r_ctr = loss_bce.item() / max(initial_losses[0], 1e-8)
-                    r_mse = loss_mse.item() / max(initial_losses[1], 1e-8)
-                    r_avg = (r_ctr + r_mse) / 2
-                    target_ctr = G_avg * (r_ctr / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
-                    target_mse = G_avg * (r_mse / max(r_avg, 1e-8)) ** RANK_GRADNORM_ALPHA
-
-                gradnorm_loss = torch.abs(G_ctr - target_ctr) + torch.abs(G_mse - target_mse)
-                weight_optimizer.zero_grad()
-                gradnorm_loss.backward(retain_graph=True)
-                weight_optimizer.step()
-
-            # --- Model update (use detached weights to avoid double grad) ---
-            total_loss = task_weights[0].detach() * loss_bce + task_weights[1].detach() * loss_mse
+                ctr_logit = model(features)
+                total_loss = model.compute_loss(ctr_logit, ctr_label)
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -238,48 +366,37 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            global_step += 1
-            w_ctr = task_weights[0].item()
-            w_mse = task_weights[1].item()
             loss_val = total_loss.item()
-            # Skip NaN batches from AMP overflow in epoch stats
             if not np.isnan(loss_val):
                 epoch_losses['total'].append(loss_val)
-                epoch_losses['bce'].append(loss_bce.item())
-                epoch_losses['mse'].append(loss_mse.item())
-                epoch_losses['w_ctr'].append(w_ctr)
-                epoch_losses['w_mse'].append(w_mse)
 
             pbar.set_postfix({
                 'loss': f"{total_loss.item():.4f}",
-                'BCE': f"{loss_bce.item():.4f}",
-                'MSE': f"{loss_mse.item():.4f}",
-                'w_ctr': f"{w_ctr:.2f}",
-                'w_mse': f"{w_mse:.2f}",
                 'LR': f"{optimizer.param_groups[0]['lr']:.6f}",
             })
 
-        avg_bce = np.mean(epoch_losses['bce'])
-        avg_mse = np.mean(epoch_losses['mse'])
-        # Use unweighted sum for monitoring to avoid GradNorm weight jitter
-        monitor_loss = avg_bce + avg_mse
-        
-        scheduler.step(monitor_loss)
-        print(f"Epoch {epoch} avg: BCE={avg_bce:.4f} MSE={avg_mse:.4f} "
-              f"monitor_sum={monitor_loss:.4f} "
-              f"w_ctr={np.mean(epoch_losses['w_ctr']):.2f} "
-              f"w_mse={np.mean(epoch_losses['w_mse']):.2f}")
+        train_loss = float(np.mean(epoch_losses['total']))
+        val_loss = _evaluate_validation_loss(model, val_subset_df, lookup_tables, device)
+        scheduler.step(val_loss)
+        print(
+            f"Epoch {epoch} train_loss={train_loss:.4f} "
+            f"val_loss(subset)={val_loss:.4f} "
+            f"best_val_loss={best_val_loss if best_val_loss < float('inf') else float('nan'):.4f} "
+            f"best_epoch={best_epoch} "
+            f"no_improve={no_improve}/{EARLY_STOP_PATIENCE}"
+        )
 
-        if monitor_loss < best_loss:
-            best_loss = monitor_loss
+        if val_loss < (best_val_loss - EARLY_STOP_MIN_DELTA):
+            best_val_loss = val_loss
+            best_epoch = epoch
             no_improve = 0
             Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
-            print(f"  -> Saved best model (monitor_sum={best_loss:.4f})")
+            print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
         else:
             no_improve += 1
-            print(f"  -> No improvement ({no_improve}/{patience})")
-            if no_improve >= patience:
+            print(f"  -> No improvement ({no_improve}/{EARLY_STOP_PATIENCE})")
+            if no_improve >= EARLY_STOP_PATIENCE:
                 print(f"Early stopping at epoch {epoch}")
                 break
 

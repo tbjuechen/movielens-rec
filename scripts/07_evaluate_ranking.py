@@ -1,4 +1,4 @@
-"""Ranking-only evaluation on prebuilt candidate pools."""
+"""CTR-only ranking evaluation on prebuilt candidate pools."""
 import argparse
 import sys
 from pathlib import Path
@@ -21,7 +21,7 @@ from src.config.settings import (
     RANK_CONT_BUCKET_SIZE,
     RANK_CROSS_LAYERS, RANK_DROPOUT,
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
-    RANK_CTR_ALPHA, RANK_RATING_BETA, RANK_EVAL_KS,
+    RANK_EVAL_KS,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
@@ -211,11 +211,8 @@ def evaluate(test_mode=False, eval_set='val'):
         features = {'int_features': int_features, 'float_features': float_features}
 
         with torch.no_grad():
-            ctr_logit, pRating = ranking_model(features)
-            # Use view(-1) instead of squeeze() to avoid 0-d scalar issues when n_cand=1
-            pCTR = torch.sigmoid(ctr_logit).view(-1)
-            pRating_clamped = pRating.clamp(min=0.01).view(-1)
-            final_score = (pCTR ** RANK_CTR_ALPHA) * (pRating_clamped ** RANK_RATING_BETA)
+            ctr_logit = ranking_model(features)
+            final_score = torch.sigmoid(ctr_logit).view(-1)
             
             # Sort
             order = final_score.argsort(descending=True)
