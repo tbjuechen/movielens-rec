@@ -233,26 +233,14 @@ def main():
                 explicit_matrix[i, :p_len] = p[:p_len]
             explicit_source = "ranking_candidate_pool.parquet"
         else:
-            print("  explicit_negatives not found in ranking_candidate_pool.parquet. Building them from train_data.parquet...")
-            train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet", columns=['userId', 'movieId', 'rating'])
-            explicit_negative_map = (
-                train_data[train_data['rating'] < RANK_EXPLICIT_NEGATIVE_THRESHOLD]
-                .groupby('userId')['movieId']
-                .apply(lambda x: _unique_int_list(x.tolist()))
-                .to_dict()
+            print(
+                "  explicit_negatives not found in ranking_candidate_pool.parquet. "
+                "Falling back to no explicit hard negatives for this run. "
+                "Rebuild ranking data with 05_build_ranking_data.py to restore them."
             )
-            raw_uids = table['userId'].to_numpy().astype(np.int64)
-            raw_pos_iids = table['movieId'].to_numpy().astype(np.int64)
-            explicit_lists = []
-            for uid, pos_iid in tqdm(zip(raw_uids, raw_pos_iids), total=n_rows, desc="Align Explicit Negatives"):
-                explicit_lists.append([iid for iid in explicit_negative_map.get(int(uid), []) if iid != int(pos_iid)])
-            explicit_width = max((len(p) for p in explicit_lists), default=0)
-            explicit_matrix = np.zeros((n_rows, explicit_width), dtype=np.int64)
-            for i, p in enumerate(tqdm(explicit_lists, desc="Padding Synthesized Explicit Negatives")):
-                p_len = min(len(p), explicit_width)
-                explicit_matrix[i, :p_len] = p[:p_len]
-            explicit_source = "train_data.parquet fallback"
-            del train_data, explicit_negative_map, explicit_lists
+            explicit_width = 0
+            explicit_matrix = np.zeros((n_rows, 0), dtype=np.int64)
+            explicit_source = "disabled fallback"
         
         samples = {
             'userId': torch.from_numpy(table['userId'].to_numpy().astype(np.int64)),
