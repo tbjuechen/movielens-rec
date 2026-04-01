@@ -1,9 +1,10 @@
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 from src.config.settings import (
-    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
+    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
+    RANK_NEGATIVES_PER_POSITIVE, RANK_HARD_NEGATIVE_TOPK, RANK_HARD_NEGATIVE_MIX,
 )
 
 
@@ -14,8 +15,11 @@ class RankingDataset(Dataset):
     In each batch, it samples negatives from valid pool entries only.
     """
 
-    def __init__(self, samples, user_profile_df, item_profile_df, neg_size=3):
+    def __init__(self, samples, user_profile_df, item_profile_df, neg_size=RANK_NEGATIVES_PER_POSITIVE):
         self.neg_size = neg_size
+        self.hard_negative_topk = RANK_HARD_NEGATIVE_TOPK
+        self.hard_pool_negatives = int(RANK_HARD_NEGATIVE_MIX[0])
+        self.explicit_negatives_quota = int(RANK_HARD_NEGATIVE_MIX[1])
         
         if isinstance(samples, dict):
             # Input is from ranking_candidate_pool.parquet
@@ -26,11 +30,18 @@ class RankingDataset(Dataset):
             self.iids_pos = samples['movieId'].share_memory_()
             self.ctr_labels_pos = samples['ctr_label'].share_memory_()
             self.rating_norms_pos = samples['rating_norm'].share_memory_()
-            # The pool: (N, pool_width) matrix
             self.candidate_pool = samples['candidate_pool'].share_memory_()
+            self.explicit_negatives = samples['explicit_negatives'].share_memory_()
         else:
             # Fallback for old flat format
             raise ValueError("RankingDataset now requires the candidate pool format.")
+
+        rows_with_explicit = int((self.explicit_negatives > 0).any(dim=1).sum().item())
+        print(
+            f"  Hard-negative setup: {self.hard_pool_negatives} pool-hard + "
+            f"{self.explicit_negatives_quota} explicit-low-rating, "
+            f"rows_with_explicit={rows_with_explicit:,}/{self.n:,}"
+        )
 
         # --- Build lookup tables (Shared Memory) ---
         max_u = int(user_profile_df['userId'].max())
@@ -90,6 +101,18 @@ class RankingDataset(Dataset):
     def __getitem__(self, idx):
         return idx
 
+    def _sample_from_pool(self, values, sample_size, used):
+        values = [int(v) for v in values if int(v) > 0 and int(v) not in used]
+        if not values or sample_size <= 0:
+            return []
+        if len(values) >= sample_size:
+            picked = np.random.choice(values, size=sample_size, replace=False).tolist()
+        else:
+            picked = list(values)
+            remaining = sample_size - len(picked)
+            picked.extend(np.random.choice(values, size=remaining, replace=True).tolist())
+        return [int(v) for v in picked]
+
     def collate_fn(self, indices):
         """Dynamic sampling: 1 positive + neg_size negatives per interaction."""
         batch_idx = torch.as_tensor(indices, dtype=torch.long)
@@ -99,17 +122,41 @@ class RankingDataset(Dataset):
         uids_pos = self.uids_pos[batch_idx]
         iids_pos = self.iids_pos[batch_idx]
         
-        # 2. Randomly sample negatives from valid pool entries only.
         batch_pool = self.candidate_pool[batch_idx]
-        valid_mask = (batch_pool > 0) & (batch_pool != iids_pos.unsqueeze(1))
-        valid_counts = valid_mask.sum(dim=1)
-        if torch.any(valid_counts == 0):
-            raise ValueError("Encountered a training sample without valid negative candidates.")
+        batch_explicit = self.explicit_negatives[batch_idx]
+        sampled_negatives = []
+        for row_idx in range(batch_size):
+            pos_id = int(iids_pos[row_idx].item())
+            row_pool = batch_pool[row_idx].tolist()
+            row_explicit = batch_explicit[row_idx].tolist()
 
-        random_scores = torch.rand(batch_pool.shape, device=batch_pool.device)
-        random_scores = random_scores.masked_fill(~valid_mask, -1.0)
-        rel_neg_idx = random_scores.topk(self.neg_size, dim=1).indices
-        iids_neg = torch.gather(batch_pool, 1, rel_neg_idx)
+            valid_pool = [int(v) for v in row_pool if int(v) > 0 and int(v) != pos_id]
+            if not valid_pool:
+                raise ValueError("Encountered a training sample without valid negative candidates.")
+
+            hard_front = valid_pool[:min(self.hard_negative_topk, len(valid_pool))]
+            chosen = []
+            used = {pos_id}
+
+            hard_samples = self._sample_from_pool(hard_front, self.hard_pool_negatives, used)
+            chosen.extend(hard_samples)
+            used.update(hard_samples)
+
+            explicit_samples = self._sample_from_pool(row_explicit, self.explicit_negatives_quota, used)
+            chosen.extend(explicit_samples)
+            used.update(explicit_samples)
+
+            remaining = self.neg_size - len(chosen)
+            if remaining > 0:
+                fallback_samples = self._sample_from_pool(valid_pool, remaining, used)
+                chosen.extend(fallback_samples)
+
+            if len(chosen) != self.neg_size:
+                raise ValueError("Failed to sample the requested number of negatives.")
+
+            sampled_negatives.append(chosen)
+
+        iids_neg = torch.as_tensor(sampled_negatives, dtype=torch.long)
         
         # 3. Concatenate (All Positives then All Negatives)
         # Final batch shape: (batch_size * (1 + neg_size), ...)

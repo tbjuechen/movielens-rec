@@ -65,6 +65,11 @@ ranking:
   learning_rate: 0.001
   epochs: 10
   neg_sample_ratio: 3
+  objective: ctr
+  negatives_per_positive: 3
+  hard_negative_topk: 20
+  explicit_negative_threshold: 3.0
+  hard_negative_mix: [2, 1]
   num_workers: 8
   # Loss (GradNorm auto-balances BCE and MSE)
   gradnorm_alpha: 1.5
