@@ -1,119 +1,372 @@
-# MovieLens-Rec-V2: 工业级电影推荐系统实战
+# MovieLens-Rec-V2
 
-本项目是一个基于 MovieLens-32M 数据集和 TMDB/IMDB 元数据的工业级推荐系统。项目实现了完整的“召回 -> 排序”流水线，重点展示了双塔模型 (Dual-Tower)、多路召回融合以及端到端评估链路。
+基于 MovieLens 32M 和 TMDB 元数据的离线推荐系统项目，覆盖了完整的召回、候选池构造、排序训练与离线评估流程。当前仓库已经不是早期的“只做召回 demo”，而是一套可以顺着脚本跑通的数据与模型流水线。
 
-## 🚀 核心特性
+## 项目目标
 
-- **多路召回 (Multi-Channel Recall)**:
-    - **双塔模型 (Dual-Tower)**: 深度语义匹配，支持 In-batch 负采样、Log-Q 纠偏和 Time-Decay 时序感知。
-    - **协同过滤 (CF)**: 包含 ItemCF 和 UserCF。
-    - **统计类召回**: 热门物品召回、基于标签 (Tags) 的召回。
-- **排序模型 (Ranking)**:
-    - **精排架构**: 支持 MLP (Multilayer Perceptron) 与 DeepFM。
-    - **预估目标**: 点击率 (CTR) 预估或评分 (Rating) 回归。
-    - **特征交叉**: 用户侧、物品侧及上下文特征的深度交叉。
-- **特征工程 (Feature Engineering)**:
-    - 针对长尾分布 (如票房、评分数) 的 **Log 变换**。
-    - 针对 Release Year 等连续特征的 **分箱 (Binning)**。
-    - **User/Item Profile**: 动静分离的特征存储设计。
-- **工程标准 (Engineering Excellence)**:
-    - 全流程 **Parquet** 存储中间数据，优化 IO 性能。
-    - **Pandas 向量化** 操作，严禁逐行循环，处理千万级数据更高效。
-    - **FAISS 索引**: 模拟真实线上全量向量检索性能。
+- 用 `MovieLens-32M` 构建一个接近工业推荐系统分层架构的离线实验环境。
+- 在召回层同时支持向量召回、协同过滤和简单统计召回。
+- 通过离线构造候选池，让排序模型尽量贴近真实线上分发场景。
+- 提供可复现实验路径，方便继续调参、替换模型和补充特征。
 
-## 🏗️ 系统架构
+## 当前实现概览
 
-```mermaid
-graph TD
-    A[Raw MovieLens & TMDB Data] --> B[01_Data Processing]
-    B --> C[02_Feature Building]
-    C --> D[Feature Store]
-    D --> E[03_Model Training]
-    E --> F[Recall: Dual-Tower, CF, Popularity]
-    E --> G[Ranking: MLP/DeepFM]
-    F --> H[04_End-to-End Evaluation]
-    G --> H
-    H --> I[Metrics: Recall@50, Recall@100]
-```
+### 召回层
 
-## 📂 项目结构
+- `DualTower` 双塔召回
+  - 用户塔和物品塔分别编码
+  - 支持 in-batch negative、global negative、hard negative
+  - 损失函数为 `InfoNCE + BPR`
+  - 使用 `FAISS` 做向量检索评估
+- `ItemCF`
+- `UserCF`
+- `PopularityRecall`
+- `GenreRecall`
+- `RecallMerger`
+  - 按配置权重融合多路召回结果
+
+### 排序层
+
+- `RankingModel`
+  - 结构为 `DCNv2 + MMoE`
+  - 双目标学习
+    - `pCTR`
+    - `pRating`
+- 最终分数由 `pCTR` 和 `pRating` 组合得到
+- 排序训练样本不是随机负采样，而是基于召回候选池构造
+
+### 数据与特征
+
+- 时间顺序切分，避免泄漏
+- 用户画像来自训练集
+  - 平均评分
+  - 活跃度
+  - Top Genres
+  - 历史序列
+- 物品画像融合 MovieLens 和 TMDB
+  - 年份
+  - 类型
+  - 票房
+  - 预算
+  - TMDB 评分与投票数
+- 类别特征和连续特征都通过 `FeatureEncoder` 持久化到 `feature_store`
+
+## 目录结构
 
 ```text
-├── data/                      # 数据目录 (Parquet 格式存储)
-│   ├── raw/                   # 原始数据 (MovieLens-32M, TMDB)
-│   ├── processed/             # 处理后的训练/验证/测试集
-│   └── feature_store/         # 模拟线上的特征快照
-├── src/                       # 核心源代码
-│   ├── data_pipeline/         # 数据清洗与 Preprocessing
-│   ├── features/              # 特征编码与工程
-│   ├── models/                # 召回与排序模型实现
-│   └── pipeline/              # 召回器、排序器、特征拉取组件
-├── scripts/                   # 一键执行流水线脚本
-│   ├── 00_prepare_tmdb.py     # 准备 TMDB 特征
-│   ├── 01_process_data.py     # 运行清洗与切分
-│   ├── 02_build_features.py   # 生成并存储特征库
-│   ├── 03_train_models.py     # 触发模型训练 (召回+排序)
-│   └── 04_evaluate_e2e.py     # 执行端到端评测
-└── docs/                      # 设计文档与技术规范
+movielens-rec-v2/
+├── config.sample.yaml
+├── docs/
+│   └── design_spec.md
+├── scripts/
+│   ├── 00_prepare_tmdb.py
+│   ├── 01_process_data.py
+│   ├── 02_build_features.py
+│   ├── 03_train_models.py
+│   ├── 04_evaluate_e2e.py
+│   ├── 05_build_ranking_data.py
+│   ├── 06_train_ranking.py
+│   └── 07_evaluate_ranking.py
+├── src/
+│   ├── config/
+│   ├── data_pipeline/
+│   ├── evaluation/
+│   ├── features/
+│   ├── models/
+│   │   ├── ranking/
+│   │   └── recall/
+│   └── pipeline/
+└── requirements.txt
 ```
 
-## 🛠️ 环境准备
+## 环境准备
 
-项目必须使用 Conda 环境 `movielens-rec` 进行开发与运行。
+建议使用 Python 3.10。
 
 ```bash
-# 创建环境
-conda create -n movielens-rec python=3.10 -y
-conda activate movielens-rec
-
-# 安装依赖
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 🏃 使用说明
+如果你使用 Conda，也可以：
 
-请按照脚本编号顺序执行以下步骤：
+```bash
+conda create -n movielens-rec python=3.10 -y
+conda activate movielens-rec
+pip install -r requirements.txt
+```
 
-1.  **准备 TMDB 缓存数据**:
-    ```bash
-    conda run -n movielens-rec python scripts/00_prepare_tmdb.py
-    ```
-2.  **数据清洗与切分**:
-    ```bash
-    conda run -n movielens-rec python scripts/01_process_data.py
-    ```
-3.  **特征工程**:
-    ```bash
-    conda run -n movielens-rec python scripts/02_build_features.py
-    ```
-4.  **模型训练**:
-    ```bash
-    conda run -n movielens-rec python scripts/03_train_models.py
-    ```
-5.  **端到端评估**:
-    ```bash
-    conda run -n movielens-rec python scripts/04_evaluate_e2e.py
-    ```
+## 数据准备
 
-## 📊 评估标准
+### 1. 放置 MovieLens 原始数据
 
-本项目主要关注召回阶段与精排阶段的离线指标：
-- **召回阶段**: Recall@50 / Recall@100，衡量候选集覆盖率。
-- **排序阶段**: AUC, LogLoss, RMSE，衡量点击或评分预估准确性。
-- **性能模拟**: FAISS Latency，评估向量索引检索在高并发下的性能表现。
+默认配置下，原始 MovieLens 数据放在：
 
-## 🎯 排序模型 (Ranking Model)
+```text
+data/raw/ml-32m/
+```
 
-在多路召回融合后，我们对 Top 500 的候选集进行精排：
-- **特征拉取**: 从 `feature_store` 动态获取 User/Item 的稠密向量与稀疏特征。
-- **特征生成**: 构造交叉特征（如 User-Genre Match、History-Item Similarity）。
-- **模型推理**: 使用训练好的精排模型进行打分，并根据打分进行最终重排。
+至少需要这些文件：
 
-## 📜 开发者指南
+- `movies.csv`
+- `ratings.csv`
+- `links.csv`
 
-- **数据防穿越**: 所有用户特征必须基于 `train_data` 计算，严禁使用验证集/测试集信息。
-- **双塔模型细节**: 
-    - User/Item 塔 ID Embedding **强共享**。
-    - 采用 `InfoNCE + BPR` 混合损失函数。
-    - 实现 `Log-Q Correction` 消除热度偏置。
-- **提交规范**: 采用 **原子化提交 (Atomic Commits)**，确保每次 Commit 仅对应一个功能或修复。
+如果你后续还会扩展标签或分析任务，也可以一起放：
+
+- `tags.csv`
+
+### 2. 放置 TMDB JSON 缓存
+
+`00_prepare_tmdb.py` 会读取：
+
+```text
+data/raw/tmdb_cache/*.json
+```
+
+脚本会把这些 JSON 合并成：
+
+```text
+data/processed/tmdb_features.parquet
+```
+
+仓库当前不包含抓取 TMDB 的脚本，所以这里默认你已经提前准备好了缓存文件。
+
+## 配置说明
+
+项目启动时会优先读取根目录下的 `config.yaml`。如果不存在，则自动回退到 `config.sample.yaml`。
+
+也就是说：
+
+- 想直接试跑：保留 `config.sample.yaml` 即可
+- 想自定义路径、batch size、召回 K、排序参数：新建 `config.yaml`
+
+主要配置项如下：
+
+- `paths`
+  - 原始数据目录
+  - 处理后数据目录
+  - 特征库目录
+  - 模型权重目录
+- `recall`
+  - 双塔 embedding 维度、温度参数、召回 top_k
+- `training`
+  - 召回训练 batch size、epoch、负采样规模
+- `merger_weights`
+  - 多路召回融合权重
+- `ranking`
+  - 排序模型结构、训练参数、候选池大小、评估 topK
+- `features`
+  - 用户历史长度、genre 截断长度、时间衰减参数
+
+## 推荐执行顺序
+
+### 阶段 1：准备 TMDB 特征
+
+```bash
+python scripts/00_prepare_tmdb.py
+```
+
+产物：
+
+- `data/processed/tmdb_features.parquet`
+
+### 阶段 2：清洗数据并构建用户/物品画像
+
+```bash
+python scripts/01_process_data.py
+```
+
+这一步会完成：
+
+- 按用户时间序列切分 `train/val/test`
+- 基于训练集构建 `user_profile`
+- 基于训练集构建 `item_profile`
+- 生成简单召回所需倒排和热度文件
+
+主要产物：
+
+- `data/processed/train_data.parquet`
+- `data/processed/val_data.parquet`
+- `data/processed/test_data.parquet`
+- `data/processed/user_profile.parquet`
+- `data/processed/item_profile.parquet`
+- `data/feature_store/genre_to_items.json`
+- `data/feature_store/popularity_list.json`
+
+### 阶段 3：构建编码器与特征字典
+
+```bash
+python scripts/02_build_features.py
+```
+
+这一步会把：
+
+- `userId`
+- `movieId`
+- `genres`
+- 连续特征归一化器
+
+保存到 `feature_store`，供召回和排序共同使用。
+
+### 阶段 4：训练召回模型
+
+训练全部召回模型：
+
+```bash
+python scripts/03_train_models.py --model all
+```
+
+也可以分开训练：
+
+```bash
+python scripts/03_train_models.py --model dual_tower
+python scripts/03_train_models.py --model item_cf
+python scripts/03_train_models.py --model user_cf
+```
+
+主要产物：
+
+- `data/model_weights/dual_tower.pth`
+- `data/model_weights/item_sim_matrix.pkl`
+- `data/model_weights/user_sim_matrix.pkl`
+
+### 阶段 5：评估召回链路
+
+```bash
+python scripts/04_evaluate_e2e.py
+```
+
+这一步会做多路召回、融合和离线指标统计，重点看：
+
+- `Recall@K`
+- `NDCG@K`
+
+### 阶段 6：构建排序训练候选池
+
+```bash
+python scripts/05_build_ranking_data.py
+```
+
+这一步很关键。它不是简单地给排序模型喂正负样本，而是：
+
+- 先用 `ItemCF + Popularity + GenreRecall` 做 CPU 候选召回
+- 再用 `DualTower + FAISS` 补充向量召回结果
+- 最后把多路结果融合成排序训练/评估候选池
+
+主要产物：
+
+- `data/processed/ranking_candidate_pool.parquet`
+- `data/processed/ranking_val_candidates.parquet`
+- `data/processed/ranking_test_candidates.parquet`
+
+### 阶段 7：训练排序模型
+
+```bash
+python scripts/06_train_ranking.py
+```
+
+主要产物：
+
+- `data/model_weights/ranking_model.pth`
+
+### 阶段 8：评估排序效果
+
+验证集：
+
+```bash
+python scripts/07_evaluate_ranking.py --set val
+```
+
+测试集：
+
+```bash
+python scripts/07_evaluate_ranking.py --set test
+```
+
+重点指标包括：
+
+- `HR@K`
+- `NDCG@K`
+- `MRR`
+
+## 一条完整跑通命令
+
+如果数据都准备好了，最常见的本地流程就是：
+
+```bash
+python scripts/00_prepare_tmdb.py
+python scripts/01_process_data.py
+python scripts/02_build_features.py
+python scripts/03_train_models.py --model all
+python scripts/04_evaluate_e2e.py
+python scripts/05_build_ranking_data.py
+python scripts/06_train_ranking.py
+python scripts/07_evaluate_ranking.py --set val
+python scripts/07_evaluate_ranking.py --set test
+```
+
+## 核心产物说明
+
+### `data/processed`
+
+- 原始交互切分结果
+- 用户画像、物品画像
+- 排序训练候选池
+
+### `data/feature_store`
+
+- 类别词表
+- 连续特征 scaler
+- 热门物品列表
+- genre 倒排索引
+
+### `data/model_weights`
+
+- 双塔权重
+- ItemCF 相似度矩阵
+- UserCF 相似度矩阵
+- 排序模型权重
+
+## 评估视角
+
+### 召回评估
+
+关注“目标物品是否能进候选池”：
+
+- `Recall@50`
+- `Recall@100`
+- `NDCG@50`
+
+### 排序评估
+
+关注“候选池内能否把目标排到更前面”：
+
+- `HR@10/20/50`
+- `NDCG@10/20/50`
+- `MRR`
+
+## 已知前提和注意事项
+
+- `05_build_ranking_data.py` 默认依赖前面训练好的召回模型，尤其是 `DualTower` 和 `ItemCF`。
+- 仓库内目前只有 TMDB 合并脚本，没有在线抓取 TMDB 的下载脚本。
+- `faiss-cpu` 已写进依赖；如果你准备在 GPU 环境做更大规模实验，可以自行替换为适合环境的版本。
+- 当前很多参数是按“大机器”思路配置的，`config.sample.yaml` 里默认值对普通笔记本可能偏大，必要时请降低：
+  - `training.batch_size`
+  - `training.inbatch_neg_size`
+  - `ranking.batch_size`
+  - `ranking.num_workers`
+- `src/features/feature_builder.py` 目前是预留接口，实际特征构建逻辑主要由 `01_process_data.py` 和 `02_build_features.py` 承担。
+
+## 后续扩展建议
+
+- 增加 TMDB 数据抓取与校验脚本
+- 把 `04/07` 的评估结果统一落盘成报表
+- 增加实验配置版本管理
+- 为训练和评估补充更明确的日志与 checkpoint 策略
+
+## 参考文档
+
+- 设计草稿见 [docs/design_spec.md](docs/design_spec.md)
+- 核心配置见 [config.sample.yaml](config.sample.yaml)
