@@ -13,13 +13,13 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
-    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
+    RANK_HIST_SEQ_MAXLEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     RANK_ID_EMBED_DIM, RANK_GENRE_EMBED_DIM, RANK_CONT_EMBED_DIM,
     RANK_CONT_BUCKET_SIZE,
     RANK_CROSS_LAYERS, RANK_DROPOUT,
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_BATCH_SIZE, RANK_LEARNING_RATE, RANK_EPOCHS,
-    RANK_NUM_WORKERS, RANK_EXPLICIT_NEGATIVE_THRESHOLD,
+    RANK_NUM_WORKERS,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
@@ -107,14 +107,24 @@ def _build_feature_lookup_tables(user_profile, item_profile):
 
 def _load_validation_subset(processed_dir):
     ranking_val_path = Path(processed_dir) / "ranking_val_candidates.parquet"
+    ranking_val_hist_path = Path(processed_dir) / "ranking_val_hist_seq.npy"
     if not ranking_val_path.exists():
         print(
             f"  {ranking_val_path} not found. Please run 05_build_ranking_data.py first "
             "to generate validation candidate pools."
         )
         sys.exit(1)
+    if not ranking_val_hist_path.exists():
+        print(f"  {ranking_val_hist_path} not found. Please run 05_build_ranking_data.py first.")
+        sys.exit(1)
 
     val_df = pd.read_parquet(ranking_val_path, columns=['userId', 'actual'])
+    val_hist_seq = np.load(ranking_val_hist_path)
+    if len(val_hist_seq) != len(val_df):
+        raise ValueError(
+            f"Validation hist_seq rows ({len(val_hist_seq)}) do not match val parquet rows ({len(val_df)})."
+        )
+    val_df = val_df.reset_index().rename(columns={'index': 'row_idx'})
     n_total = len(val_df)
     subset_size = max(1, int(np.ceil(n_total * VAL_SUBSET_RATIO)))
     subset_df = val_df.sample(n=subset_size, random_state=VAL_SUBSET_SEED).reset_index(drop=True)
@@ -122,10 +132,10 @@ def _load_validation_subset(processed_dir):
         f"  Loaded validation pool with {n_total:,} rows; using fixed subset of "
         f"{subset_size:,} rows ({VAL_SUBSET_RATIO:.2%}, seed={VAL_SUBSET_SEED})"
     )
-    return subset_df
+    return subset_df, val_hist_seq
 
 
-def _evaluate_validation_loss(model, val_subset_df, lookup_tables, device):
+def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
     model.eval()
     losses = []
 
@@ -138,6 +148,10 @@ def _evaluate_validation_loss(model, val_subset_df, lookup_tables, device):
 
     uid_buffer = []
     iid_buffer = []
+    seq_buffer = []
+
+    def _encode_hist(hist_row):
+        return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
 
     def _flush_batch():
         if not uid_buffer:
@@ -145,6 +159,7 @@ def _evaluate_validation_loss(model, val_subset_df, lookup_tables, device):
 
         uids = torch.tensor(uid_buffer, dtype=torch.long, device=device)
         iids = torch.tensor(iid_buffer, dtype=torch.long, device=device)
+        seq_features = torch.tensor(seq_buffer, dtype=torch.long, device=device)
         int_features = torch.cat([
             user_encoded_id[uids].unsqueeze(1),
             item_encoded_id[iids].unsqueeze(1),
@@ -155,7 +170,11 @@ def _evaluate_validation_loss(model, val_subset_df, lookup_tables, device):
             user_cont[uids],
             item_cont[iids]
         ], dim=1).contiguous()
-        features = {'int_features': int_features, 'float_features': float_features}
+        features = {
+            'int_features': int_features,
+            'float_features': float_features,
+            'seq_features': seq_features,
+        }
         labels = torch.ones(len(uid_buffer), device=device)
 
         with torch.no_grad():
@@ -164,15 +183,18 @@ def _evaluate_validation_loss(model, val_subset_df, lookup_tables, device):
 
         uid_buffer.clear()
         iid_buffer.clear()
+        seq_buffer.clear()
 
     for row in val_subset_df.itertuples(index=False):
         actual_items = [int(iid) for iid in row.actual if int(iid) > 0]
         if not actual_items:
             continue
+        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)])
 
         for item_id in actual_items:
             uid_buffer.append(int(row.userId))
             iid_buffer.append(item_id)
+            seq_buffer.append(hist_encoded)
             if len(uid_buffer) >= VAL_BATCH_SIZE:
                 _flush_batch()
 
@@ -200,8 +222,12 @@ def main():
     # 3. Load pre-generated ranking samples
     print("[3/6] Loading ranking candidate pool...")
     ranking_samples_path = Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet"
+    ranking_train_hist_path = Path(PROCESSED_DATA_DIR) / "ranking_train_hist_seq.npy"
     if not ranking_samples_path.exists():
         print(f"  {ranking_samples_path} not found. Please run 05_build_ranking_data.py first.")
+        sys.exit(1)
+    if not ranking_train_hist_path.exists():
+        print(f"  {ranking_train_hist_path} not found. Please run 05_build_ranking_data.py first.")
         sys.exit(1)
     else:
         # Optimization: Use pyarrow to load the pool
@@ -255,12 +281,17 @@ def main():
             f"and explicit-negative width {explicit_width} ({explicit_source})"
         )
         del table, raw_pool, pool_matrix, explicit_matrix; import gc; gc.collect()
-        
     n_total = len(samples['userId'])
+    train_hist_seq = np.load(ranking_train_hist_path)
+    if train_hist_seq.shape != (n_total, RANK_HIST_SEQ_MAXLEN):
+        raise ValueError(
+            f"Train hist_seq shape mismatch: expected {(n_total, RANK_HIST_SEQ_MAXLEN)}, got {train_hist_seq.shape}"
+        )
+
     print(f"  Unique positives: {n_total:,} (Negative sampling will be 1:3 dynamic)")
 
     print("[3.5/6] Loading validation subset for early stopping...")
-    val_subset_df = _load_validation_subset(PROCESSED_DATA_DIR)
+    val_subset_df, val_hist_seq = _load_validation_subset(PROCESSED_DATA_DIR)
 
     # 4. Compute quantile bucket boundaries
     print("[4/6] Computing bucket boundaries...")
@@ -276,7 +307,7 @@ def main():
 
     # 5. Create dataset & dataloader
     print("[5/6] Creating dataset & dataloader...")
-    dataset = RankingDataset(samples, user_profile, item_profile)
+    dataset = RankingDataset(samples, user_profile, item_profile, train_hist_seq, encoder.vocabularies['movieId'])
     lookup_tables = _build_feature_lookup_tables(user_profile, item_profile)
     
     # Crucial: Clean up profiles after dataset lookup table is built
@@ -347,11 +378,13 @@ def main():
             # Efficiently move the 3 major blocks to GPU
             int_feat = batch['int_features'].to(device, non_blocking=True)
             float_feat = batch['float_features'].to(device, non_blocking=True)
+            seq_feat = batch['seq_features'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
             
             features = {
                 'int_features': int_feat,
-                'float_features': float_feat
+                'float_features': float_feat,
+                'seq_features': seq_feat,
             }
             ctr_label = labels[:, 0]
 
@@ -376,7 +409,9 @@ def main():
             })
 
         train_loss = float(np.mean(epoch_losses['total']))
-        val_loss = _evaluate_validation_loss(model, val_subset_df, lookup_tables, device)
+        val_loss = _evaluate_validation_loss(
+            model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
+        )
         scheduler.step(val_loss)
         print(
             f"Epoch {epoch} train_loss={train_loss:.4f} "

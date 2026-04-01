@@ -23,7 +23,7 @@ from src.config.settings import (
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS, RANK_TRAIN_POOL_SIZE, RANK_EVAL_POOL_SIZE,
-    RANK_FORCE_INSERT_TARGET, RANK_EXPLICIT_NEGATIVE_THRESHOLD,
+    RANK_FORCE_INSERT_TARGET, RANK_EXPLICIT_NEGATIVE_THRESHOLD, RANK_HIST_SEQ_MAXLEN,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
@@ -108,8 +108,8 @@ def _prepare_candidate_pool(merged_candidates, actual_list, pool_size, force_ins
     }
 
 
-def _merge_with_dt(pool_merger, cpu_merged, dt_snap_results, uid, snap_idx, watched_items):
-    dt_cands = dt_snap_results.get((uid, snap_idx), [])
+def _merge_with_dt(pool_merger, cpu_merged, dt_snap_results, uid, dt_key, watched_items):
+    dt_cands = dt_snap_results.get((uid, dt_key), [])
     if dt_cands:
         watched_set = set(watched_items)
         dt_cands = [c for c in dt_cands if c not in watched_set][:RECALL_K]
@@ -118,6 +118,25 @@ def _merge_with_dt(pool_merger, cpu_merged, dt_snap_results, uid, snap_idx, watc
             weights={'cpu': 1.0, 'dt': MERGER_WEIGHTS.get('dual_tower', 1.0)}
         )
     return cpu_merged
+
+
+def _pad_histories(histories, max_len):
+    out = np.zeros((len(histories), max_len), dtype=np.int64)
+    for idx, hist in enumerate(histories):
+        hist = [int(mid) for mid in hist[:max_len]]
+        out[idx, :len(hist)] = hist
+    return out
+
+
+def _build_cpu_merged(history, top_genres, watched_set, item_cf, icf_ready, pop_candidates,
+                      genre_recall, merger, weights):
+    channels = {}
+    if icf_ready and history:
+        channels['item_cf'] = [iid for iid in item_cf.retrieve(history, k=RECALL_K) if iid not in watched_set][:RECALL_K]
+    channels['popularity'] = [iid for iid in pop_candidates if iid not in watched_set][:RECALL_K]
+    if top_genres:
+        channels['genre'] = [iid for iid in genre_recall.retrieve(top_genres, k=RECALL_K) if iid not in watched_set][:RECALL_K]
+    return merger.merge(channels, weights=weights) if channels else []
 
 
 def _build_user_data(uid):
@@ -132,6 +151,9 @@ def _build_user_data(uid):
     weights = s['weights']
     val_gt = s['val_gt']
     test_gt = s['test_gt']
+    val_target_map = s['val_target_map']
+    val_target_ts_map = s['val_target_ts_map']
+    val_target_genres_map = s['val_target_genres_map']
 
     train_out = []
     val_out = []
@@ -164,15 +186,10 @@ def _build_user_data(uid):
         # 2. Recall + Merge (If in sampling window)
         if i >= sample_start:
             watched_set = set(history)
-            channels = {}
-            if icf_ready and snap_history:
-                channels['item_cf'] = [iid for iid in item_cf.retrieve(snap_history, k=RECALL_K) if iid not in watched_set][:RECALL_K]
-            channels['popularity'] = [iid for iid in pop_candidates if iid not in watched_set][:RECALL_K]
-            if snap_top_genres:
-                channels['genre'] = [iid for iid in genre_recall.retrieve(snap_top_genres, k=RECALL_K) if iid not in watched_set][:RECALL_K]
-
-            # RRF Merge (Initial CPU-only merge, DT will be added later if available)
-            merged = merger.merge(channels, weights=weights) if channels else []
+            merged = _build_cpu_merged(
+                snap_history, snap_top_genres, watched_set,
+                item_cf, icf_ready, pop_candidates, genre_recall, merger, weights
+            )
             
             # Record state for training, even if the current merged pool is empty.
             # The final integration step may still force-insert the target item.
@@ -181,15 +198,75 @@ def _build_user_data(uid):
                 rating_norm = rating / 5.0
                 train_out.append({
                     'uid': uid, 'mid': mid, 'ctr': ctr_label, 'rat': rating_norm,
-                    'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW
+                    'cpu_merged': merged, 'watched': list(watched_set), 'snap_idx': i // SNAPSHOT_WINDOW,
+                    'hist_seq': list(history[-RANK_HIST_SEQ_MAXLEN:]),
                 })
 
             # Record state for Evaluation (If it's the last interaction)
             if i == n_total - 1:
+                val_hist = list(history[-USER_HISTORY_MAX_LEN:])
+                val_top_genres = [g for g, _ in genre_counter.most_common(USER_TOP_GENRES_MAX_LEN)]
+                if history_ts:
+                    val_recent_ts = history_ts[-USER_HISTORY_MAX_LEN:]
+                    val_max_ts = val_recent_ts[-1]
+                    val_ts_diff = [(val_max_ts - t) / 3600.0 for t in val_recent_ts]
+                else:
+                    val_ts_diff = []
+                val_dt_key = 'val'
+                snapshots_out.append((uid, val_dt_key, val_hist, val_top_genres, val_ts_diff))
+                val_watched = set(history)
+                val_merged = _build_cpu_merged(
+                    val_hist, val_top_genres, val_watched,
+                    item_cf, icf_ready, pop_candidates, genre_recall, merger, weights
+                )
                 if uid in val_gt:
-                    val_out.append({'userId': uid, 'cpu_merged': merged, 'actual': val_gt[uid], 'snap_idx': i // SNAPSHOT_WINDOW, 'watched': list(watched_set)})
+                    val_out.append({
+                        'userId': uid,
+                        'cpu_merged': val_merged,
+                        'actual': val_gt[uid],
+                        'dt_key': val_dt_key,
+                        'watched': list(val_watched),
+                        'hist_seq': list(history[-RANK_HIST_SEQ_MAXLEN:]),
+                    })
                 if uid in test_gt:
-                    test_out.append({'userId': uid, 'cpu_merged': merged, 'actual': test_gt[uid], 'snap_idx': i // SNAPSHOT_WINDOW, 'watched': list(watched_set)})
+                    test_history = list(history)
+                    val_target = val_target_map.get(uid)
+                    val_target_ts = val_target_ts_map.get(uid)
+                    val_target_genres = val_target_genres_map.get(uid, '')
+                    test_genre_counter = genre_counter.copy()
+                    if val_target is not None:
+                        test_history.append(int(val_target))
+                    test_history_recent = test_history[-USER_HISTORY_MAX_LEN:]
+                    test_history_ts = list(history_ts)
+                    if val_target_ts is not None:
+                        test_history_ts.append(val_target_ts)
+                    test_history_ts_recent = test_history_ts[-USER_HISTORY_MAX_LEN:]
+                    if val_target_genres:
+                        for g in val_target_genres.split('|'):
+                            test_genre_counter[g] += 1
+                    test_top_genres = [g for g, _ in test_genre_counter.most_common(USER_TOP_GENRES_MAX_LEN)]
+                    if test_history_ts_recent:
+                        test_max_ts = test_history_ts_recent[-1]
+                        test_ts_diff = [(test_max_ts - t) / 3600.0 for t in test_history_ts_recent]
+                    else:
+                        test_ts_diff = []
+                    test_watched = set(history)
+                    if val_target is not None:
+                        test_watched.add(int(val_target))
+                    test_dt_key = 'test'
+                    snapshots_out.append((uid, test_dt_key, test_history_recent, test_top_genres, test_ts_diff))
+                    test_merged = _build_cpu_merged(
+                        test_history_recent, test_top_genres, test_watched,
+                        item_cf, icf_ready, pop_candidates, genre_recall, merger, weights
+                    )
+                    test_out.append({
+                        'userId': uid,
+                        'cpu_merged': test_merged,
+                        'actual': test_gt[uid],
+                        'dt_key': test_dt_key,
+                        'watched': list(test_watched),
+                        'hist_seq': test_history[-RANK_HIST_SEQ_MAXLEN:],
+                    })
 
         # Update History
         history.append(mid)
@@ -244,6 +321,9 @@ def main():
     
     val_gt = val_data.groupby('userId')['movieId'].apply(list).to_dict()
     test_gt = test_data.groupby('userId')['movieId'].apply(list).to_dict()
+    val_target_map = val_data.groupby('userId')['movieId'].first().to_dict()
+    val_target_ts_map = val_data.groupby('userId')['timestamp'].first().to_dict()
+    val_target_genres_map = val_data.assign(genres_str=val_data['movieId'].map(movie_genres).fillna('')).groupby('userId')['genres_str'].first().to_dict()
 
     # 4. Phase 1: Parallel CPU Recall + Merge
     print(f"[4/7] Phase 1: Parallel Recall & Merge ({RECALL_WORKERS} workers)...")
@@ -251,7 +331,8 @@ def main():
         'user_interactions': user_interactions, 'item_cf': item_cf, 'icf_ready': True,
         'genre_recall': genre_recall, 'pop': pop_candidates,
         'merger': RecallMerger(top_k=MERGE_K), 'weights': MERGER_WEIGHTS,
-        'val_gt': val_gt, 'test_gt': test_gt
+        'val_gt': val_gt, 'test_gt': test_gt, 'val_target_map': val_target_map,
+        'val_target_ts_map': val_target_ts_map, 'val_target_genres_map': val_target_genres_map,
     })
 
     all_train = []; all_val = []; all_test = []; all_snapshots = []
@@ -392,6 +473,9 @@ def main():
     final_train = []
     final_val = []
     final_test = []
+    train_histories = []
+    val_histories = []
+    test_histories = []
     pool_stats = {
         'train': {'target_in_pool_before_fix': 0, 'target_force_inserted': 0, 'target_pool_was_empty': 0},
         'val': {'target_in_pool_before_fix': 0, 'target_force_inserted': 0, 'target_pool_was_empty': 0},
@@ -400,8 +484,8 @@ def main():
 
     # Process Train interactions
     for item in tqdm(all_train, desc="Final Train Pool"):
-        uid, mid, snap_idx = item['uid'], item['mid'], item['snap_idx']
-        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, snap_idx, item['watched'])
+        uid, mid, dt_key = item['uid'], item['mid'], item['snap_idx']
+        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, dt_key, item['watched'])
         pool, stats = _prepare_candidate_pool(
             merged_candidates=merged,
             actual_list=[mid],
@@ -417,12 +501,13 @@ def main():
         neg_count = sum(1 for c in pool if c != int(mid))
         if neg_count >= 10:
             final_train.append((uid, mid, item['ctr'], item['rat'], pool, explicit_negatives))
+            train_histories.append(item['hist_seq'])
 
     # Process Eval sets
     for item in tqdm(all_val, desc="Final Val Pool"):
-        uid, snap_idx = item['userId'], item['snap_idx']
+        uid, dt_key = item['userId'], item['dt_key']
         actual_list = item['actual']
-        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, snap_idx, item['watched'])
+        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, dt_key, item['watched'])
         candidates, stats = _prepare_candidate_pool(
             merged_candidates=merged,
             actual_list=actual_list,
@@ -439,11 +524,12 @@ def main():
             'actual': actual_list,
             **stats,
         })
+        val_histories.append(item['hist_seq'])
 
     for item in tqdm(all_test, desc="Final Test Pool"):
-        uid, snap_idx = item['userId'], item['snap_idx']
+        uid, dt_key = item['userId'], item['dt_key']
         actual_list = item['actual']
-        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, snap_idx, item['watched'])
+        merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, dt_key, item['watched'])
         candidates, stats = _prepare_candidate_pool(
             merged_candidates=merged,
             actual_list=actual_list,
@@ -460,6 +546,7 @@ def main():
             'actual': actual_list,
             **stats,
         })
+        test_histories.append(item['hist_seq'])
 
     # 7. Save
     print("[7/7] Saving Results...")
@@ -467,6 +554,9 @@ def main():
         Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet", index=False)
     pd.DataFrame(final_val).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet", index=False)
     pd.DataFrame(final_test).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)
+    np.save(Path(PROCESSED_DATA_DIR) / "ranking_train_hist_seq.npy", _pad_histories(train_histories, RANK_HIST_SEQ_MAXLEN))
+    np.save(Path(PROCESSED_DATA_DIR) / "ranking_val_hist_seq.npy", _pad_histories(val_histories, RANK_HIST_SEQ_MAXLEN))
+    np.save(Path(PROCESSED_DATA_DIR) / "ranking_test_hist_seq.npy", _pad_histories(test_histories, RANK_HIST_SEQ_MAXLEN))
     
     print(f"\n=== Done ===\nSaved Training: {len(final_train):,}, Val: {len(final_val):,}, Test: {len(final_test):,}")
     for split, stats in pool_stats.items():

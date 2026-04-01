@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from src.models.ranking.modules import CrossNetV2, MMoE, TaskTower
+from src.config.settings import RANK_DIN_ATTENTION_HIDDEN
+from src.models.ranking.modules import CrossNetV2, DINAttention, MMoE, TaskTower
 
 
 def _quantile_bounds(values, n_buckets):
@@ -18,11 +19,12 @@ def _quantile_bounds(values, n_buckets):
 
 
 class EmbeddingLayer(nn.Module):
-    """Transforms 11 feature fields into mixed-dimension embeddings.
+    """Transforms base features and DIN history into mixed-dimension embeddings.
 
     ID features (user/item) → 64d embedding
     Genre features → 8d embedding (masked mean pooling)
     Continuous features → quantile bucketization → 8d embedding
+    DIN history interest → 64d embedding
     """
 
     def __init__(self, vocab_sizes, id_embed_dim=64, genre_embed_dim=8,
@@ -33,6 +35,7 @@ class EmbeddingLayer(nn.Module):
         # 1-2. Sparse ID embeddings (64d)
         self.user_emb = nn.Embedding(vocab_sizes['userId'] + 1, id_embed_dim, padding_idx=0)
         self.item_emb = nn.Embedding(vocab_sizes['movieId'] + 1, id_embed_dim, padding_idx=0)
+        self.din_attention = DINAttention(id_embed_dim, RANK_DIN_ATTENTION_HIDDEN)
 
         # 3-4. Genre embeddings (8d)
         self.genre_emb = nn.Embedding(vocab_sizes['genres'] + 1, genre_embed_dim, padding_idx=0)
@@ -59,8 +62,8 @@ class EmbeddingLayer(nn.Module):
             else:
                 self.register_buffer(f'{name}_bounds', default_bounds.clone())
 
-        # Output dim: 2*id + 2*genre + 7*cont
-        self.output_dim = 2 * id_embed_dim + 2 * genre_embed_dim + 7 * cont_embed_dim
+        # Output dim: 2*id + 2*genre + 7*cont + 1*history_interest
+        self.output_dim = 2 * id_embed_dim + 2 * genre_embed_dim + 7 * cont_embed_dim + id_embed_dim
 
     def forward(self, features):
         """Returns (B, output_dim) concatenated embedding vector."""
@@ -68,12 +71,15 @@ class EmbeddingLayer(nn.Module):
         # int_features: [user_id(0), item_id(1), user_genres(2:12), item_genres(12:22)]
         int_feat = features['int_features']
         float_feat = features['float_features']
+        seq_feat = features['seq_features']
         
         embs = []
 
         # 1-2. Sparse IDs (64d each)
-        embs.append(self.user_emb(int_feat[:, 0]))
-        embs.append(self.item_emb(int_feat[:, 1]))
+        user_emb = self.user_emb(int_feat[:, 0])
+        item_emb = self.item_emb(int_feat[:, 1])
+        embs.append(user_emb)
+        embs.append(item_emb)
 
         # 3-4. Genre pooling — masked mean (8d each)
         # user_genres: 2 to 12, item_genres: 12 to 22
@@ -97,6 +103,10 @@ class EmbeddingLayer(nn.Module):
             val = float_feat[:, i].contiguous()
             bucket_idx = torch.bucketize(val, bounds)
             embs.append(self.bucket_embs[name](bucket_idx))
+
+        hist_keys = self.item_emb(seq_feat)
+        hist_mask = seq_feat > 0
+        embs.append(self.din_attention(item_emb, hist_keys, hist_mask))
 
         return torch.cat(embs, dim=-1)  # (B, output_dim)
 

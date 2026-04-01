@@ -2,6 +2,42 @@ import torch
 import torch.nn as nn
 
 
+class DINAttention(nn.Module):
+    """DIN-style attention with query-aware history aggregation."""
+
+    def __init__(self, embed_dim, hidden_dims):
+        super().__init__()
+        mlp_dims = [embed_dim * 4] + list(hidden_dims) + [1]
+        layers = []
+        for in_dim, out_dim in zip(mlp_dims[:-2], mlp_dims[1:-1]):
+            layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
+        layers.append(nn.Linear(mlp_dims[-2], mlp_dims[-1]))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, query, keys, mask):
+        seq_len = keys.size(1)
+        query_expanded = query.unsqueeze(1).expand(-1, seq_len, -1)
+        attn_input = torch.cat([
+            query_expanded,
+            keys,
+            query_expanded - keys,
+            query_expanded * keys,
+        ], dim=-1)
+        scores = self.mlp(attn_input).squeeze(-1)
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+        has_history = mask.any(dim=1, keepdim=True)
+        safe_scores = torch.where(has_history, scores, torch.zeros_like(scores))
+        weights = torch.softmax(safe_scores, dim=1)
+        weights = weights * mask.float()
+        weights = torch.where(
+            has_history,
+            weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8),
+            torch.zeros_like(weights),
+        )
+        return torch.bmm(weights.unsqueeze(1), keys).squeeze(1)
+
+
 class CrossNetV2(nn.Module):
     """DCN-V2 Cross Network: explicit high-order feature interactions.
 

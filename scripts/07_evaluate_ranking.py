@@ -13,10 +13,7 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
-    EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA, BPR_MARGIN,
-    LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
-    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
-    MERGER_WEIGHTS,
+    USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN, RANK_HIST_SEQ_MAXLEN,
     RANK_ID_EMBED_DIM, RANK_GENRE_EMBED_DIM, RANK_CONT_EMBED_DIM,
     RANK_CONT_BUCKET_SIZE,
     RANK_CROSS_LAYERS, RANK_DROPOUT,
@@ -24,10 +21,6 @@ from src.config.settings import (
     RANK_EVAL_KS,
 )
 from src.features.encoder import FeatureEncoder
-from src.models.recall.dual_tower import DualTowerModel
-from src.models.recall.item_cf import ItemCFModel
-from src.models.recall.simple_recall import PopularityRecall, GenreRecall
-from src.models.recall.merger import RecallMerger
 from src.models.ranking.ranker import RankingModel
 from src.evaluation.metrics import hitrate_at_k, ndcg_at_k, mrr
 
@@ -35,7 +28,6 @@ from src.evaluation.metrics import hitrate_at_k, ndcg_at_k, mrr
 def apply_encoding(user_profile, item_profile, encoder):
     user_profile['userId_encoded'] = encoder.transform_categorical(user_profile['userId'], 'userId')
     user_profile['top_genres_encoded'] = encoder.transform_categorical(user_profile['top_genres'], 'genres', is_list=True, max_len=USER_TOP_GENRES_MAX_LEN)
-    user_profile['history_encoded'] = encoder.transform_categorical(user_profile['history'], 'movieId', is_list=True, max_len=USER_HISTORY_MAX_LEN)
 
     item_profile['movieId_encoded'] = encoder.transform_categorical(item_profile['movieId'], 'movieId')
     item_profile['tmdb_genres_encoded'] = encoder.transform_categorical(item_profile['tmdb_genres'], 'genres', is_list=True, max_len=ITEM_GENRES_MAX_LEN)
@@ -53,33 +45,14 @@ def apply_encoding(user_profile, item_profile, encoder):
     return user_profile, item_profile
 
 
-# Module-level shared data for multiprocessing (fork-based COW)
-_shared = {}
-
-
-def _recall_one_user(uid):
-    """Worker: ItemCF + genre + pop + merge + filter watched → candidate list."""
-    s = _shared
-    watched_set = s['watched'][uid]
-
-    channels = {}
-    dt = s['dt_results'].get(uid)
-    if dt is not None:
-        channels['dual_tower'] = dt
-    history = s['history'].get(uid)
-    if s['icf_ready'] and history is not None:
-        channels['item_cf'] = s['item_cf'].retrieve(list(history), k=s['RAW_K'])
-    channels['popularity'] = s['pop']
-    genres = s['genres'].get(uid)
-    if genres is not None:
-        channels['genre'] = s['genre_recall'].retrieve(list(genres), k=s['RAW_K'])
-
-    for name in list(channels.keys()):
-        channels[name] = [iid for iid in channels[name] if iid not in watched_set][:s['CH_K']]
-
-    merged = s['merger'].merge(channels, weights=s['weights'])
-    actual = s['ground_truth'][uid]
-    return uid, merged, actual
+def _encode_hist_matrix(hist_seq, movie_vocab):
+    encoded = np.zeros(hist_seq.shape, dtype=np.int64)
+    for row_idx in range(hist_seq.shape[0]):
+        encoded[row_idx] = [
+            movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0
+            for mid in hist_seq[row_idx]
+        ]
+    return encoded
 
 
 def evaluate(test_mode=False, eval_set='val'):
@@ -87,13 +60,23 @@ def evaluate(test_mode=False, eval_set='val'):
 
     # 1. Load data & encoder
     ranking_val_path = Path(PROCESSED_DATA_DIR) / f"ranking_{eval_set}_candidates.parquet"
+    ranking_hist_path = Path(PROCESSED_DATA_DIR) / f"ranking_{eval_set}_hist_seq.npy"
     if not ranking_val_path.exists():
         print(f"ERROR: {ranking_val_path} not found. Run 05_build_ranking_data.py first.")
         return
+    if not ranking_hist_path.exists():
+        print(f"ERROR: {ranking_hist_path} not found. Run 05_build_ranking_data.py first.")
+        return
     
     val_df = pd.read_parquet(ranking_val_path)
+    hist_seq = np.load(ranking_hist_path)
+    if hist_seq.shape != (len(val_df), RANK_HIST_SEQ_MAXLEN):
+        raise ValueError(
+            f"hist_seq shape mismatch for {eval_set}: expected {(len(val_df), RANK_HIST_SEQ_MAXLEN)}, got {hist_seq.shape}"
+        )
     if test_mode:
         val_df = val_df.head(1000)
+        hist_seq = hist_seq[:len(val_df)]
     
     user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
     item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
@@ -101,6 +84,7 @@ def evaluate(test_mode=False, eval_set='val'):
     encoder = FeatureEncoder(FEATURE_STORE_DIR)
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
+    hist_seq_encoded = _encode_hist_matrix(hist_seq, encoder.vocabularies['movieId'])
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Device: {device}")
@@ -173,7 +157,7 @@ def evaluate(test_mode=False, eval_set='val'):
     
     print(f"Ranking {len(val_df):,} users with batch scoring...")
     
-    for _, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Ranking"):
+    for row_idx, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Ranking"):
         uid = int(row['userId'])
         candidates = list(row['candidates'])
         actual_items = list(row['actual'])
@@ -207,8 +191,13 @@ def evaluate(test_mode=False, eval_set='val'):
             user_cont_arr[uid].expand(n_cand, -1),
             item_cont_arr[cand_arr]
         ], dim=1).contiguous()
+        seq_features = torch.from_numpy(hist_seq_encoded[row_idx]).to(device).unsqueeze(0).expand(n_cand, -1).contiguous()
         
-        features = {'int_features': int_features, 'float_features': float_features}
+        features = {
+            'int_features': int_features,
+            'float_features': float_features,
+            'seq_features': seq_features,
+        }
 
         with torch.no_grad():
             ctr_logit = ranking_model(features)

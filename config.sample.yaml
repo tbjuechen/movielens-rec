@@ -52,6 +52,8 @@ ranking:
   genre_embed_dim: 8         # genre features (low cardinality ~20)
   cont_embed_dim: 8          # bucketized continuous features (20 bins)
   cont_bucket_size: 20
+  hist_seq_maxlen: 50
+  din_attention_hidden: [64, 32]
   # DCNv2
   cross_layers: 3
   dropout: 0.1

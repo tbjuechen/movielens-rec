@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.config.settings import (
-    USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
+    RANK_HIST_SEQ_MAXLEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     RANK_NEGATIVES_PER_POSITIVE, RANK_HARD_NEGATIVE_TOPK, RANK_HARD_NEGATIVE_MIX,
 )
 
@@ -15,7 +15,8 @@ class RankingDataset(Dataset):
     In each batch, it samples negatives from valid pool entries only.
     """
 
-    def __init__(self, samples, user_profile_df, item_profile_df, neg_size=RANK_NEGATIVES_PER_POSITIVE):
+    def __init__(self, samples, user_profile_df, item_profile_df, hist_seq, movie_vocab,
+                 neg_size=RANK_NEGATIVES_PER_POSITIVE):
         self.neg_size = neg_size
         self.hard_negative_topk = RANK_HARD_NEGATIVE_TOPK
         self.hard_pool_negatives = int(RANK_HARD_NEGATIVE_MIX[0])
@@ -35,6 +36,17 @@ class RankingDataset(Dataset):
         else:
             # Fallback for old flat format
             raise ValueError("RankingDataset now requires the candidate pool format.")
+
+        expected_shape = (self.n, RANK_HIST_SEQ_MAXLEN)
+        if hist_seq.shape != expected_shape:
+            raise ValueError(f"hist_seq shape mismatch: expected {expected_shape}, got {hist_seq.shape}")
+        hist_seq_encoded = np.zeros(expected_shape, dtype=np.int64)
+        for row_idx in range(self.n):
+            hist_seq_encoded[row_idx] = [
+                movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0
+                for mid in hist_seq[row_idx]
+            ]
+        self.hist_seq_encoded = torch.from_numpy(hist_seq_encoded).share_memory_()
 
         rows_with_explicit = int((self.explicit_negatives > 0).any(dim=1).sum().item())
         print(
@@ -162,6 +174,8 @@ class RankingDataset(Dataset):
         # Final batch shape: (batch_size * (1 + neg_size), ...)
         uids = torch.cat([uids_pos, uids_pos.repeat_interleave(self.neg_size)])
         iids = torch.cat([iids_pos, iids_neg.view(-1)])
+        seq_pos = self.hist_seq_encoded[batch_idx]
+        seq_features = torch.cat([seq_pos, seq_pos.repeat_interleave(self.neg_size, dim=0)], dim=0)
         
         # 4. Construct Labels
         ctr_label = torch.cat([
@@ -203,6 +217,7 @@ class RankingDataset(Dataset):
         return {
             'int_features': int_features,
             'float_features': float_features,
+            'seq_features': seq_features,
             'labels': labels
         }
 
