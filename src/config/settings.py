@@ -87,6 +87,8 @@ RANK_HARD_NEGATIVE_MIX = _hard_negative_mix
 RANK_TRAIN_POOL_SIZE = _ranking.get('train_pool_size', 100)
 RANK_EVAL_POOL_SIZE = _ranking.get('eval_pool_size', 500)
 RANK_FORCE_INSERT_TARGET = _ranking.get('force_insert_target', True)
+RANK_BPR_WEIGHT = _ranking.get('bpr_weight', 0.1)
+RANK_EARLY_STOP_METRIC = _ranking.get('early_stop_metric', 'mrr').lower()
 
 # 8. Merger Weights
 MERGER_WEIGHTS = config.get('merger_weights', {

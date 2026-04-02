@@ -218,7 +218,10 @@ class RankingDataset(Dataset):
             'int_features': int_features,
             'float_features': float_features,
             'seq_features': seq_features,
-            'labels': labels
+            'labels': labels,
+            'batch_size': batch_size,
+            'neg_size': self.neg_size,
+            'group_size': 1 + self.neg_size,
         }
 
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -21,10 +22,12 @@ from src.config.settings import (
     RANK_BATCH_SIZE, RANK_LEARNING_RATE, RANK_EPOCHS,
     RANK_NUM_WORKERS, RANK_WEIGHT_DECAY, RANK_WARMUP_EPOCHS,
     RANK_NEGATIVES_PER_POSITIVE, RANK_HARD_NEGATIVE_MIX,
+    RANK_BPR_WEIGHT, RANK_EARLY_STOP_METRIC,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
 from src.data_pipeline.ranking_dataset import RankingDataset
+from src.evaluation.metrics import mrr
 
 VAL_SUBSET_RATIO = 0.05
 VAL_SUBSET_SEED = 42
@@ -205,6 +208,57 @@ def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables,
     if not losses:
         raise ValueError("Validation subset produced no valid positive targets for early stopping.")
     return float(np.mean(losses))
+
+
+def _evaluate_validation_mrr(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
+    """Compute MRR on validation candidate pools."""
+    model.eval()
+    user_encoded_id = lookup_tables['user_encoded_id']
+    user_top_genres = lookup_tables['user_top_genres']
+    user_cont = lookup_tables['user_cont']
+    item_encoded_id = lookup_tables['item_encoded_id']
+    item_genres = lookup_tables['item_genres']
+    item_cont = lookup_tables['item_cont']
+
+    def _encode_hist(hist_row):
+        return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
+
+    mrr_scores = []
+    for row in val_subset_df.itertuples(index=False):
+        actual_items = [int(iid) for iid in row.actual if int(iid) > 0]
+        candidates = [int(c) for c in row.candidates if int(c) > 0]
+        if not actual_items or not candidates:
+            continue
+
+        uid = int(row.userId)
+        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)])
+        n_cand = len(candidates)
+        cand_t = torch.tensor(candidates, dtype=torch.long, device=device)
+
+        int_features = torch.cat([
+            user_encoded_id[uid].expand(n_cand, 1),
+            item_encoded_id[cand_t].unsqueeze(1),
+            user_top_genres[uid].expand(n_cand, -1),
+            item_genres[cand_t],
+        ], dim=1).contiguous()
+        float_features = torch.cat([
+            user_cont[uid].expand(n_cand, -1),
+            item_cont[cand_t],
+        ], dim=1).contiguous()
+        seq_features = torch.tensor(hist_encoded, dtype=torch.long, device=device).unsqueeze(0).expand(n_cand, -1).contiguous()
+        features = {'int_features': int_features, 'float_features': float_features, 'seq_features': seq_features}
+
+        with torch.no_grad():
+            logits = model(features).view(-1)
+            order = logits.argsort(descending=True)
+            ranked = [candidates[i] for i in order.cpu().numpy().reshape(-1)]
+
+        mrr_scores.append(mrr(actual_items, ranked))
+
+    model.train()
+    if not mrr_scores:
+        return 0.0
+    return float(np.mean(mrr_scores))
 
 
 def _evaluate_validation_gauc(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
@@ -436,7 +490,7 @@ def main():
         for key, value in lookup_tables.items()
     }
 
-    # 7. Training loop with CTR-only objective + AMP
+    # 7. Training loop with BCE + BPR objective + AMP
     emb_params = [p for n, p in model.named_parameters() if 'emb' in n]
     other_params = [p for n, p in model.named_parameters() if 'emb' not in n]
     optimizer = optim.AdamW([
@@ -451,6 +505,17 @@ def main():
     amp_dtype = torch.float16 if use_amp else torch.float32
     print(f"AMP: {'enabled (fp16)' if use_amp else 'disabled'}")
 
+    monitor_metric = RANK_EARLY_STOP_METRIC
+    if monitor_metric not in {'mrr', 'gauc'}:
+        print(f"Invalid ranking.early_stop_metric={monitor_metric}, fallback to 'mrr'")
+        monitor_metric = 'mrr'
+    print(
+        f"Training objective: BCE + {RANK_BPR_WEIGHT:.4f} * BPR, "
+        f"early_stop_metric={monitor_metric}"
+    )
+
+    best_val_metric = -np.inf
+    best_val_mrr = 0.0
     best_val_gauc = 0.0
     best_epoch = 0
     no_improve = 0
@@ -458,7 +523,7 @@ def main():
     global_step = 0
     for epoch in range(1, RANK_EPOCHS + 1):
         model.train()
-        epoch_losses = {'total': []}
+        epoch_losses = {'total': [], 'bce': [], 'bpr': []}
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
@@ -481,11 +546,24 @@ def main():
                 'seq_features': seq_feat,
             }
             ctr_label = labels[:, 0]
+            batch_size = int(batch['batch_size'])
+            neg_size = int(batch['neg_size'])
+            expected_total = batch_size * (1 + neg_size)
+            if ctr_label.numel() != expected_total:
+                raise ValueError(
+                    f"Batch shape mismatch: got {ctr_label.numel()} rows, expected {expected_total} "
+                    f"(batch_size={batch_size}, neg_size={neg_size})"
+                )
 
             # Forward (AMP autocast for model; BCE-with-logits remains numerically stable)
             with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                ctr_logit = model(features)
-                total_loss = model.compute_loss(ctr_logit, ctr_label)
+                ctr_logit = model(features).view(-1)
+                bce_loss = model.compute_loss(ctr_logit, ctr_label)
+
+                pos_logit = ctr_logit[:batch_size].unsqueeze(1)
+                neg_logit = ctr_logit[batch_size:].view(batch_size, neg_size)
+                bpr_loss = -F.logsigmoid(pos_logit - neg_logit).mean()
+                total_loss = bce_loss + (RANK_BPR_WEIGHT * bpr_loss)
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -496,36 +574,51 @@ def main():
             loss_val = total_loss.item()
             if not np.isnan(loss_val):
                 epoch_losses['total'].append(loss_val)
+                epoch_losses['bce'].append(bce_loss.item())
+                epoch_losses['bpr'].append(bpr_loss.item())
 
             pbar.set_postfix({
                 'loss': f"{total_loss.item():.4f}",
+                'bce': f"{bce_loss.item():.4f}",
+                'bpr': f"{bpr_loss.item():.4f}",
                 'LR': f"{optimizer.param_groups[0]['lr']:.6f}",
             })
 
         train_loss = float(np.mean(epoch_losses['total']))
+        train_bce = float(np.mean(epoch_losses['bce']))
+        train_bpr = float(np.mean(epoch_losses['bpr']))
         val_loss = _evaluate_validation_loss(
+            model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
+        )
+        val_mrr = _evaluate_validation_mrr(
             model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
         )
         val_gauc = _evaluate_validation_gauc(
             model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
         )
-        scheduler.step(val_gauc)
+        val_monitor = val_mrr if monitor_metric == 'mrr' else val_gauc
+        scheduler.step(val_monitor)
+
+        best_val_mrr = max(best_val_mrr, val_mrr)
+        best_val_gauc = max(best_val_gauc, val_gauc)
         print(
             f"Epoch {epoch} train_loss={train_loss:.4f} "
+            f"(bce={train_bce:.4f}, bpr={train_bpr:.4f}) "
             f"val_loss(diag)={val_loss:.4f} "
+            f"val_mrr={val_mrr:.4f} "
             f"val_gauc={val_gauc:.4f} "
-            f"best_gauc={best_val_gauc:.4f} "
+            f"best_{monitor_metric}={best_val_metric if best_val_metric > -np.inf else 0.0:.4f} "
             f"best_epoch={best_epoch} "
             f"no_improve={no_improve}/{EARLY_STOP_PATIENCE}"
         )
 
-        if val_gauc > (best_val_gauc + EARLY_STOP_MIN_DELTA):
-            best_val_gauc = val_gauc
+        if val_monitor > (best_val_metric + EARLY_STOP_MIN_DELTA):
+            best_val_metric = val_monitor
             best_epoch = epoch
             no_improve = 0
             Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
-            print(f"  -> Saved best model (val_gauc={best_val_gauc:.4f})")
+            print(f"  -> Saved best model (val_{monitor_metric}={best_val_metric:.4f})")
         else:
             no_improve += 1
             print(f"  -> No improvement ({no_improve}/{EARLY_STOP_PATIENCE})")
