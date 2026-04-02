@@ -53,7 +53,7 @@ ranking:
   cont_embed_dim: 8          # bucketized continuous features (20 bins)
   cont_bucket_size: 20
   hist_seq_maxlen: 50
-  din_attention_hidden: [64, 32]
+  din_attention_hidden: [128, 64]
   # DCNv2
   cross_layers: 3
   dropout: 0.1
@@ -64,14 +64,16 @@ ranking:
   tower_dims: [64, 32]
   # Training
   batch_size: 16384
-  learning_rate: 0.001
+  learning_rate: 0.0005
+  weight_decay: 1e-5
+  warmup_epochs: 1
   epochs: 10
   neg_sample_ratio: 3
   objective: ctr
-  negatives_per_positive: 3
-  hard_negative_topk: 20
+  negatives_per_positive: 4
+  hard_negative_topk: 50
   explicit_negative_threshold: 3.0
-  hard_negative_mix: [2, 1]
+  hard_negative_mix: [3, 1]
   num_workers: 8
   # Loss (GradNorm auto-balances BCE and MSE)
   gradnorm_alpha: 1.5

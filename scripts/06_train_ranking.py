@@ -19,13 +19,13 @@ from src.config.settings import (
     RANK_CROSS_LAYERS, RANK_DROPOUT,
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_BATCH_SIZE, RANK_LEARNING_RATE, RANK_EPOCHS,
-    RANK_NUM_WORKERS,
+    RANK_NUM_WORKERS, RANK_WEIGHT_DECAY, RANK_WARMUP_EPOCHS,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
 from src.data_pipeline.ranking_dataset import RankingDataset
 
-VAL_SUBSET_RATIO = 0.01
+VAL_SUBSET_RATIO = 0.05
 VAL_SUBSET_SEED = 42
 EARLY_STOP_PATIENCE = 5
 EARLY_STOP_MIN_DELTA = 1e-4
@@ -118,7 +118,7 @@ def _load_validation_subset(processed_dir):
         print(f"  {ranking_val_hist_path} not found. Please run 05_build_ranking_data.py first.")
         sys.exit(1)
 
-    val_df = pd.read_parquet(ranking_val_path, columns=['userId', 'actual'])
+    val_df = pd.read_parquet(ranking_val_path, columns=['userId', 'actual', 'candidates'])
     val_hist_seq = np.load(ranking_val_hist_path)
     if len(val_hist_seq) != len(val_df):
         raise ValueError(
@@ -204,6 +204,73 @@ def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables,
     if not losses:
         raise ValueError("Validation subset produced no valid positive targets for early stopping.")
     return float(np.mean(losses))
+
+
+def _evaluate_validation_auc(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
+    """Compute pairwise AUC on validation candidate pools."""
+    model.eval()
+    user_encoded_id = lookup_tables['user_encoded_id']
+    user_top_genres = lookup_tables['user_top_genres']
+    user_cont = lookup_tables['user_cont']
+    item_encoded_id = lookup_tables['item_encoded_id']
+    item_genres = lookup_tables['item_genres']
+    item_cont = lookup_tables['item_cont']
+
+    def _encode_hist(hist_row):
+        return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
+
+    aucs = []
+    for row in val_subset_df.itertuples(index=False):
+        actual_set = {int(iid) for iid in row.actual if int(iid) > 0}
+        candidates = [int(c) for c in row.candidates if int(c) > 0]
+        if not actual_set or not candidates:
+            continue
+
+        # Build labels: 1 for items in actual, 0 otherwise
+        labels = [1.0 if c in actual_set else 0.0 for c in candidates]
+        n_pos = sum(labels)
+        n_neg = len(labels) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            continue  # AUC undefined
+
+        uid = int(row.userId)
+        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)])
+        n_cand = len(candidates)
+        cand_t = torch.tensor(candidates, dtype=torch.long, device=device)
+
+        int_features = torch.cat([
+            user_encoded_id[uid].expand(n_cand, 1),
+            item_encoded_id[cand_t].unsqueeze(1),
+            user_top_genres[uid].expand(n_cand, -1),
+            item_genres[cand_t],
+        ], dim=1).contiguous()
+        float_features = torch.cat([
+            user_cont[uid].expand(n_cand, -1),
+            item_cont[cand_t],
+        ], dim=1).contiguous()
+        seq_features = torch.tensor(hist_encoded, dtype=torch.long, device=device).unsqueeze(0).expand(n_cand, -1).contiguous()
+
+        features = {'int_features': int_features, 'float_features': float_features, 'seq_features': seq_features}
+
+        with torch.no_grad():
+            scores = torch.sigmoid(model(features)).view(-1).cpu().numpy()
+
+        labels_np = np.array(labels)
+        # Manual pairwise AUC: fraction of (pos, neg) pairs where pos scored higher
+        pos_scores = scores[labels_np == 1]
+        neg_scores = scores[labels_np == 0]
+        n_correct = 0
+        n_pairs = 0
+        for ps in pos_scores:
+            n_correct += (ps > neg_scores).sum() + 0.5 * (ps == neg_scores).sum()
+            n_pairs += len(neg_scores)
+        if n_pairs > 0:
+            aucs.append(n_correct / n_pairs)
+
+    model.train()
+    if not aucs:
+        return 0.5
+    return float(np.mean(aucs))
 
 
 def main():
@@ -346,6 +413,8 @@ def main():
         expert_dim=RANK_EXPERT_DIM,
         tower_dims=RANK_TOWER_DIMS,
         bucket_boundaries=bucket_boundaries,
+        user_genre_max_len=USER_TOP_GENRES_MAX_LEN,
+        item_genre_max_len=ITEM_GENRES_MAX_LEN,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -357,8 +426,13 @@ def main():
     }
 
     # 7. Training loop with CTR-only objective + AMP
-    optimizer = optim.Adam(model.parameters(), lr=RANK_LEARNING_RATE)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, min_lr=1e-6)
+    emb_params = [p for n, p in model.named_parameters() if 'emb' in n]
+    other_params = [p for n, p in model.named_parameters() if 'emb' not in n]
+    optimizer = optim.AdamW([
+        {'params': emb_params, 'weight_decay': 0},
+        {'params': other_params, 'weight_decay': RANK_WEIGHT_DECAY},
+    ], lr=RANK_LEARNING_RATE)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=1, min_lr=1e-6)
 
     # AMP: mixed precision for GPU throughput
     use_amp = device.type == 'cuda'
@@ -366,21 +440,30 @@ def main():
     amp_dtype = torch.float16 if use_amp else torch.float32
     print(f"AMP: {'enabled (fp16)' if use_amp else 'disabled'}")
 
-    best_val_loss = float('inf')
+    best_val_auc = 0.0
     best_epoch = 0
     no_improve = 0
+    warmup_total_steps = len(dataloader) * RANK_WARMUP_EPOCHS
+    global_step = 0
     for epoch in range(1, RANK_EPOCHS + 1):
         model.train()
         epoch_losses = {'total': []}
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
+            # LR warmup
+            global_step += 1
+            if global_step <= warmup_total_steps:
+                warmup_lr = RANK_LEARNING_RATE * global_step / warmup_total_steps
+                for pg in optimizer.param_groups:
+                    pg['lr'] = warmup_lr
+
             # Efficiently move the 3 major blocks to GPU
             int_feat = batch['int_features'].to(device, non_blocking=True)
             float_feat = batch['float_features'].to(device, non_blocking=True)
             seq_feat = batch['seq_features'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
-            
+
             features = {
                 'int_features': int_feat,
                 'float_features': float_feat,
@@ -412,22 +495,26 @@ def main():
         val_loss = _evaluate_validation_loss(
             model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
         )
-        scheduler.step(val_loss)
+        val_auc = _evaluate_validation_auc(
+            model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
+        )
+        scheduler.step(val_auc)
         print(
             f"Epoch {epoch} train_loss={train_loss:.4f} "
-            f"val_loss(subset)={val_loss:.4f} "
-            f"best_val_loss={best_val_loss if best_val_loss < float('inf') else float('nan'):.4f} "
+            f"val_loss(diag)={val_loss:.4f} "
+            f"val_auc={val_auc:.4f} "
+            f"best_auc={best_val_auc:.4f} "
             f"best_epoch={best_epoch} "
             f"no_improve={no_improve}/{EARLY_STOP_PATIENCE}"
         )
 
-        if val_loss < (best_val_loss - EARLY_STOP_MIN_DELTA):
-            best_val_loss = val_loss
+        if val_auc > (best_val_auc + EARLY_STOP_MIN_DELTA):
+            best_val_auc = val_auc
             best_epoch = epoch
             no_improve = 0
             Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
-            print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
+            print(f"  -> Saved best model (val_auc={best_val_auc:.4f})")
         else:
             no_improve += 1
             print(f"  -> No improvement ({no_improve}/{EARLY_STOP_PATIENCE})")

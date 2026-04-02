@@ -101,6 +101,8 @@ def evaluate(test_mode=False, eval_set='val'):
         num_experts=RANK_NUM_EXPERTS,
         expert_dim=RANK_EXPERT_DIM,
         tower_dims=RANK_TOWER_DIMS,
+        user_genre_max_len=USER_TOP_GENRES_MAX_LEN,
+        item_genre_max_len=ITEM_GENRES_MAX_LEN,
     ).to(device)
     ranking_path = Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth"
     if not ranking_path.exists():

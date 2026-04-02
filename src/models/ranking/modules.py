@@ -5,12 +5,12 @@ import torch.nn as nn
 class DINAttention(nn.Module):
     """DIN-style attention with query-aware history aggregation."""
 
-    def __init__(self, embed_dim, hidden_dims):
+    def __init__(self, embed_dim, hidden_dims, dropout=0.0):
         super().__init__()
         mlp_dims = [embed_dim * 4] + list(hidden_dims) + [1]
         layers = []
         for in_dim, out_dim in zip(mlp_dims[:-2], mlp_dims[1:-1]):
-            layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
+            layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(dropout)])
         layers.append(nn.Linear(mlp_dims[-2], mlp_dims[-1]))
         self.mlp = nn.Sequential(*layers)
 
@@ -113,12 +113,12 @@ class MMoE(nn.Module):
 class TaskTower(nn.Module):
     """Task-specific prediction tower."""
 
-    def __init__(self, input_dim, hidden_dims, use_sigmoid=False):
+    def __init__(self, input_dim, hidden_dims, use_sigmoid=False, dropout=0.1):
         super().__init__()
         layers = []
         in_dim = input_dim
         for h_dim in hidden_dims:
-            layers.extend([nn.Linear(in_dim, h_dim), nn.ReLU(), nn.Dropout(0.1)])
+            layers.extend([nn.Linear(in_dim, h_dim), nn.ReLU(), nn.Dropout(dropout)])
             in_dim = h_dim
         layers.append(nn.Linear(in_dim, 1))
         self.mlp = nn.Sequential(*layers)
