@@ -20,6 +20,7 @@ from src.config.settings import (
     RANK_NUM_EXPERTS, RANK_EXPERT_DIM, RANK_TOWER_DIMS,
     RANK_BATCH_SIZE, RANK_LEARNING_RATE, RANK_EPOCHS,
     RANK_NUM_WORKERS, RANK_WEIGHT_DECAY, RANK_WARMUP_EPOCHS,
+    RANK_NEGATIVES_PER_POSITIVE, RANK_HARD_NEGATIVE_MIX,
 )
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
@@ -361,7 +362,11 @@ def main():
             f"Train hist_seq shape mismatch: expected {(n_total, RANK_HIST_SEQ_MAXLEN)}, got {train_hist_seq.shape}"
         )
 
-    print(f"  Unique positives: {n_total:,} (Negative sampling will be 1:3 dynamic)")
+    print(
+        f"  Unique positives: {n_total:,} "
+        f"(Negative sampling will be 1:{RANK_NEGATIVES_PER_POSITIVE} dynamic, "
+        f"hard_mix={RANK_HARD_NEGATIVE_MIX})"
+    )
 
     print("[3.5/6] Loading validation subset for early stopping...")
     val_subset_df, val_hist_seq = _load_validation_subset(PROCESSED_DATA_DIR)
