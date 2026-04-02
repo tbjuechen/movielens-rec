@@ -206,8 +206,11 @@ def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables,
     return float(np.mean(losses))
 
 
-def _evaluate_validation_auc(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
-    """Compute pairwise AUC on validation candidate pools."""
+def _evaluate_validation_gauc(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
+    """Compute GAUC on validation candidate pools.
+
+    Per-user AUC is weighted by the number of positive-negative pairs (n_pos * n_neg).
+    """
     model.eval()
     user_encoded_id = lookup_tables['user_encoded_id']
     user_top_genres = lookup_tables['user_top_genres']
@@ -219,7 +222,8 @@ def _evaluate_validation_auc(model, val_subset_df, val_hist_seq, lookup_tables, 
     def _encode_hist(hist_row):
         return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
 
-    aucs = []
+    weighted_auc_sum = 0.0
+    total_pairs = 0
     for row in val_subset_df.itertuples(index=False):
         actual_set = {int(iid) for iid in row.actual if int(iid) > 0}
         candidates = [int(c) for c in row.candidates if int(c) > 0]
@@ -259,18 +263,20 @@ def _evaluate_validation_auc(model, val_subset_df, val_hist_seq, lookup_tables, 
         # Manual pairwise AUC: fraction of (pos, neg) pairs where pos scored higher
         pos_scores = scores[labels_np == 1]
         neg_scores = scores[labels_np == 0]
-        n_correct = 0
+        n_correct = 0.0
         n_pairs = 0
         for ps in pos_scores:
             n_correct += (ps > neg_scores).sum() + 0.5 * (ps == neg_scores).sum()
             n_pairs += len(neg_scores)
         if n_pairs > 0:
-            aucs.append(n_correct / n_pairs)
+            user_auc = n_correct / n_pairs
+            weighted_auc_sum += user_auc * n_pairs
+            total_pairs += n_pairs
 
     model.train()
-    if not aucs:
+    if total_pairs == 0:
         return 0.5
-    return float(np.mean(aucs))
+    return float(weighted_auc_sum / total_pairs)
 
 
 def main():
@@ -440,7 +446,7 @@ def main():
     amp_dtype = torch.float16 if use_amp else torch.float32
     print(f"AMP: {'enabled (fp16)' if use_amp else 'disabled'}")
 
-    best_val_auc = 0.0
+    best_val_gauc = 0.0
     best_epoch = 0
     no_improve = 0
     warmup_total_steps = len(dataloader) * RANK_WARMUP_EPOCHS
@@ -495,26 +501,26 @@ def main():
         val_loss = _evaluate_validation_loss(
             model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
         )
-        val_auc = _evaluate_validation_auc(
+        val_gauc = _evaluate_validation_gauc(
             model, val_subset_df, val_hist_seq, lookup_tables, device, encoder.vocabularies['movieId']
         )
-        scheduler.step(val_auc)
+        scheduler.step(val_gauc)
         print(
             f"Epoch {epoch} train_loss={train_loss:.4f} "
             f"val_loss(diag)={val_loss:.4f} "
-            f"val_auc={val_auc:.4f} "
-            f"best_auc={best_val_auc:.4f} "
+            f"val_gauc={val_gauc:.4f} "
+            f"best_gauc={best_val_gauc:.4f} "
             f"best_epoch={best_epoch} "
             f"no_improve={no_improve}/{EARLY_STOP_PATIENCE}"
         )
 
-        if val_auc > (best_val_auc + EARLY_STOP_MIN_DELTA):
-            best_val_auc = val_auc
+        if val_gauc > (best_val_gauc + EARLY_STOP_MIN_DELTA):
+            best_val_gauc = val_gauc
             best_epoch = epoch
             no_improve = 0
             Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
-            print(f"  -> Saved best model (val_auc={best_val_auc:.4f})")
+            print(f"  -> Saved best model (val_gauc={best_val_gauc:.4f})")
         else:
             no_improve += 1
             print(f"  -> No improvement ({no_improve}/{EARLY_STOP_PATIENCE})")
