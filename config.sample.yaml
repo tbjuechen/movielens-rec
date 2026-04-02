@@ -76,7 +76,7 @@ ranking:
   hard_negative_topk: 50
   explicit_negative_threshold: 3.0
   hard_negative_mix: [3, 1]
-  num_workers: 8
+  num_workers: 16
   # Loss (GradNorm auto-balances BCE and MSE)
   gradnorm_alpha: 1.5
   # Multi-Objective Scoring

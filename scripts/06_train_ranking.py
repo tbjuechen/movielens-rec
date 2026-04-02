@@ -1,4 +1,4 @@
-"""Train the ranking model as a single-objective CTR ranker."""
+"""Train the ranking model (DCNv2 + MMoE) with BCE + BPR loss."""
 import sys
 from pathlib import Path
 import numpy as np
@@ -34,6 +34,7 @@ VAL_SUBSET_SEED = 42
 EARLY_STOP_PATIENCE = 5
 EARLY_STOP_MIN_DELTA = 1e-4
 VAL_BATCH_SIZE = 8192
+VAL_EVAL_BATCH_USERS = 16  # Users per batched forward pass for MRR/GAUC evaluation
 
 
 def apply_encoding(user_profile, item_profile, encoder):
@@ -66,6 +67,11 @@ def _unique_int_list(values):
         seen.add(value)
         out.append(value)
     return out
+
+
+def _encode_hist(hist_row, movie_vocab):
+    """Encode a raw history row using movie vocabulary. 0 stays 0 (padding)."""
+    return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
 
 
 def _build_feature_lookup_tables(user_profile, item_profile):
@@ -154,9 +160,6 @@ def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables,
     iid_buffer = []
     seq_buffer = []
 
-    def _encode_hist(hist_row):
-        return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
-
     def _flush_batch():
         if not uid_buffer:
             return
@@ -193,7 +196,7 @@ def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables,
         actual_items = [int(iid) for iid in row.actual if int(iid) > 0]
         if not actual_items:
             continue
-        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)])
+        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)], movie_vocab)
 
         for item_id in actual_items:
             uid_buffer.append(int(row.userId))
@@ -211,7 +214,7 @@ def _evaluate_validation_loss(model, val_subset_df, val_hist_seq, lookup_tables,
 
 
 def _evaluate_validation_mrr(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
-    """Compute MRR on validation candidate pools."""
+    """Compute MRR on validation candidate pools (batched for GPU utilization)."""
     model.eval()
     user_encoded_id = lookup_tables['user_encoded_id']
     user_top_genres = lookup_tables['user_top_genres']
@@ -220,49 +223,74 @@ def _evaluate_validation_mrr(model, val_subset_df, val_hist_seq, lookup_tables, 
     item_genres = lookup_tables['item_genres']
     item_cont = lookup_tables['item_cont']
 
-    def _encode_hist(hist_row):
-        return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
-
-    mrr_scores = []
+    # Phase 1: Pre-collect per-user metadata
+    user_records = []
     for row in val_subset_df.itertuples(index=False):
         actual_items = [int(iid) for iid in row.actual if int(iid) > 0]
         candidates = [int(c) for c in row.candidates if int(c) > 0]
         if not actual_items or not candidates:
             continue
-
         uid = int(row.userId)
-        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)])
-        n_cand = len(candidates)
-        cand_t = torch.tensor(candidates, dtype=torch.long, device=device)
+        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)], movie_vocab)
+        user_records.append((uid, actual_items, candidates, hist_encoded, len(candidates)))
+
+    if not user_records:
+        model.train()
+        return 0.0
+
+    # Phase 2: Batched forward passes
+    mrr_scores = []
+    i = 0
+    while i < len(user_records):
+        batch_end = min(i + VAL_EVAL_BATCH_USERS, len(user_records))
+        batch_users = user_records[i:batch_end]
+
+        # Flatten all candidates into one tensor, tracking boundaries
+        all_uids, all_cands, all_seqs = [], [], []
+        boundaries = []
+        offset = 0
+        for uid, actual_items, candidates, hist_encoded, n_cand in batch_users:
+            all_uids.extend([uid] * n_cand)
+            all_cands.extend(candidates)
+            all_seqs.extend([hist_encoded] * n_cand)
+            boundaries.append((offset, offset + n_cand, actual_items, candidates))
+            offset += n_cand
+
+        uids_t = torch.tensor(all_uids, dtype=torch.long, device=device)
+        cands_t = torch.tensor(all_cands, dtype=torch.long, device=device)
+        seq_t = torch.tensor(all_seqs, dtype=torch.long, device=device)
 
         int_features = torch.cat([
-            user_encoded_id[uid].expand(n_cand, 1),
-            item_encoded_id[cand_t].unsqueeze(1),
-            user_top_genres[uid].expand(n_cand, -1),
-            item_genres[cand_t],
+            user_encoded_id[uids_t].unsqueeze(1),
+            item_encoded_id[cands_t].unsqueeze(1),
+            user_top_genres[uids_t],
+            item_genres[cands_t],
         ], dim=1).contiguous()
         float_features = torch.cat([
-            user_cont[uid].expand(n_cand, -1),
-            item_cont[cand_t],
+            user_cont[uids_t],
+            item_cont[cands_t],
         ], dim=1).contiguous()
-        seq_features = torch.tensor(hist_encoded, dtype=torch.long, device=device).unsqueeze(0).expand(n_cand, -1).contiguous()
-        features = {'int_features': int_features, 'float_features': float_features, 'seq_features': seq_features}
+        features = {'int_features': int_features, 'float_features': float_features, 'seq_features': seq_t}
 
+        # Single forward pass for the entire mega-batch
         with torch.no_grad():
-            logits = model(features).view(-1)
-            order = logits.argsort(descending=True)
-            ranked = [candidates[i] for i in order.cpu().numpy().reshape(-1)]
+            logits = model(features).view(-1).cpu().numpy()
 
-        mrr_scores.append(mrr(actual_items, ranked))
+        # Phase 3: Split scores per-user and compute MRR
+        for start, end, actual_items, candidates in boundaries:
+            user_logits = logits[start:end]
+            order = np.argsort(-user_logits)
+            ranked = [candidates[j] for j in order]
+            mrr_scores.append(mrr(actual_items, ranked))
+
+        i = batch_end
 
     model.train()
-    if not mrr_scores:
-        return 0.0
     return float(np.mean(mrr_scores))
 
 
 def _evaluate_validation_gauc(model, val_subset_df, val_hist_seq, lookup_tables, device, movie_vocab):
-    """Compute GAUC on validation candidate pools.
+    """Compute GAUC on validation candidate pools (batched for GPU utilization).
 
     Per-user AUC is weighted by the number of positive-negative pairs (n_pos * n_neg).
     """
@@ -274,59 +302,78 @@ def _evaluate_validation_gauc(model, val_subset_df, val_hist_seq, lookup_tables,
     item_genres = lookup_tables['item_genres']
     item_cont = lookup_tables['item_cont']
 
-    def _encode_hist(hist_row):
-        return [movie_vocab.get(int(mid), 0) if int(mid) > 0 else 0 for mid in hist_row]
-
-    weighted_auc_sum = 0.0
-    total_pairs = 0
+    # Phase 1: Pre-collect per-user metadata
+    user_records = []
     for row in val_subset_df.itertuples(index=False):
         actual_set = {int(iid) for iid in row.actual if int(iid) > 0}
         candidates = [int(c) for c in row.candidates if int(c) > 0]
         if not actual_set or not candidates:
             continue
-
-        # Build labels: 1 for items in actual, 0 otherwise
-        labels = [1.0 if c in actual_set else 0.0 for c in candidates]
-        n_pos = sum(labels)
+        labels = np.array([1.0 if c in actual_set else 0.0 for c in candidates], dtype=np.float32)
+        n_pos = labels.sum()
         n_neg = len(labels) - n_pos
         if n_pos == 0 or n_neg == 0:
             continue  # AUC undefined
-
         uid = int(row.userId)
-        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)])
-        n_cand = len(candidates)
-        cand_t = torch.tensor(candidates, dtype=torch.long, device=device)
+        hist_encoded = _encode_hist(val_hist_seq[int(row.row_idx)], movie_vocab)
+        user_records.append((uid, candidates, hist_encoded, labels, len(candidates)))
+
+    if not user_records:
+        model.train()
+        return 0.5
+
+    # Phase 2: Batched forward passes
+    weighted_auc_sum = 0.0
+    total_pairs = 0
+    i = 0
+    while i < len(user_records):
+        batch_end = min(i + VAL_EVAL_BATCH_USERS, len(user_records))
+        batch_users = user_records[i:batch_end]
+
+        all_uids, all_cands, all_seqs = [], [], []
+        boundaries = []
+        offset = 0
+        for uid, candidates, hist_encoded, labels, n_cand in batch_users:
+            all_uids.extend([uid] * n_cand)
+            all_cands.extend(candidates)
+            all_seqs.extend([hist_encoded] * n_cand)
+            boundaries.append((offset, offset + n_cand, labels))
+            offset += n_cand
+
+        uids_t = torch.tensor(all_uids, dtype=torch.long, device=device)
+        cands_t = torch.tensor(all_cands, dtype=torch.long, device=device)
+        seq_t = torch.tensor(all_seqs, dtype=torch.long, device=device)
 
         int_features = torch.cat([
-            user_encoded_id[uid].expand(n_cand, 1),
-            item_encoded_id[cand_t].unsqueeze(1),
-            user_top_genres[uid].expand(n_cand, -1),
-            item_genres[cand_t],
+            user_encoded_id[uids_t].unsqueeze(1),
+            item_encoded_id[cands_t].unsqueeze(1),
+            user_top_genres[uids_t],
+            item_genres[cands_t],
         ], dim=1).contiguous()
         float_features = torch.cat([
-            user_cont[uid].expand(n_cand, -1),
-            item_cont[cand_t],
+            user_cont[uids_t],
+            item_cont[cands_t],
         ], dim=1).contiguous()
-        seq_features = torch.tensor(hist_encoded, dtype=torch.long, device=device).unsqueeze(0).expand(n_cand, -1).contiguous()
-
-        features = {'int_features': int_features, 'float_features': float_features, 'seq_features': seq_features}
+        features = {'int_features': int_features, 'float_features': float_features, 'seq_features': seq_t}
 
         with torch.no_grad():
             scores = torch.sigmoid(model(features)).view(-1).cpu().numpy()
 
-        labels_np = np.array(labels)
-        # Manual pairwise AUC: fraction of (pos, neg) pairs where pos scored higher
-        pos_scores = scores[labels_np == 1]
-        neg_scores = scores[labels_np == 0]
-        n_correct = 0.0
-        n_pairs = 0
-        for ps in pos_scores:
-            n_correct += (ps > neg_scores).sum() + 0.5 * (ps == neg_scores).sum()
-            n_pairs += len(neg_scores)
-        if n_pairs > 0:
-            user_auc = n_correct / n_pairs
-            weighted_auc_sum += user_auc * n_pairs
-            total_pairs += n_pairs
+        # Phase 3: Per-user AUC computation (vectorized)
+        for start, end, labels in boundaries:
+            user_scores = scores[start:end]
+            pos_scores = user_scores[labels == 1]
+            neg_scores = user_scores[labels == 0]
+            # Vectorized pairwise AUC: broadcast pos vs neg
+            n_correct = ((pos_scores[:, None] > neg_scores[None, :]).sum()
+                         + 0.5 * (pos_scores[:, None] == neg_scores[None, :]).sum())
+            n_pairs = len(pos_scores) * len(neg_scores)
+            if n_pairs > 0:
+                user_auc = n_correct / n_pairs
+                weighted_auc_sum += user_auc * n_pairs
+                total_pairs += n_pairs
+
+        i = batch_end
 
     model.train()
     if total_pairs == 0:
@@ -548,12 +595,23 @@ def main():
             ctr_label = labels[:, 0]
             batch_size = int(batch['batch_size'])
             neg_size = int(batch['neg_size'])
-            expected_total = batch_size * (1 + neg_size)
+            group_size = int(batch['group_size'])
+            expected_total = batch_size * group_size
             if ctr_label.numel() != expected_total:
                 raise ValueError(
                     f"Batch shape mismatch: got {ctr_label.numel()} rows, expected {expected_total} "
                     f"(batch_size={batch_size}, neg_size={neg_size})"
                 )
+
+            # Sanity check: BPR relies on positives-first layout from collate_fn
+            assert ctr_label[:batch_size].min() >= 0.5, (
+                f"BPR layout violation: first {batch_size} rows must be positives, "
+                f"got min label={ctr_label[:batch_size].min().item():.2f}"
+            )
+            assert ctr_label[batch_size:].max() < 0.5, (
+                f"BPR layout violation: rows [{batch_size}:] must be negatives, "
+                f"got max label={ctr_label[batch_size:].max().item():.2f}"
+            )
 
             # Forward (AMP autocast for model; BCE-with-logits remains numerically stable)
             with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
@@ -607,7 +665,7 @@ def main():
             f"val_loss(diag)={val_loss:.4f} "
             f"val_mrr={val_mrr:.4f} "
             f"val_gauc={val_gauc:.4f} "
-            f"best_{monitor_metric}={best_val_metric if best_val_metric > -np.inf else 0.0:.4f} "
+            f"best_mrr={best_val_mrr:.4f} best_gauc={best_val_gauc:.4f} "
             f"best_epoch={best_epoch} "
             f"no_improve={no_improve}/{EARLY_STOP_PATIENCE}"
         )
