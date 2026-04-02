@@ -540,10 +540,12 @@ def main():
     # 7. Training loop with BCE + BPR objective + AMP
     emb_params = [p for n, p in model.named_parameters() if 'emb' in n]
     other_params = [p for n, p in model.named_parameters() if 'emb' not in n]
+    lr = float(RANK_LEARNING_RATE)
+    weight_decay = float(RANK_WEIGHT_DECAY)
     optimizer = optim.AdamW([
         {'params': emb_params, 'weight_decay': 0},
-        {'params': other_params, 'weight_decay': RANK_WEIGHT_DECAY},
-    ], lr=RANK_LEARNING_RATE)
+        {'params': other_params, 'weight_decay': weight_decay},
+    ], lr=lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=1, min_lr=1e-6)
 
     # AMP: mixed precision for GPU throughput
@@ -577,7 +579,7 @@ def main():
             # LR warmup
             global_step += 1
             if global_step <= warmup_total_steps:
-                warmup_lr = RANK_LEARNING_RATE * global_step / warmup_total_steps
+                warmup_lr = lr * global_step / warmup_total_steps
                 for pg in optimizer.param_groups:
                     pg['lr'] = warmup_lr
 

@@ -2,6 +2,12 @@ import os
 from pathlib import Path
 import yaml
 
+def _as_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
 # Project Root
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -66,8 +72,8 @@ RANK_NUM_EXPERTS = _ranking.get('num_experts', 4)
 RANK_EXPERT_DIM = _ranking.get('expert_dim', 128)
 RANK_TOWER_DIMS = _ranking.get('tower_dims', [64, 32])
 RANK_BATCH_SIZE = _ranking.get('batch_size', 4096)
-RANK_LEARNING_RATE = _ranking.get('learning_rate', 0.0005)
-RANK_WEIGHT_DECAY = _ranking.get('weight_decay', 1e-5)
+RANK_LEARNING_RATE = _as_float(_ranking.get('learning_rate', 0.0005), 0.0005)
+RANK_WEIGHT_DECAY = _as_float(_ranking.get('weight_decay', 1e-5), 1e-5)
 RANK_WARMUP_EPOCHS = _ranking.get('warmup_epochs', 1)
 RANK_EPOCHS = _ranking.get('epochs', 10)
 RANK_NEG_SAMPLE_RATIO = _ranking.get('neg_sample_ratio', 3)
@@ -87,7 +93,7 @@ RANK_HARD_NEGATIVE_MIX = _hard_negative_mix
 RANK_TRAIN_POOL_SIZE = _ranking.get('train_pool_size', 100)
 RANK_EVAL_POOL_SIZE = _ranking.get('eval_pool_size', 500)
 RANK_FORCE_INSERT_TARGET = _ranking.get('force_insert_target', True)
-RANK_BPR_WEIGHT = _ranking.get('bpr_weight', 0.1)
+RANK_BPR_WEIGHT = _as_float(_ranking.get('bpr_weight', 0.1), 0.1)
 RANK_EARLY_STOP_METRIC = _ranking.get('early_stop_metric', 'mrr').lower()
 
 # 8. Merger Weights
