@@ -3,88 +3,88 @@
 
 # 1. Path Settings
 paths:
-  raw_data_dir: "data/raw"
-  processed_data_dir: "data/processed"
-  feature_store_dir: "data/feature_store"
-  model_weights_dir: "data/model_weights"
+  raw_data_dir: "data/raw"                # Input CSV / source files
+  processed_data_dir: "data/processed"    # Cleaned datasets and splits
+  feature_store_dir: "data/feature_store" # Persisted offline features
+  model_weights_dir: "data/model_weights" # Saved checkpoints and final weights
 
 # 2. Recall Hyperparameters
 recall:
-  top_k: 100
-  embedding_dim: 128
-  tau: 0.07
+  top_k: 100           # Recall stage candidate size per user
+  embedding_dim: 128   # User/item embedding dimension
+  tau: 0.07            # InfoNCE temperature (smaller => sharper logits)
   bpr_gamma: 5.0  # BPR-specific scaling factor for sigmoid input
   bpr_margin: 0.1  # BPR margin: forces pos-neg gap before scoring correct
   logit_scale_max: 100.0  # Clamp for learnable tau (min tau = 1/max)
   cont_bucket_size: 20  # Number of bins for continuous feature discretization
   # Mixed Loss Weights
-  loss_infonce_weight: 1.0
-  loss_bpr_weight: 1.0
+  loss_infonce_weight: 1.0  # Weight of contrastive objective
+  loss_bpr_weight: 1.0      # Weight of pairwise ranking objective
 
 # 3. Training Settings
 training:
-  batch_size: 4096
-  learning_rate: 0.001
-  epochs: 5
+  batch_size: 4096     # Global batch size for recall model training
+  learning_rate: 0.001 # Initial optimizer learning rate
+  epochs: 5            # Number of full passes over training data
   # Negative Sampling Sizes
-  inbatch_neg_size: 4096
-  global_neg_size: 2048
-  hard_neg_size: 512
-  num_workers: 32
+  inbatch_neg_size: 4096 # Negatives from current batch
+  global_neg_size: 2048  # Random negatives sampled globally
+  hard_neg_size: 512     # Hard negatives mined from near-miss items
+  num_workers: 32        # Dataloader worker processes
 
-# 5. CF Settings
+# 4. CF Settings
 cf:
-  top_k: 50
-  cf_workers: 32
+  top_k: 50      # Per-source CF recall size
+  cf_workers: 32 # Parallel workers for CF candidate generation
 
-# 6. Merger Weights (Tuned for Recall maximization)
+# 5. Merger Weights (Tuned for Recall maximization)
 merger_weights:
-  dual_tower: 0.5
-  item_cf: 0.8
-  user_cf: 1.0
-  popularity: 0.01
-  genre: 0.05
+  dual_tower: 0.5  # Neural recall score contribution
+  item_cf: 0.8     # Item-item CF score contribution
+  user_cf: 1.0     # User-user CF score contribution
+  popularity: 0.01 # Global popularity prior
+  genre: 0.05      # Genre affinity prior
 
-# 4. Ranking Model Settings
+# 6. Ranking Model Settings
 ranking:
   # Mixed embedding dimensions (D = 6 * N^0.25, clamped to power of 2)
   id_embed_dim: 64           # user_id, item_id (high cardinality ~330K/87K)
   genre_embed_dim: 8         # genre features (low cardinality ~20)
   cont_embed_dim: 8          # bucketized continuous features (20 bins)
-  cont_bucket_size: 20
+  cont_bucket_size: 20       # Bucket count for continuous ranking features
   # DCNv2
-  cross_layers: 3
-  dropout: 0.1
+  cross_layers: 3            # Number of explicit feature-cross layers
+  dropout: 0.1               # Dropout probability for dense blocks
   # MMoE
-  num_experts: 4
-  expert_dim: 128
+  num_experts: 4             # Shared experts across multi-task heads
+  expert_dim: 128            # Hidden size inside each expert
   # Task Towers
-  tower_dims: [64, 32]
+  tower_dims: [64, 32]       # Per-task MLP tower hidden dimensions
   # Training
-  batch_size: 16384
-  learning_rate: 0.001
-  epochs: 10
-  neg_sample_ratio: 3
-  objective: ctr
-  negatives_per_positive: 3
-  hard_negative_topk: 20
-  explicit_negative_threshold: 3.0
-  hard_negative_mix: [2, 1]
-  num_workers: 8
+  batch_size: 16384                  # Ranking model batch size
+  learning_rate: 0.001               # Ranking optimizer learning rate
+  epochs: 10                         # Ranking training epochs
+  neg_sample_ratio: 3                # Total negatives sampled per positive
+  objective: ctr                     # Primary task objective: ctr | rating | multi
+  negatives_per_positive: 3          # Explicit negative sampling ratio
+  hard_negative_topk: 20             # Mine hard negatives from top-K candidates
+  explicit_negative_threshold: 3.0   # Ratings below this are treated as negatives
+  hard_negative_mix: [2, 1]          # Blend ratio: [hard_negative, random_negative]
+  num_workers: 8                     # Dataloader workers for ranking stage
   # Loss (GradNorm auto-balances BCE and MSE)
-  gradnorm_alpha: 1.5
+  gradnorm_alpha: 1.5                # Larger => faster task rebalancing
   # Multi-Objective Scoring
-  ctr_alpha: 1.0
-  rating_beta: 0.5
+  ctr_alpha: 1.0                     # CTR score weight in final ranking score
+  rating_beta: 0.5                   # Rating score weight in final ranking score
   # Evaluation
-  eval_ks: [10, 20, 50]
-  train_pool_size: 100
-  eval_pool_size: 500
-  force_insert_target: true
+  eval_ks: [10, 20, 50]              # Metrics computed at K
+  train_pool_size: 100               # Candidate pool size used in train-time eval
+  eval_pool_size: 500                # Candidate pool size used in full evaluation
+  force_insert_target: true          # Ensure GT item exists in evaluation pool
 
-# 5. Feature Settings
+# 7. Feature Settings
 features:
-  user_history_max_len: 50
-  user_top_genres_max_len: 3
-  item_genres_max_len: 5
-  time_decay_lambda: 0.001
+  user_history_max_len: 50     # Max recent interactions kept per user
+  user_top_genres_max_len: 3   # Max preferred genres retained per user
+  item_genres_max_len: 5       # Max genres retained per item
+  time_decay_lambda: 0.001     # Exponential time-decay strength for recency
