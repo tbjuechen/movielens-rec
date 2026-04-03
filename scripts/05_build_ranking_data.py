@@ -6,6 +6,7 @@ Two-phase pipeline:
 
 This aligns ranking training distribution with online inference.
 """
+import argparse
 import sys
 from pathlib import Path
 from collections import Counter
@@ -18,13 +19,16 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
+    BASE_DIR,
     PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
     EMBEDDING_DIM, TAU, TIME_DECAY_LAMBDA, BPR_GAMMA, BPR_MARGIN,
     LOSS_INFONCE_WEIGHT, LOSS_BPR_WEIGHT, LOGIT_SCALE_MAX, CONT_BUCKET_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS, RANK_TRAIN_POOL_SIZE, RANK_EVAL_POOL_SIZE,
     RANK_FORCE_INSERT_TARGET, RANK_EXPLICIT_NEGATIVE_THRESHOLD, RANK_HIST_SEQ_MAXLEN,
+    ALIGNMENT_STRICT_POOL_SIZE,
 )
+from src.config.alignment import STRICT_MINONICC_MODE, get_alignment_paths
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
 from src.models.recall.item_cf import ItemCFModel
@@ -278,13 +282,24 @@ def _build_user_data(uid):
     return train_out, val_out, test_out, snapshots_out
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--alignment", type=str, default=None, help="Alignment mode, e.g. strict_minonicc")
+    args = parser.parse_args()
+    paths = get_alignment_paths(args.alignment)
+    processed_dir = paths.processed_dir
+    feature_store_dir = paths.feature_store_dir
+    model_weights_dir = paths.model_weights_dir
+    strict_mode = paths.mode == STRICT_MINONICC_MODE
+    train_pool_size = ALIGNMENT_STRICT_POOL_SIZE if strict_mode else RANK_TRAIN_POOL_SIZE
+    eval_pool_size = ALIGNMENT_STRICT_POOL_SIZE if strict_mode else RANK_EVAL_POOL_SIZE
+
     print("=== Building Ranking Data (Optimized Multiprocessing) ===")
 
     # 1. Load data
     print("[1/7] Loading data...")
-    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
-    val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
-    test_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "test_data.parquet")
+    train_data = pd.read_parquet(Path(processed_dir) / "train_data.parquet")
+    val_data = pd.read_parquet(Path(processed_dir) / "val_data.parquet")
+    test_data = pd.read_parquet(Path(processed_dir) / "test_data.parquet")
     valid_user_ids = _filter_valid_users(train_data, val_data, test_data)
     print(f"  Ranking users with total interactions > 5: {len(valid_user_ids):,}")
     train_data = train_data[train_data['userId'].isin(valid_user_ids)].copy()
@@ -297,18 +312,18 @@ def main():
         .to_dict()
     )
     
-    raw_dir = Path(PROCESSED_DATA_DIR).parent / "raw" / "ml-32m"
+    raw_dir = BASE_DIR / "data" / "raw" / "ml-32m"
     movies = pd.read_csv(raw_dir / "movies.csv")
     movie_genres = dict(zip(movies['movieId'].values, movies['genres'].values))
 
     # 2. Load CPU models
     print("[2/7] Loading CPU recall models...")
-    item_cf = ItemCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "item_sim_matrix.pkl")
+    item_cf = ItemCFModel(sim_save_path=Path(model_weights_dir) / "item_sim_matrix.pkl")
     item_cf.load()
-    pop_recall = PopularityRecall(item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
+    pop_recall = PopularityRecall(item_profile_path=Path(processed_dir) / "item_profile.parquet")
     genre_recall = GenreRecall(
-        genre_to_items_path=Path(FEATURE_STORE_DIR) / "genre_to_items.json",
-        item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet"
+        genre_to_items_path=Path(feature_store_dir) / "genre_to_items.json",
+        item_profile_path=Path(processed_dir) / "item_profile.parquet"
     )
     pop_candidates = pop_recall.retrieve(k=RECALL_K)
 
@@ -358,9 +373,9 @@ def main():
     print(f"  Device: {device}")
 
     # Load encoder + profiles for DT
-    user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
-    item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
-    encoder = FeatureEncoder(FEATURE_STORE_DIR)
+    user_profile = pd.read_parquet(Path(processed_dir) / "user_profile.parquet")
+    item_profile = pd.read_parquet(Path(processed_dir) / "item_profile.parquet")
+    encoder = FeatureEncoder(feature_store_dir)
     encoder.load()
 
     item_profile['movieId_encoded'] = encoder.transform_categorical(item_profile['movieId'], 'movieId')
@@ -378,7 +393,7 @@ def main():
     ).to(device)
 
     dt_ready = False
-    dt_path = Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth"
+    dt_path = Path(model_weights_dir) / "dual_tower.pth"
     if dt_path.exists():
         dt_model.load_state_dict(torch.load(dt_path, map_location=device))
         dt_ready = True
@@ -489,7 +504,7 @@ def main():
         pool, stats = _prepare_candidate_pool(
             merged_candidates=merged,
             actual_list=[mid],
-            pool_size=RANK_TRAIN_POOL_SIZE,
+            pool_size=train_pool_size,
             force_insert=RANK_FORCE_INSERT_TARGET,
         )
         if pool is None:
@@ -508,10 +523,16 @@ def main():
         uid, dt_key = item['userId'], item['dt_key']
         actual_list = item['actual']
         merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, dt_key, item['watched'])
+        raw_candidates, _ = _prepare_candidate_pool(
+            merged_candidates=merged,
+            actual_list=actual_list,
+            pool_size=eval_pool_size,
+            force_insert=False,
+        )
         candidates, stats = _prepare_candidate_pool(
             merged_candidates=merged,
             actual_list=actual_list,
-            pool_size=RANK_EVAL_POOL_SIZE,
+            pool_size=eval_pool_size,
             force_insert=RANK_FORCE_INSERT_TARGET,
         )
         if candidates is None:
@@ -521,6 +542,7 @@ def main():
         final_val.append({
             'userId': uid,
             'candidates': candidates,
+            'raw_candidates': raw_candidates if raw_candidates is not None else [],
             'actual': actual_list,
             **stats,
         })
@@ -530,10 +552,16 @@ def main():
         uid, dt_key = item['userId'], item['dt_key']
         actual_list = item['actual']
         merged = _merge_with_dt(pool_merger, item['cpu_merged'], dt_snap_results, uid, dt_key, item['watched'])
+        raw_candidates, _ = _prepare_candidate_pool(
+            merged_candidates=merged,
+            actual_list=actual_list,
+            pool_size=eval_pool_size,
+            force_insert=False,
+        )
         candidates, stats = _prepare_candidate_pool(
             merged_candidates=merged,
             actual_list=actual_list,
-            pool_size=RANK_EVAL_POOL_SIZE,
+            pool_size=eval_pool_size,
             force_insert=RANK_FORCE_INSERT_TARGET,
         )
         if candidates is None:
@@ -543,6 +571,7 @@ def main():
         final_test.append({
             'userId': uid,
             'candidates': candidates,
+            'raw_candidates': raw_candidates if raw_candidates is not None else [],
             'actual': actual_list,
             **stats,
         })
@@ -551,12 +580,12 @@ def main():
     # 7. Save
     print("[7/7] Saving Results...")
     pd.DataFrame(final_train, columns=['userId', 'movieId', 'ctr_label', 'rating_norm', 'candidate_pool', 'explicit_negatives']).to_parquet(
-        Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet", index=False)
-    pd.DataFrame(final_val).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_val_candidates.parquet", index=False)
-    pd.DataFrame(final_test).to_parquet(Path(PROCESSED_DATA_DIR) / "ranking_test_candidates.parquet", index=False)
-    np.save(Path(PROCESSED_DATA_DIR) / "ranking_train_hist_seq.npy", _pad_histories(train_histories, RANK_HIST_SEQ_MAXLEN))
-    np.save(Path(PROCESSED_DATA_DIR) / "ranking_val_hist_seq.npy", _pad_histories(val_histories, RANK_HIST_SEQ_MAXLEN))
-    np.save(Path(PROCESSED_DATA_DIR) / "ranking_test_hist_seq.npy", _pad_histories(test_histories, RANK_HIST_SEQ_MAXLEN))
+        Path(processed_dir) / "ranking_candidate_pool.parquet", index=False)
+    pd.DataFrame(final_val).to_parquet(Path(processed_dir) / "ranking_val_candidates.parquet", index=False)
+    pd.DataFrame(final_test).to_parquet(Path(processed_dir) / "ranking_test_candidates.parquet", index=False)
+    np.save(Path(processed_dir) / "ranking_train_hist_seq.npy", _pad_histories(train_histories, RANK_HIST_SEQ_MAXLEN))
+    np.save(Path(processed_dir) / "ranking_val_hist_seq.npy", _pad_histories(val_histories, RANK_HIST_SEQ_MAXLEN))
+    np.save(Path(processed_dir) / "ranking_test_hist_seq.npy", _pad_histories(test_histories, RANK_HIST_SEQ_MAXLEN))
     
     print(f"\n=== Done ===\nSaved Training: {len(final_train):,}, Val: {len(final_val):,}, Test: {len(final_test):,}")
     for split, stats in pool_stats.items():

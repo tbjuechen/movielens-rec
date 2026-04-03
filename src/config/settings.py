@@ -104,3 +104,14 @@ MERGER_WEIGHTS = config.get('merger_weights', {
     'popularity': 1.0,
     'genre': 1.0
 })
+
+# 9. Alignment Settings
+_alignment = config.get('alignment', {})
+ALIGNMENT_MODE = _alignment.get('mode', '')
+ALIGNMENT_SEED = int(_alignment.get('seed', 42))
+ALIGNMENT_STRICT_USER_PACK_SIZE = int(_alignment.get('strict_user_pack_size', 40000))
+ALIGNMENT_STRICT_LONG_USER_RATIO = _as_float(_alignment.get('strict_long_user_ratio', 0.25), 0.25)
+ALIGNMENT_STRICT_LONG_USER_THRESHOLD = int(_alignment.get('strict_long_user_threshold', 150))
+ALIGNMENT_STRICT_POOL_SIZE = int(_alignment.get('strict_pool_size', 350))
+ALIGNMENT_STRICT_VAL_SAMPLE_SIZE = int(_alignment.get('strict_val_sample_size', 10000))
+ALIGNMENT_STRICT_TEST_SAMPLE_FRAC = _as_float(_alignment.get('strict_test_sample_frac', 0.2), 0.2)

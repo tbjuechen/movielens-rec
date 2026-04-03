@@ -1,4 +1,5 @@
 """Train the ranking model (DCNv2 + MMoE) with BCE + BPR loss."""
+import argparse
 import sys
 from pathlib import Path
 import numpy as np
@@ -13,7 +14,6 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config.settings import (
-    PROCESSED_DATA_DIR, FEATURE_STORE_DIR, MODEL_WEIGHTS_DIR,
     RANK_HIST_SEQ_MAXLEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     RANK_ID_EMBED_DIM, RANK_GENRE_EMBED_DIM, RANK_CONT_EMBED_DIM,
     RANK_CONT_BUCKET_SIZE,
@@ -24,6 +24,7 @@ from src.config.settings import (
     RANK_NEGATIVES_PER_POSITIVE, RANK_HARD_NEGATIVE_MIX,
     RANK_BPR_WEIGHT, RANK_EARLY_STOP_METRIC,
 )
+from src.config.alignment import get_alignment_paths
 from src.features.encoder import FeatureEncoder
 from src.models.ranking.ranker import RankingModel, _quantile_bounds
 from src.data_pipeline.ranking_dataset import RankingDataset
@@ -382,22 +383,30 @@ def _evaluate_validation_gauc(model, val_subset_df, val_hist_seq, lookup_tables,
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--alignment", type=str, default=None, help="Alignment mode, e.g. strict_minonicc")
+    args = parser.parse_args()
+    paths = get_alignment_paths(args.alignment)
+    processed_dir = paths.processed_dir
+    feature_store_dir = paths.feature_store_dir
+    model_weights_dir = paths.model_weights_dir
+
     print("=== Training Ranking Model (DCNv2 + MMoE) ===")
 
     # 1. Load profiles first (train_data is only needed if samples don't exist)
     print("[1/6] Loading profiles...")
-    user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
-    item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
+    user_profile = pd.read_parquet(Path(processed_dir) / "user_profile.parquet")
+    item_profile = pd.read_parquet(Path(processed_dir) / "item_profile.parquet")
     
     print("[2/6] Encoding features...")
-    encoder = FeatureEncoder(FEATURE_STORE_DIR)
+    encoder = FeatureEncoder(feature_store_dir)
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
 
     # 3. Load pre-generated ranking samples
     print("[3/6] Loading ranking candidate pool...")
-    ranking_samples_path = Path(PROCESSED_DATA_DIR) / "ranking_candidate_pool.parquet"
-    ranking_train_hist_path = Path(PROCESSED_DATA_DIR) / "ranking_train_hist_seq.npy"
+    ranking_samples_path = Path(processed_dir) / "ranking_candidate_pool.parquet"
+    ranking_train_hist_path = Path(processed_dir) / "ranking_train_hist_seq.npy"
     if not ranking_samples_path.exists():
         print(f"  {ranking_samples_path} not found. Please run 05_build_ranking_data.py first.")
         sys.exit(1)
@@ -470,7 +479,7 @@ def main():
     )
 
     print("[3.5/6] Loading validation subset for early stopping...")
-    val_subset_df, val_hist_seq = _load_validation_subset(PROCESSED_DATA_DIR)
+    val_subset_df, val_hist_seq = _load_validation_subset(processed_dir)
 
     # 4. Compute quantile bucket boundaries
     print("[4/6] Computing bucket boundaries...")
@@ -676,8 +685,8 @@ def main():
             best_val_metric = val_monitor
             best_epoch = epoch
             no_improve = 0
-            Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "ranking_model.pth")
+            Path(model_weights_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), Path(model_weights_dir) / "ranking_model.pth")
             print(f"  -> Saved best model (val_{monitor_metric}={best_val_metric:.4f})")
         else:
             no_improve += 1

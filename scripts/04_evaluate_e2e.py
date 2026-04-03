@@ -17,6 +17,7 @@ from src.config.settings import (
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN,
     MERGER_WEIGHTS
 )
+from src.config.alignment import get_alignment_paths
 from src.features.encoder import FeatureEncoder
 from src.models.recall.dual_tower import DualTowerModel
 from src.models.recall.item_cf import ItemCFModel
@@ -50,8 +51,12 @@ def pad_ts_diff(ts_list, max_len):
     ts = list(ts_list)[:max_len]
     return ts + [0.0] * (max_len - len(ts))
 
-def evaluate(test_mode=False):
+def evaluate(test_mode=False, alignment=None):
     print("=== Starting End-to-End Evaluation ===")
+    paths = get_alignment_paths(alignment)
+    processed_dir = paths.processed_dir
+    feature_store_dir = paths.feature_store_dir
+    model_weights_dir = paths.model_weights_dir
 
     CHANNEL_K = 200       # 过滤后每个通道保留的候选数
     RAW_CHANNEL_K = 300   # 过滤前多召回一些，留出余量
@@ -60,11 +65,11 @@ def evaluate(test_mode=False):
     FINAL_EVAL_KS = [100, 200, 500]    # 融合后评测的 K 值
 
     # 1. Load Data
-    val_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "val_data.parquet")
-    user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
-    item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
+    val_data = pd.read_parquet(Path(processed_dir) / "val_data.parquet")
+    user_profile = pd.read_parquet(Path(processed_dir) / "user_profile.parquet")
+    item_profile = pd.read_parquet(Path(processed_dir) / "item_profile.parquet")
 
-    encoder = FeatureEncoder(FEATURE_STORE_DIR)
+    encoder = FeatureEncoder(feature_store_dir)
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
 
@@ -78,7 +83,7 @@ def evaluate(test_mode=False):
         loss_infonce_weight=LOSS_INFONCE_WEIGHT, loss_bpr_weight=LOSS_BPR_WEIGHT,
         logit_scale_max=LOGIT_SCALE_MAX, cont_bucket_size=CONT_BUCKET_SIZE
     ).to(device)
-    model_path = Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth"
+    model_path = Path(model_weights_dir) / "dual_tower.pth"
     dual_tower_ready = False
     if model_path.exists():
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -86,7 +91,7 @@ def evaluate(test_mode=False):
         print("Loaded Dual-Tower weights.")
     model.eval()
 
-    item_cf = ItemCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "item_sim_matrix.pkl")
+    item_cf = ItemCFModel(sim_save_path=Path(model_weights_dir) / "item_sim_matrix.pkl")
     item_cf_ready = False
     try:
         item_cf.load()
@@ -94,7 +99,7 @@ def evaluate(test_mode=False):
     except FileNotFoundError:
         print("Warning: ItemCF matrix not found.")
 
-    user_cf = UserCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "user_sim_matrix.pkl")
+    user_cf = UserCFModel(sim_save_path=Path(model_weights_dir) / "user_sim_matrix.pkl")
     user_cf_ready = False
     try:
         user_cf.load()
@@ -102,10 +107,10 @@ def evaluate(test_mode=False):
     except FileNotFoundError:
         print("Warning: UserCF matrix not found.")
 
-    pop_recall = PopularityRecall(item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
+    pop_recall = PopularityRecall(item_profile_path=Path(processed_dir) / "item_profile.parquet")
     genre_recall = GenreRecall(
-        genre_to_items_path=Path(FEATURE_STORE_DIR) / "genre_to_items.json",
-        item_profile_path=Path(PROCESSED_DATA_DIR) / "item_profile.parquet"
+        genre_to_items_path=Path(feature_store_dir) / "genre_to_items.json",
+        item_profile_path=Path(processed_dir) / "item_profile.parquet"
     )
     merger = RecallMerger(top_k=MERGE_K)
 
@@ -212,5 +217,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Quick evaluation with 1000 users.")
+    parser.add_argument("--alignment", type=str, default=None, help="Alignment mode, e.g. strict_minonicc")
     args = parser.parse_args()
-    evaluate(test_mode=args.test)
+    evaluate(test_mode=args.test, alignment=args.alignment)

@@ -19,6 +19,7 @@ from src.config.settings import (
     INBATCH_NEG_SIZE, GLOBAL_NEG_SIZE, HARD_NEG_SIZE,
     USER_HISTORY_MAX_LEN, USER_TOP_GENRES_MAX_LEN, ITEM_GENRES_MAX_LEN
 )
+from src.config.alignment import get_alignment_paths
 from src.features.encoder import FeatureEncoder
 from src.data_pipeline.dataset import create_dataloader
 from src.models.recall.dual_tower import DualTowerModel
@@ -46,15 +47,15 @@ def apply_encoding(user_profile, item_profile, encoder):
     item_profile['vote_count_ml_norm'] = item_cont['item_vote_count_ml']
     return user_profile, item_profile
 
-def train_dual_tower(batch_size=BATCH_SIZE):
+def train_dual_tower(processed_dir, feature_store_dir, model_weights_dir, batch_size=BATCH_SIZE):
     print(f"=== Training Dual-Tower Model (Batch: {batch_size}, Epochs: {EPOCHS}) ===")
-    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
-    user_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "user_profile.parquet")
-    item_profile = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "item_profile.parquet")
-    with open(Path(FEATURE_STORE_DIR) / "popularity_list.json", "r") as f:
+    train_data = pd.read_parquet(Path(processed_dir) / "train_data.parquet")
+    user_profile = pd.read_parquet(Path(processed_dir) / "user_profile.parquet")
+    item_profile = pd.read_parquet(Path(processed_dir) / "item_profile.parquet")
+    with open(Path(feature_store_dir) / "popularity_list.json", "r") as f:
         popularity_list = json.load(f)
 
-    encoder = FeatureEncoder(FEATURE_STORE_DIR)
+    encoder = FeatureEncoder(feature_store_dir)
     encoder.load()
     user_profile, item_profile = apply_encoding(user_profile, item_profile, encoder)
     
@@ -173,21 +174,21 @@ def train_dual_tower(batch_size=BATCH_SIZE):
             tau_eff = 1.0 / model.logit_scale.exp().clamp(max=model.logit_scale_max).item()
             pbar.set_postfix({'loss': f"{loss.item():.4f}", 'NCE': f"{l_nce.item():.4f}", 'BPR': f"{l_bpr.item():.4f}", 'tau': f"{tau_eff:.4f}", 'LR': f"{scheduler.get_last_lr()[0]:.6f}"})
 
-    Path(MODEL_WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), Path(MODEL_WEIGHTS_DIR) / "dual_tower.pth")
+    Path(model_weights_dir).mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), Path(model_weights_dir) / "dual_tower.pth")
     print("Dual-Tower training finished.")
 
-def train_item_cf():
+def train_item_cf(processed_dir, model_weights_dir):
     print("=== Training ItemCF (Sparse Matrix) ===")
-    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
-    model = ItemCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "item_sim_matrix.pkl")
+    train_data = pd.read_parquet(Path(processed_dir) / "train_data.parquet")
+    model = ItemCFModel(sim_save_path=Path(model_weights_dir) / "item_sim_matrix.pkl")
     model.fit(train_df=train_data[train_data['rating'] >= 3.0])
     print("ItemCF training finished.")
 
-def train_user_cf():
+def train_user_cf(processed_dir, model_weights_dir):
     print("=== Training UserCF (Sparse Matrix) ===")
-    train_data = pd.read_parquet(Path(PROCESSED_DATA_DIR) / "train_data.parquet")
-    model = UserCFModel(sim_save_path=Path(MODEL_WEIGHTS_DIR) / "user_sim_matrix.pkl")
+    train_data = pd.read_parquet(Path(processed_dir) / "train_data.parquet")
+    model = UserCFModel(sim_save_path=Path(model_weights_dir) / "user_sim_matrix.pkl")
     model.fit(train_df=train_data[train_data['rating'] >= 3.0])
     print("UserCF training finished.")
 
@@ -195,11 +196,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, choices=["dual_tower", "item_cf", "user_cf", "all"])
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--alignment", type=str, default=None, help="Alignment mode, e.g. strict_minonicc")
     args = parser.parse_args()
+    paths = get_alignment_paths(args.alignment)
+    processed_dir = paths.processed_dir
+    feature_store_dir = paths.feature_store_dir
+    model_weights_dir = paths.model_weights_dir
     
     if args.model == "dual_tower" or args.model == "all":
-        train_dual_tower(batch_size=args.batch_size)
+        train_dual_tower(processed_dir, feature_store_dir, model_weights_dir, batch_size=args.batch_size)
     if args.model == "item_cf" or args.model == "all":
-        train_item_cf()
+        train_item_cf(processed_dir, model_weights_dir)
     if args.model == "user_cf" or args.model == "all":
-        train_user_cf()
+        train_user_cf(processed_dir, model_weights_dir)

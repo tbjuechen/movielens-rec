@@ -94,3 +94,14 @@ features:
   user_top_genres_max_len: 3
   item_genres_max_len: 5
   time_decay_lambda: 0.001
+
+# 6. Alignment Mode (for strict apples-to-apples benchmark)
+alignment:
+  mode: ""
+  seed: 42
+  strict_user_pack_size: 40000
+  strict_long_user_ratio: 0.25
+  strict_long_user_threshold: 150
+  strict_pool_size: 350
+  strict_val_sample_size: 10000
+  strict_test_sample_frac: 0.2
