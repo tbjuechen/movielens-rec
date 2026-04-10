@@ -56,7 +56,7 @@ ranking:
   din_attention_hidden: [128, 64]
   # DCNv2
   cross_layers: 3
-  dropout: 0.2
+  dropout: 0.3
   # MMoE
   num_experts: 4
   expert_dim: 128
